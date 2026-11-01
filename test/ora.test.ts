@@ -6,4 +6,4 @@ const skip = conn
 	? ((await reachable(connHost(conn), connPort(conn))) ? false : 'ora: host unreachable')
 	: 'ora: .connect.json missing'
 
-runDbSuite('ora', conn, 'SELECT :v AS v FROM dual', 'SELECT :v AS v FROM dual', skip)
+runDbSuite('ora', conn, 'SELECT :v AS v FROM dual', skip)

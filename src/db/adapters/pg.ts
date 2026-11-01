@@ -2,17 +2,19 @@ import { Client, type FieldDef } from 'pg'
 import type { IDbAdapter, TDbCol, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
 import type { TConnPg } from '../connection'
 import type { TResult } from '../../tresult'
+import { mapPlaceholders } from '../placeholders'
 
 function toSchema(fields: FieldDef[]): TDbCol[] {
 	return fields.map((f) => ({ name: f.name, kind: 'unknown' }))
 }
 
 // Converts :name placeholders to $1, $2, ... and collects values.
-// Same :name used multiple times maps to the same $N.
+// Same :name used multiple times maps to the same $N. A colon inside a string literal, a
+// quoted identifier or a comment is left as it is.
 function buildQuery(query: string, params: TDbParam[]): { text: string; values: unknown[] } {
 	const nameToIndex = new Map<string, number>()
 	const values: unknown[] = []
-	const text = query.replace(/:(\w+)/g, (_, name: string) => {
+	const text = mapPlaceholders(query, (name) => {
 		if (!nameToIndex.has(name)) {
 			const found = params.find((p) => p.name === name)
 			if (!found) throw new Error(`pg: param not found: ${name}`)

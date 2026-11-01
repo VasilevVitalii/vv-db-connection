@@ -142,7 +142,7 @@ All methods accept named parameters in `:name` syntax, regardless of the underly
 
 | Driver     | Native format                        | Notes |
 |------------|--------------------------------------|-------|
-| MSSQL      | `@name` (mssql `request.input`)      | passed directly |
+| MSSQL      | `@name` (mssql `request.input`)      | `:name` converted to `@name` |
 | PostgreSQL | `$1, $2, …`                          | same `:name` used multiple times maps to the same `$N` |
 | Oracle     | `:name` (native bind)                | passed as a named bind object |
 | Firebird   | `?` (positional)                     | replaced in left-to-right order of appearance |

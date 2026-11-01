@@ -55,17 +55,11 @@ export function connPort(conn: TConnectionParam): number {
 	}
 }
 
-// execParamQuery and txParamQuery each return exactly one row with one column.
-//
-// They differ because the adapters translate `:name` parameters in different places:
-//   - pg / ora / fb convert `:name` in BOTH execStream and execTxDynamic;
-//   - mssql converts `:name` -> `@name` ONLY inside execTxDynamic (buildMssqlQuery),
-//     so its execStream/exec path expects native `@name` and rejects `:name`
-//     ("Incorrect syntax near ':'"). The test mirrors that real behaviour.
-//
-// The returned column name also differs per database (v vs V), so the value is read
-// through Object.values rather than by name.
-export function runDbSuite(name: TProvider, conn: TConnectionParam | null, execParamQuery: string, txParamQuery: string, skip: string | false): void {
+// selectOne returns exactly one row with one column. Every adapter accepts the `:name`
+// parameter syntax in exec, execStream and execTxDynamic alike — each translates it to
+// its own native form. The returned column name differs per database (v vs V), so the
+// value is read through Object.values rather than by name.
+export function runDbSuite(name: TProvider, conn: TConnectionParam | null, selectOne: string, skip: string | false): void {
 	if (!conn) {
 		test(`${name} (no connection)`, { skip: skip || 'no connection' }, () => {})
 		return
@@ -91,7 +85,7 @@ export function runDbSuite(name: TProvider, conn: TConnectionParam | null, execP
 	})
 
 	test(`${name} exec with param`, { skip }, async () => {
-		const r = await db.exec(execParamQuery, [{ name: 'v', value: 'hello' }])
+		const r = await db.exec(selectOne, [{ name: 'v', value: 'hello' }])
 		assert.equal(r.ok, true, r.ok ? '' : r.error)
 		if (!r.ok) return
 		assert.equal(r.result.length, 1)
@@ -103,7 +97,7 @@ export function runDbSuite(name: TProvider, conn: TConnectionParam | null, execP
 		const kinds: string[] = []
 		let schemaLen = -1
 		let rows = 0
-		await db.execStream(execParamQuery, [{ name: 'v', value: 'hello' }], (ev) => {
+		await db.execStream(selectOne, [{ name: 'v', value: 'hello' }], (ev) => {
 			if (ev.kind === 'schema') { kinds.push('schema'); schemaLen = ev.schema.length }
 			else if (ev.kind === 'row') { kinds.push('row'); rows++ }
 			else { kinds.push('finish'); if (ev.error) kinds.push(`finish(${ev.error})`) }
@@ -115,7 +109,7 @@ export function runDbSuite(name: TProvider, conn: TConnectionParam | null, execP
 
 	test(`${name} execTxDynamic commit`, { skip }, async () => {
 		const r = await db.execTxDynamic(async (exec) => {
-			const res = await exec(txParamQuery, [{ name: 'v', value: 'world' }])
+			const res = await exec(selectOne, [{ name: 'v', value: 'world' }])
 			assert.equal(res.rows.length, 1)
 			assert.equal(Object.values(res.rows[0]!)[0], 'world')
 		})

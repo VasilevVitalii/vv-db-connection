@@ -6,4 +6,4 @@ const skip = conn
 	? ((await reachable(connHost(conn), connPort(conn))) ? false : 'fb: host unreachable')
 	: 'fb: .connect.json missing'
 
-runDbSuite('fb', conn, 'SELECT :v AS v FROM rdb$database', 'SELECT :v AS v FROM rdb$database', skip)
+runDbSuite('fb', conn, 'SELECT :v AS v FROM rdb$database', skip)

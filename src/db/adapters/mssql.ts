@@ -2,10 +2,12 @@ import sql from 'mssql'
 import type { IDbAdapter, TDbCol, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
 import type { TConnMssql } from '../connection'
 import type { TResult } from '../../tresult'
+import { mapPlaceholders } from '../placeholders'
 
-// Converts :name placeholders to @name for mssql named parameters.
+// Converts :name placeholders to @name for mssql named parameters. A colon inside a
+// string literal, a quoted identifier or a comment is left as it is.
 function buildMssqlQuery(query: string): string {
-	return query.replace(/:(\w+)/g, '@$1')
+	return mapPlaceholders(query, (name) => `@${name}`)
 }
 
 function toSchema(columns: Record<string, any>): TDbCol[] {
@@ -90,7 +92,7 @@ export class MssqlAdapter implements IDbAdapter {
 				resolve()
 			})
 
-			request.query(query)
+			request.query(buildMssqlQuery(query))
 		})
 	}
 
