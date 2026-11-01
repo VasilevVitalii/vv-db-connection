@@ -46,3 +46,8 @@ test('leaves a :: cast alone', () => {
 	assert.equal(mapPlaceholders('SELECT 1::int', toAt), 'SELECT 1::int')
 	assert.equal(mapPlaceholders('SELECT :v::int', toAt), 'SELECT @v::int')
 })
+
+test('bounds the rewrite at an offset (EXECUTE BLOCK body)', () => {
+	assert.equal(mapPlaceholders('SELECT :a, :b', toAt, 11), 'SELECT @a, :b')
+	assert.equal(mapPlaceholders(':a :b :c', toAt, 3), '@a :b :c')
+})

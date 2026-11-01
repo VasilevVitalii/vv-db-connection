@@ -1,6 +1,6 @@
 {
   "name": "vv-db-connection",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "The wrapper for connecting to various database servers",
   "keywords": [
     "MSSQL",
@@ -38,7 +38,7 @@
   },
   "dependencies": {
     "mssql": "^12.5.0",
-    "node-firebird": "^1.1.5",
+    "node-firebird": "2.19.1",
     "oracledb": "^26.0.0",
     "pg": "^8.20.0"
   },
