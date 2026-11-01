@@ -1,0 +1,54 @@
+{
+  "name": "vv-db-connection",
+  "version": "1.0.0",
+  "description": "The wrapper for connecting to various database servers",
+  "keywords": [
+    "MSSQL",
+    "Oracle",
+    "PostgreSQL",
+    "Firebird",
+    "connection",
+    "database"
+  ],
+  "homepage": "https://github.com/VasilevVitalii/vv-db-connection#readme",
+  "bugs": {
+    "url": "https://github.com/VasilevVitalii/vv-db-connection/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/VasilevVitalii/vv-db-connection.git"
+  },
+  "license": "MIT",
+  "author": "Vitalii Vasilev",
+  "type": "module",
+  "main": "distjs/src/index.js",
+  "types": "distjs/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./distjs/src/index.d.ts",
+      "import": "./distjs/src/index.js"
+    }
+  },
+  "files": [
+    "distjs/src"
+  ],
+  "scripts": {
+    "build": "tsc && tsc-esm-fix --target=distjs",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "mssql": "^12.5.0",
+    "node-firebird": "^1.1.5",
+    "oracledb": "^26.0.0",
+    "pg": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/mssql": "^12.3.0",
+    "@types/node": "^26.2.0",
+    "@types/oracledb": "^26.0.1",
+    "@types/pg": "^8.20.0",
+    "tsc-esm-fix": "^3.1.2",
+    "tsx": "^4.21.0",
+    "typescript": "^7.0.2"
+  }
+}
