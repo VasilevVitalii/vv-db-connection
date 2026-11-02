@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
-import { test } from 'node:test'
+import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createDbConnection } from '../src/index'
 import type { TConnectionParam } from '../src/db/connection'
@@ -66,6 +66,9 @@ export function runDbSuite(name: TProvider, conn: TConnectionParam | null, selec
 	}
 
 	const db = createDbConnection(conn)
+	// Release the pool after the suite: an idle oracledb pool keeps a ref'd handle
+	// alive, so without this the test process never exits cleanly.
+	after(async () => { await db.close() })
 
 	test(`${name} ping`, { skip }, async () => {
 		const r = await db.ping()

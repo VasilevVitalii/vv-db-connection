@@ -88,7 +88,12 @@ export class DbConnection {
 			settled = true
 			clearTimeout(timer)
 			abort.abort(new Error(error.message))
-			callback({ kind: 'finish', error })
+			// The finish reaches the consumer's callback too. A throw from that handler
+			// has nowhere left to report and must not reach the driver either, so it is
+			// dropped. This also covers finishEarly being called from the catch below.
+			try {
+				callback({ kind: 'finish', error })
+			} catch { /* the consumer's own finish handler threw */ }
 			giveUp()
 		}
 
@@ -118,7 +123,16 @@ export class DbConnection {
 			} else {
 				arm(idleTimeout, timeoutError('idle', idleTimeout))
 			}
-			callback(event)
+			// The consumer's callback runs synchronously inside the driver's own event
+			// handlers (mssql request.on('row'), pg q.on('row'), ora stream.on('data'),
+			// fb sequentially). A throw here would otherwise reach the driver's
+			// EventEmitter and become an uncaughtException or corrupt the driver, so it
+			// is caught and turned into the error of the final finish.
+			try {
+				callback(event)
+			} catch (err) {
+				finishEarly(toDbError(err, 'query'))
+			}
 		}, abort.signal)
 		// The adapter promise is raced against the timeout; when the timeout wins it is no
 		// longer awaited, so a rejection it produces later must not become an

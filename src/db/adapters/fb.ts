@@ -265,6 +265,13 @@ export class FbAdapter implements IDbAdapter {
 			// still running will not send; drop the connection outright instead.
 			const teardown = (): void => { dropConnection(db) }
 			signal.addEventListener('abort', teardown, { once: true })
+			// attach() may have resolved after the deadline already fired: the listener
+			// above was added too late to ever run, and the finally below skips detach() on
+			// an aborted signal. Drop the socket here instead of leaking it.
+			if (signal.aborted) {
+				teardown()
+				return { ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }
+			}
 			let tx: Firebird.Transaction | undefined
 			try {
 				tx = await new Promise<Firebird.Transaction>((resolve, reject) => {

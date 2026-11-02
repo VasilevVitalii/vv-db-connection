@@ -98,9 +98,15 @@ export class MssqlAdapter implements IDbAdapter {
 			const onAbort = (): void => {
 				if (done) return
 				done = true
-				// Cancel the statement, not the pool: the connection stays usable for the
-				// next call, unlike the pre-pool teardown that closed the whole pool.
-				try { request.cancel() } catch {}
+				// Tear the borrowed connection down hard. cancel() only sends an ATTN and
+				// waits for a server response that may never come, which strands the tarn
+				// slot forever (contract: "tear down without waiting"). Destroying the socket
+				// completes the request locally and releases the connection at once.
+				try {
+					const conn = (request as unknown as { _currentRequest?: { connection?: { close(): void } } })._currentRequest?.connection
+					if (conn) conn.close()
+					else request.cancel()
+				} catch {}
 				resolve()
 			}
 			signal?.addEventListener('abort', onAbort)
@@ -140,6 +146,13 @@ export class MssqlAdapter implements IDbAdapter {
 			pool.on('error', () => {})
 			const teardown = (): void => { void pool.close().catch(() => {}) }
 			signal.addEventListener('abort', teardown, { once: true })
+			// connect() may have resolved after the deadline already fired: the listener
+			// above was added too late to ever run, and the finally below skips close() on
+			// an aborted signal. Tear the connection down here instead of leaking it.
+			if (signal.aborted) {
+				teardown()
+				return { ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }
+			}
 			let tx: sql.Transaction | undefined
 			try {
 				tx = new sql.Transaction(pool)

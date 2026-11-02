@@ -14,9 +14,10 @@ if (mssql && pg) {
 	skip = okMssql && okPg ? false : 'multi: host unreachable'
 }
 
-test('two connections in parallel (mssql + pg)', { skip }, async () => {
+test('two connections in parallel (mssql + pg)', { skip }, async (t) => {
 	const mssqlDb = createDbConnection(mssql!)
 	const pgDb = createDbConnection(pg!)
+	t.after(async () => { await mssqlDb.close(); await pgDb.close() })
 	assert.equal(mssqlDb.kind(), 'mssql')
 	assert.equal(pgDb.kind(), 'pg')
 	const [r1, r2] = await Promise.all([mssqlDb.ping(), pgDb.ping()])

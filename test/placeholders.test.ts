@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mapPlaceholders } from '../src/db/placeholders'
+import { mapPlaceholders, SQL_ATOM_PG } from '../src/db/placeholders'
 
 const toAt = (name: string): string => `@${name}`
 
@@ -65,6 +65,21 @@ test('leaves a dollar-quoted string alone (pg DO block)', () => {
 	assert.equal(mapPlaceholders('SELECT $body$ :x $body$', toAt), 'SELECT $body$ :x $body$')
 })
 
-test('handles a backslash-escaped quote in an E string (pg)', () => {
-	assert.equal(mapPlaceholders("SELECT E'it\\'s :v'", toAt), "SELECT E'it\\'s :v'")
+test('handles a backslash-escaped quote in a pg E string', () => {
+	assert.equal(mapPlaceholders("SELECT E'it\\'s :v'", toAt, undefined, SQL_ATOM_PG), "SELECT E'it\\'s :v'")
+	assert.equal(mapPlaceholders("SELECT e'it\\'s :v'", toAt, undefined, SQL_ATOM_PG), "SELECT e'it\\'s :v'")
+})
+
+test('treats a backslash as an ordinary character in a string (MSSQL/Oracle/Firebird)', () => {
+	const q = "WHERE path = 'C:\\' AND id = :id AND name = 'x'"
+	assert.equal(mapPlaceholders(q, toAt), "WHERE path = 'C:\\' AND id = @id AND name = 'x'")
+})
+
+test('pg: a backslash is ordinary in a standard string, an escape only in an E string', () => {
+	const q = "WHERE path = 'C:\\' AND id = :id AND name = 'x'"
+	assert.equal(mapPlaceholders(q, toAt, undefined, SQL_ATOM_PG), "WHERE path = 'C:\\' AND id = @id AND name = 'x'")
+})
+
+test('does not treat a backslash-quote as an escape in a quoted identifier', () => {
+	assert.equal(mapPlaceholders('SELECT "C:\\" AS p, :v', toAt), 'SELECT "C:\\" AS p, @v')
 })

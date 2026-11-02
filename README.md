@@ -181,7 +181,7 @@ In Firebird a `:name` inside a string literal, a quoted identifier or a comment 
 type TDbErrorKind = 'connect' | 'query' | 'timeout' | 'aborted'
 type TDbError = {
   message: string
-  code?: string   // driver code: SQLSTATE (pg), ORA-xxxxx / NJS-xxxx (ora), SQL Server number (mssql)
+  code?: string   // driver code: SQLSTATE (pg), ORA-xxxxx / NJS-xxxx (ora), SQL Server number (mssql), gdscode (fb)
   kind: TDbErrorKind
 }
 

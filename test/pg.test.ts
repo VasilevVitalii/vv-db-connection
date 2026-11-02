@@ -13,8 +13,9 @@ runDbSuite('pg', conn, 'SELECT :v AS v', skip)
 
 // A colon inside a string literal is text, not a parameter: the query must come back
 // verbatim, not with the literal rewritten to '12@30'.
-test('pg: colon inside a string literal stays literal', { skip }, async () => {
+test('pg: colon inside a string literal stays literal', { skip }, async (t) => {
 	const db = createDbConnection(conn!)
+	t.after(async () => { await db.close() })
 	const r = await db.exec("SELECT '12:30' AS t, :v AS v", [{ name: 'v', value: 'hello' }])
 	assert.equal(r.ok, true, r.ok ? '' : r.error.message)
 	if (!r.ok) return

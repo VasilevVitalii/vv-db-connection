@@ -17,9 +17,9 @@ export type TDbRes = {
 }
 
 // A structured error: `kind` tells what happened, `code` keeps the driver's own code
-// (SQLSTATE for pg, ORA-xxxxx / NJS-xxxx for oracle, SQL Server number for mssql), and
-// `message` is the human text. Two failures are told apart by `code`/`kind`, not by
-// parsing `message`.
+// (SQLSTATE for pg, ORA-xxxxx / NJS-xxxx for oracle, SQL Server number for mssql,
+// gdscode for firebird), and `message` is the human text. Two failures are told apart by
+// `code`/`kind`, not by parsing `message`.
 export type TDbErrorKind = 'connect' | 'query' | 'timeout' | 'aborted'
 export type TDbError = {
 	message: string

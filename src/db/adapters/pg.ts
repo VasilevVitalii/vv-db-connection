@@ -2,7 +2,7 @@ import { Client, Pool, Query, type FieldDef, type PoolClient, type QueryResult }
 import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
 import type { TConnPg } from '../connection'
 import type { TResult } from '../../tresult'
-import { mapPlaceholders } from '../placeholders'
+import { mapPlaceholders, SQL_ATOM_PG } from '../placeholders'
 import { toDbError, withTxTimeout } from '../helpers'
 
 function toSchema(fields: FieldDef[]): TDbCol[] {
@@ -23,7 +23,7 @@ function buildQuery(query: string, params: TDbParam[]): { text: string; values: 
 			nameToIndex.set(name, values.length)
 		}
 		return `$${nameToIndex.get(name)}`
-	})
+	}, undefined, SQL_ATOM_PG)
 	return { text, values }
 }
 
@@ -174,6 +174,13 @@ export class PgAdapter implements IDbAdapter {
 				try { internals.connection?.stream?.destroy() } catch {}
 			}
 			signal.addEventListener('abort', teardown, { once: true })
+			// connect() may have resolved after the deadline already fired: the listener
+			// above was added too late to ever run, and the finally below skips release()
+			// on an aborted signal. Rip the socket here instead of leaking the pool client.
+			if (signal.aborted) {
+				teardown()
+				return { ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }
+			}
 			try {
 				await client.query('BEGIN')
 				const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {

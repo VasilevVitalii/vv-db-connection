@@ -144,6 +144,14 @@ export class OraAdapter implements IDbAdapter {
 				void conn.close().catch(() => {})
 			}
 			signal.addEventListener('abort', teardown, { once: true })
+			// getConnection() may have resolved after the deadline already fired: the
+			// listener above was added too late to ever run, and the finally below skips
+			// close() on an aborted signal. Release the connection here instead of leaking
+			// it from the shared pool (poolMax is small enough to exhaust).
+			if (signal.aborted) {
+				teardown()
+				return { ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }
+			}
 			try {
 				const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
 					const { sql, binds } = buildQuery(query, params)

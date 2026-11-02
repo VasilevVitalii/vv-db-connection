@@ -2,11 +2,15 @@ import type { TResult } from '../tresult'
 import type { TDbError, TDbErrorKind } from './types'
 
 // Builds a TDbError from whatever a driver throws. Each driver reports its own code in a
-// different field (pg: code, mssql: number or code, oracle: code) - all of them are
-// picked up so the driver's code survives the generic catch instead of being lost.
+// different field, and the most specific one must win: mssql's `number` (1205, 2627) is
+// the real SQL Server number while its `code` is only the driver class ('EREQUEST' /
+// 'ELOGIN' / 'ETIMEOUT'); Firebird's `gdscode` is its own error code; pg's `code` is the
+// SQLSTATE; Oracle's `code` is 'ORA-xxxxx' / 'NJS-xxxx'. `number`/`gdscode` therefore
+// come before the generic `code`, with `sqlState` as the last fallback - this keeps a
+// driver's real error identifier instead of the boilerplate wrapper around it.
 export function toDbError(err: unknown, kind: TDbErrorKind): TDbError {
-	const e = err as { message?: unknown; code?: unknown; number?: unknown; sqlState?: unknown } | null | undefined
-	const code = e?.code ?? e?.number ?? e?.sqlState
+	const e = err as { message?: unknown; code?: unknown; number?: unknown; sqlState?: unknown; gdscode?: unknown } | null | undefined
+	const code = e?.number ?? e?.gdscode ?? e?.code ?? e?.sqlState
 	return {
 		message: typeof e?.message === 'string' ? e.message : String(err),
 		kind,

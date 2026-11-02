@@ -27,6 +27,31 @@ test('toDbError keeps the driver code (code / number / sqlState) and the kind', 
 	)
 })
 
+test('toDbError prefers the SQL Server number over the mssql driver class code', () => {
+	assert.deepEqual(
+		toDbError({ message: 'deadlock', code: 'EREQUEST', number: 1205 }, 'query'),
+		{ message: 'deadlock', code: '1205', kind: 'query' },
+	)
+	assert.deepEqual(
+		toDbError({ message: 'unique violation', code: 'EREQUEST', number: 2627 }, 'query'),
+		{ message: 'unique violation', code: '2627', kind: 'query' },
+	)
+})
+
+test('toDbError keeps the mssql driver code when there is no number (connection error)', () => {
+	assert.deepEqual(
+		toDbError({ message: 'timeout', code: 'ETIMEOUT' }, 'connect'),
+		{ message: 'timeout', code: 'ETIMEOUT', kind: 'connect' },
+	)
+})
+
+test('toDbError keeps the Firebird gdscode', () => {
+	assert.deepEqual(
+		toDbError({ message: 'Dynamic SQL Error', gdscode: 335544569 }, 'query'),
+		{ message: 'Dynamic SQL Error', code: '335544569', kind: 'query' },
+	)
+})
+
 test('toDbError falls back to String(err) when there is no message', () => {
 	assert.deepEqual(
 		toDbError('plain string', 'connect'),
