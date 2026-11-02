@@ -14,6 +14,8 @@ export type TConnMssql = {
 	auth: TMssqlAuth
 	trustServerCertificate?: boolean
 	encrypt?: boolean
+	ca?: string // PEM CA certificate(s); passed to tedious as cryptoCredentialsDetails.ca
+	connectTimeout?: number // ms; drives tedious connectionTimeout + tarn acquire/create
 }
 
 export type TConnPg = {
@@ -23,7 +25,8 @@ export type TConnPg = {
 	database: string
 	user: string
 	password: string
-	ssl?: boolean
+	ssl?: boolean | { ca?: string; trustServerCertificate?: boolean }
+	connectTimeout?: number // ms; pg connectionTimeoutMillis
 }
 
 export type TOraPrivilege = 'SYSDBA' | 'SYSOPER' | 'SYSASM' | 'SYSBACKUP' | 'SYSDG' | 'SYSKM' | 'SYSRAC'
@@ -36,6 +39,7 @@ export type TConnOra = {
 	user: string
 	password: string
 	privilege?: TOraPrivilege
+	connectTimeout?: number // ms; converted to seconds for oracledb connectTimeout
 }
 
 export type TConnFb = {

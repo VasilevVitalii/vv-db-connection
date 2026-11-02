@@ -16,7 +16,7 @@ runDbSuite('pg', conn, 'SELECT :v AS v', skip)
 test('pg: colon inside a string literal stays literal', { skip }, async () => {
 	const db = createDbConnection(conn!)
 	const r = await db.exec("SELECT '12:30' AS t, :v AS v", [{ name: 'v', value: 'hello' }])
-	assert.equal(r.ok, true, r.ok ? '' : r.error)
+	assert.equal(r.ok, true, r.ok ? '' : r.error.message)
 	if (!r.ok) return
 	const row = r.result[0]!.rows[0] as Record<string, unknown>
 	assert.equal(row.t, '12:30')

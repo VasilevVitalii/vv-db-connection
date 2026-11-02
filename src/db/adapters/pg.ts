@@ -1,11 +1,12 @@
-import { Client, type FieldDef } from 'pg'
-import type { IDbAdapter, TDbCol, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
+import { Client, Pool, Query, type FieldDef, type PoolClient, type QueryResult } from 'pg'
+import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
 import type { TConnPg } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders } from '../placeholders'
+import { toDbError, withTxTimeout } from '../helpers'
 
 function toSchema(fields: FieldDef[]): TDbCol[] {
-	return fields.map((f) => ({ name: f.name, kind: 'unknown' }))
+	return fields.map((f) => ({ name: f.name, kind: String(f.dataTypeID) }))
 }
 
 // Converts :name placeholders to $1, $2, ... and collects values.
@@ -35,6 +36,36 @@ export class PgAdapter implements IDbAdapter {
 	versionQuery(): string { return 'SELECT version() AS ver' }
 	pingQuery(): string { return 'SELECT 1 AS p' }
 
+	private _pool?: Pool
+	private pool(): Pool {
+		if (!this._pool) {
+			this._pool = new Pool(this._clientConfig())
+			// An idle client that loses its connection emits "error" on the pool; with no
+			// listener that would be thrown. The client in use rejects on its own.
+			this._pool.on('error', () => {})
+		}
+		return this._pool
+	}
+
+	async close(): Promise<void> {
+		if (this._pool) {
+			try { await this._pool.end() } catch {}
+			this._pool = undefined
+		}
+	}
+
+	private _sslConfig() {
+		const ssl = this.p.ssl
+		if (!ssl) return undefined
+		if (ssl === true) return { rejectUnauthorized: false }
+		// trustServerCertificate is the same flag mssql uses: true = accept the server
+		// certificate without verifying it. The driver speaks rejectUnauthorized, so invert.
+		return {
+			rejectUnauthorized: ssl.trustServerCertificate !== true,
+			...(ssl.ca ? { ca: ssl.ca } : {}),
+		}
+	}
+
 	private _clientConfig() {
 		return {
 			host:     this.p.host,
@@ -42,7 +73,8 @@ export class PgAdapter implements IDbAdapter {
 			database: this.p.database,
 			user:     this.p.user,
 			password: this.p.password,
-			ssl:      this.p.ssl ? { rejectUnauthorized: false } : undefined,
+			ssl:      this._sslConfig(),
+			...(this.p.connectTimeout ? { connectionTimeoutMillis: this.p.connectTimeout } : {}),
 			options:  '-c client_encoding=UTF8',
 		}
 	}
@@ -61,7 +93,13 @@ export class PgAdapter implements IDbAdapter {
 	}
 
 	async execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void> {
-		const client = new Client(this._clientConfig())
+		let client: PoolClient
+		try {
+			client = await this.pool().connect()
+		} catch (err) {
+			callback({ kind: 'finish', error: toDbError(err, 'connect') })
+			return
+		}
 		// The socket is destroyed rather than ended: a graceful end waits for a server
 		// that may be the very thing that stopped answering. The query then fails, and the
 		// client also emits "error" - with nobody listening that would be thrown.
@@ -73,68 +111,85 @@ export class PgAdapter implements IDbAdapter {
 		}
 		signal?.addEventListener('abort', onAbort)
 		try {
-			await client.connect()
 			const { text, values } = buildQuery(query, params)
-			const result = await client.query({ text, values })
-			callback({ kind: 'schema', schema: toSchema(result.fields) })
-			for (const row of result.rows) {
-				callback({ kind: 'row', row })
+			// Multi-statement works only on the simple query protocol (no parameters) and
+			// comes back buffered as an array of results. A parameterized query goes over
+			// the extended protocol, where Query streams rows instead of buffering them.
+			if (values.length === 0) {
+				const result = await client.query(text)
+				const sets = (Array.isArray(result) ? result : [result]) as QueryResult[]
+				for (const rs of sets) {
+					callback({ kind: 'schema', schema: toSchema(rs.fields ?? []) })
+					for (const row of rs.rows) {
+						callback({ kind: 'row', row })
+					}
+				}
+			} else {
+				await new Promise<void>((resolve, reject) => {
+					const q = new Query({ text, values })
+					let schemaEmitted = false
+					q.on('row', (row: Record<string, unknown>, result?: { fields?: FieldDef[] }) => {
+						if (!schemaEmitted) {
+							schemaEmitted = true
+							callback({ kind: 'schema', schema: toSchema(result?.fields ?? []) })
+						}
+						callback({ kind: 'row', row })
+					})
+					q.on('error', (err: Error) => reject(err))
+					q.on('end', (result: { fields?: FieldDef[] }) => {
+						if (!schemaEmitted) {
+							callback({ kind: 'schema', schema: toSchema(result.fields ?? []) })
+						}
+						resolve()
+					})
+					client.query(q)
+				})
 			}
 			callback({ kind: 'finish' })
 		} catch (err) {
-			callback({ kind: 'finish', error: String(err) })
+			callback({ kind: 'finish', error: toDbError(err, 'query') })
 		} finally {
 			signal?.removeEventListener('abort', onAbort)
-			try { await client.end() } catch {}
+			client.release(signal?.aborted)
 		}
 	}
 
-	async execTxDynamic(cb: TDbTxCb, timeoutMs?: number): Promise<TResult<void>> {
-		const client = new Client({
-			host:     this.p.host,
-			port:     this.p.port ?? 5432,
-			database: this.p.database,
-			user:     this.p.user,
-			password: this.p.password,
-			ssl:      this.p.ssl ? { rejectUnauthorized: false } : undefined,
-			options:  '-c client_encoding=UTF8',
-		})
-		const txWork = async (): Promise<TResult<void>> => {
+	async execTxDynamic(cb: TDbTxCb, timeoutMs?: number): Promise<TResult<void, TDbError>> {
+		return withTxTimeout(timeoutMs, async (signal) => {
+			let client: PoolClient
 			try {
-				await client.connect()
+				client = await this.pool().connect()
+			} catch (err) {
+				return { ok: false, error: toDbError(err, 'connect') }
+			}
+			// A connection lost with no query in flight emits "error" on the client; with
+			// nobody listening that would be thrown. Queries reject on their own.
+			client.on('error', () => {})
+			// On a timeout a graceful end() would send Terminate, which the backend only
+			// reads after the running query has finished - so a stuck query would outlive
+			// it. Cancel it on the server and rip the socket, as execStream's onAbort does.
+			const teardown = (): void => {
+				const internals = client as unknown as { processID?: number; connection?: { stream?: { destroy(): void } } }
+				if (internals.processID) this._cancelBackend(internals.processID)
+				try { internals.connection?.stream?.destroy() } catch {}
+			}
+			signal.addEventListener('abort', teardown, { once: true })
+			try {
 				await client.query('BEGIN')
 				const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
 					const { text, values } = buildQuery(query, params)
-					return new Promise<TDbTxResult>((resolve, reject) => {
-						const onUncaught = (err: Error) => reject(err)
-						process.once('uncaughtException', onUncaught)
-						client.query({ text, values })
-							.then((res) => { process.removeListener('uncaughtException', onUncaught); resolve({ rows: res.rows as Record<string, unknown>[] }) })
-							.catch((err) => { process.removeListener('uncaughtException', onUncaught); reject(err) })
-					})
+					return client.query({ text, values }).then((res) => ({ rows: res.rows as Record<string, unknown>[] }))
 				}
-				await cb(exec)
+				await cb(exec, signal)
 				await client.query('COMMIT')
 				return { ok: true, result: undefined }
 			} catch (err) {
 				try { await client.query('ROLLBACK') } catch {}
-				return { ok: false, error: String(err) }
+				return { ok: false, error: toDbError(err, 'query') }
 			} finally {
-				try { await client.end() } catch {}
+				signal.removeEventListener('abort', teardown)
+				client.release(signal.aborted)
 			}
-		}
-		if (!timeoutMs) return txWork()
-		let timer: ReturnType<typeof setTimeout> | undefined
-		const timeoutPromise = new Promise<TResult<void>>((resolve) => {
-			timer = setTimeout(() => {
-				void client.end().catch(() => {})
-				resolve({ ok: false, error: 'TIMEOUT' })
-			}, timeoutMs)
 		})
-		try {
-			return await Promise.race([txWork(), timeoutPromise])
-		} finally {
-			clearTimeout(timer)
-		}
 	}
 }

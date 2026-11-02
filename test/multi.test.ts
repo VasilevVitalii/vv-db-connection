@@ -20,6 +20,6 @@ test('two connections in parallel (mssql + pg)', { skip }, async () => {
 	assert.equal(mssqlDb.kind(), 'mssql')
 	assert.equal(pgDb.kind(), 'pg')
 	const [r1, r2] = await Promise.all([mssqlDb.ping(), pgDb.ping()])
-	assert.equal(r1.ok, true, r1.ok ? '' : r1.error)
-	assert.equal(r2.ok, true, r2.ok ? '' : r2.error)
+	assert.equal(r1.ok, true, r1.ok ? '' : r1.error.message)
+	assert.equal(r2.ok, true, r2.ok ? '' : r2.error.message)
 })

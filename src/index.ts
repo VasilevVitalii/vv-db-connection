@@ -12,11 +12,13 @@ export type {
 	TOraPrivilege,
 } from './db/connection'
 export type {
-	IDbAdapter,
 	TDbParam,
 	TDbCol,
 	TDbRes,
 	TDbStreamEvent,
+	TDbError,
+	TDbErrorKind,
+	TExecOptions,
 	TDbTxResult,
 	TDbTxExec,
 	TDbTxCb,

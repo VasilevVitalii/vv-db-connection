@@ -51,3 +51,20 @@ test('bounds the rewrite at an offset (EXECUTE BLOCK body)', () => {
 	assert.equal(mapPlaceholders('SELECT :a, :b', toAt, 11), 'SELECT @a, :b')
 	assert.equal(mapPlaceholders(':a :b :c', toAt, 3), '@a :b :c')
 })
+
+test('does not treat a digit-leading name as a placeholder (array slice)', () => {
+	assert.equal(mapPlaceholders('SELECT arr[1:2]', toAt), 'SELECT arr[1:2]')
+})
+
+test('leaves a bracket-quoted identifier alone (MSSQL)', () => {
+	assert.equal(mapPlaceholders('SELECT [a:b] AS x', toAt), 'SELECT [a:b] AS x')
+})
+
+test('leaves a dollar-quoted string alone (pg DO block)', () => {
+	assert.equal(mapPlaceholders('DO $$ SELECT :v $$', toAt), 'DO $$ SELECT :v $$')
+	assert.equal(mapPlaceholders('SELECT $body$ :x $body$', toAt), 'SELECT $body$ :x $body$')
+})
+
+test('handles a backslash-escaped quote in an E string (pg)', () => {
+	assert.equal(mapPlaceholders("SELECT E'it\\'s :v'", toAt), "SELECT E'it\\'s :v'")
+})

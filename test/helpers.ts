@@ -69,12 +69,12 @@ export function runDbSuite(name: TProvider, conn: TConnectionParam | null, selec
 
 	test(`${name} ping`, { skip }, async () => {
 		const r = await db.ping()
-		assert.equal(r.ok, true, r.ok ? '' : r.error)
+		assert.equal(r.ok, true, r.ok ? '' : r.error.message)
 	})
 
 	test(`${name} version`, { skip }, async () => {
 		const r = await db.version()
-		assert.equal(r.ok, true, r.ok ? '' : r.error)
+		assert.equal(r.ok, true, r.ok ? '' : r.error.message)
 		if (r.ok) assert.ok(r.result.length > 0, 'empty version string')
 	})
 
@@ -86,7 +86,7 @@ export function runDbSuite(name: TProvider, conn: TConnectionParam | null, selec
 
 	test(`${name} exec with param`, { skip }, async () => {
 		const r = await db.exec(selectOne, [{ name: 'v', value: 'hello' }])
-		assert.equal(r.ok, true, r.ok ? '' : r.error)
+		assert.equal(r.ok, true, r.ok ? '' : r.error.message)
 		if (!r.ok) return
 		assert.equal(r.result.length, 1)
 		const row = r.result[0]!.rows[0] as Record<string, unknown>
@@ -100,7 +100,7 @@ export function runDbSuite(name: TProvider, conn: TConnectionParam | null, selec
 		await db.execStream(selectOne, [{ name: 'v', value: 'hello' }], (ev) => {
 			if (ev.kind === 'schema') { kinds.push('schema'); schemaLen = ev.schema.length }
 			else if (ev.kind === 'row') { kinds.push('row'); rows++ }
-			else { kinds.push('finish'); if (ev.error) kinds.push(`finish(${ev.error})`) }
+			else { kinds.push('finish'); if (ev.error) kinds.push(`finish(${ev.error.message})`) }
 		})
 		assert.deepEqual(kinds, ['schema', 'row', 'finish'])
 		assert.equal(schemaLen, 1)
@@ -113,12 +113,12 @@ export function runDbSuite(name: TProvider, conn: TConnectionParam | null, selec
 			assert.equal(res.rows.length, 1)
 			assert.equal(Object.values(res.rows[0]!)[0], 'world')
 		})
-		assert.equal(r.ok, true, r.ok ? '' : r.error)
+		assert.equal(r.ok, true, r.ok ? '' : r.error.message)
 	})
 
 	test(`${name} execTxDynamic rollback on throw`, { skip }, async () => {
 		const r = await db.execTxDynamic(async () => { throw new Error('boom') })
 		assert.equal(r.ok, false)
-		if (!r.ok) assert.match(r.error, /boom/)
+		if (!r.ok) assert.match(r.error.message, /boom/)
 	})
 }

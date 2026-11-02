@@ -6,3 +6,10 @@ distjs/
 
 # подключения к локальнмм БД для теста
 .connect.json
+
+# проверки opus
+review1.txt
+review2.txt
+review3.txt
+review4.txt
+review5.txt

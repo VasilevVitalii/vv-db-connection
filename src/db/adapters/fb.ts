@@ -1,9 +1,10 @@
 import * as Firebird from 'node-firebird'
 import Connection from 'node-firebird/lib/wire/connection'
-import type { IDbAdapter, TDbCol, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
+import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
 import type { TConnFb } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM } from '../placeholders'
+import { toDbError, withTxTimeout } from '../helpers'
 
 // ---- monkey-patch: node-firebird@2 leaks the TCP socket on a failed attach ----
 // Connection.attach() answers an attach error with doError(err, cb) and never
@@ -46,6 +47,40 @@ if (!fbAttachProto.attach.__vvPatched) {
 	} as FbAttachFn & { __vvPatched?: true }
 	patched.__vvPatched = true
 	fbAttachProto.attach = patched
+}
+
+
+// Firebird reports each column's type as a numeric SQL code; map it back to the
+// driver's type name ('VARYING', 'INT64', ...) for TDbCol.kind - the same names the
+// driver's own withMeta fields deliver. SQL_TYPES is the public name -> code table.
+const FB_TYPE_NAME: Record<number, string> = {}
+for (const [key, code] of Object.entries(Firebird.SQL_TYPES)) {
+	FB_TYPE_NAME[code] = key.replace(/^SQL_(TYPE_)?/, '')
+}
+
+// The describe metadata of one output column, as node-firebird exposes it on
+// statement.output after prepare.
+type FbColMeta = {
+	type: number
+	subType?: number
+	scale?: number
+	length?: number
+	nativeLength?: number
+	field?: string
+	alias?: string
+}
+
+function fbSchema(output: FbColMeta[]): TDbCol[] {
+	return output.map((m) => {
+		const col: TDbCol = {
+			name: m.alias ?? m.field ?? '',
+			kind: FB_TYPE_NAME[m.type] ?? String(m.type),
+		}
+		const len = m.nativeLength ?? m.length
+		if (len !== undefined) col.len = len
+		if (m.scale !== undefined) col.scale = m.scale
+		return col
+	})
 }
 
 
@@ -94,17 +129,17 @@ function buildQuery(query: string, params: TDbParam[]): { sql: string; values: u
 // good: the driver emits it from the socket handler, and without a listener the loss is
 // silently swallowed instead of surfacing.
 /* eslint-disable @typescript-eslint/no-explicit-any */
-function watchConnection(db: Firebird.Database, onLost: (error: string) => void): void {
+function watchConnection(db: Firebird.Database, onLost: (error: TDbError) => void): void {
 	// The typings leave out that Database is an EventEmitter.
 	const events: any = db
 	const conn: any   = events.connection
-	events.on('error', (err: unknown) => onLost(`fb: connection lost: ${String(err)}`))
-	events.on('reconnect', () => onLost('fb: connection lost, the driver reattached on its own'))
+	events.on('error', (err: unknown) => onLost({ message: `fb: connection lost: ${String(err)}`, kind: 'query' }))
+	events.on('reconnect', () => onLost({ message: 'fb: connection lost, the driver reattached on its own', kind: 'query' }))
 	conn?._socket?.on('close', () => {
 		// Set by our own detach at the end of the query - a close that was asked for.
 		if (conn._isDetach) return
 		clearTimeout(conn._retry_connection_id)
-		onLost('fb: connection lost')
+		onLost({ message: 'fb: connection lost', kind: 'query' })
 	})
 }
 
@@ -121,15 +156,18 @@ function dropConnection(db: Firebird.Database): void {
 export class FbAdapter implements IDbAdapter {
 	constructor(private readonly p: TConnFb) {}
 
+	// node-firebird has no connection pool; each attach is closed by its own query, so
+	// nothing is held between calls to release.
+	async close(): Promise<void> {}
+
 	kind(): 'fb' { return 'fb' }
 	title(): string { return `${this.p.host}:${this.p.port || 'DEFAULT'} [${this.p.database}]` }
 	user(): string { return this.p.user }
 	versionQuery(): string { return "SELECT rdb$get_context('SYSTEM', 'ENGINE_VERSION') AS ver FROM rdb$database" }
 	pingQuery(): string { return 'SELECT 1 AS p FROM rdb$database' }
 
-	async execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void> {
-		const { sql, values } = buildQuery(query, params)
-		const options: Firebird.Options = {
+	private _options(): Firebird.Options {
+		return {
 			host:     this.p.host,
 			port:     this.p.port ?? 3050,
 			database: this.p.database,
@@ -140,10 +178,24 @@ export class FbAdapter implements IDbAdapter {
 			// value, and JSON.stringify silently drops such a field from the row.
 			blobAsText: true,
 		}
+	}
+
+	async execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void> {
+		let sql: string
+		let values: unknown[]
+		try {
+			const parsed = buildQuery(query, params)
+			sql = parsed.sql
+			values = parsed.values
+		} catch (err) {
+			callback({ kind: 'finish', error: toDbError(err, 'query') })
+			return
+		}
+		const options = this._options()
 		return new Promise<void>((resolve) => {
 			let done = false
 			let db: Firebird.Database | undefined
-			const finish = (error?: string): void => {
+			const finish = (error?: TDbError): void => {
 				if (done) return
 				done = true
 				signal?.removeEventListener('abort', onAbort)
@@ -152,13 +204,13 @@ export class FbAdapter implements IDbAdapter {
 			}
 			const onAbort = (): void => {
 				if (db) dropConnection(db)
-				finish(String(signal?.reason ?? 'aborted'))
+				finish({ message: String(signal?.reason ?? 'aborted'), kind: 'aborted' })
 			}
-			if (signal?.aborted) { finish(String(signal.reason ?? 'aborted')); return }
+			if (signal?.aborted) { finish({ message: String(signal.reason ?? 'aborted'), kind: 'aborted' }); return }
 			signal?.addEventListener('abort', onAbort)
 
 			Firebird.attach(options, (attachErr, attached) => {
-				if (attachErr) { finish(String(attachErr)); return }
+				if (attachErr) { finish(toDbError(attachErr, 'connect')); return }
 				// Given up while the attach was on its way - nobody is waiting for this one.
 				if (done) { dropConnection(attached); return }
 				db = attached
@@ -166,87 +218,84 @@ export class FbAdapter implements IDbAdapter {
 					dropConnection(attached)
 					finish(error)
 				})
-				let schemaEmitted = false
-				db.sequentially(
-					sql,
-					values,
-					(row: Record<string, unknown>, _index: number) => {
-						if (done) return
-						if (!schemaEmitted) {
-							schemaEmitted = true
-							const schema: TDbCol[] = Object.keys(row).map((name) => ({ name, kind: 'unknown' }))
-							callback({ kind: 'schema', schema })
-						}
-						callback({ kind: 'row', row })
-					},
-					(seqErr?: Error) => {
-						if (done) return
+				// Schema comes from the statement's describe, not from the first row: it is
+				// there for an empty result too, and carries the real column types. The
+				// streaming APIs do not hand the describe back, so it is asked for on its
+				// own statement, then the rows are streamed separately.
+				attached.newStatement(sql, (stmtErr, statement) => {
+					if (stmtErr) {
 						attached.detach()
-						finish(seqErr ? String(seqErr) : undefined)
-					},
-				)
+						finish(toDbError(stmtErr, 'query'))
+						return
+					}
+					if (done) { dropConnection(attached); return }
+					callback({ kind: 'schema', schema: fbSchema((statement as { output?: FbColMeta[] }).output ?? []) })
+					statement.drop(() => {})
+					// Rows arrive one by one; the schema above has already been emitted, so
+					// the columns no longer depend on a first row.
+					attached.sequentially(
+						sql,
+						values,
+						(row: Record<string, unknown>) => {
+							if (!done) callback({ kind: 'row', row })
+						},
+						(seqErr?: Error) => {
+							if (done) return
+							attached.detach()
+							finish(seqErr ? toDbError(seqErr, 'query') : undefined)
+						},
+					)
+				})
 			})
 		})
 	}
 
-	async execTxDynamic(cb: TDbTxCb, timeoutMs?: number): Promise<TResult<void>> {
-		const options: Firebird.Options = {
-			host:     this.p.host,
-			port:     this.p.port ?? 3050,
-			database: this.p.database,
-			user:     this.p.user,
-			password: this.p.password,
-			encoding: (this.p.charset ?? 'UTF8') as Firebird.SupportedCharacterSet,
-			// Without it a text blob arrives as an async reader function instead of a
-			// value, and JSON.stringify silently drops such a field from the row.
-			blobAsText: true,
-		}
-		const db = await new Promise<Firebird.Database>((resolve, reject) => {
-			Firebird.attach(options, (err, d) => { if (err) reject(err); else resolve(d) })
-		})
-		const txWork = async (): Promise<TResult<void>> => {
+	async execTxDynamic(cb: TDbTxCb, timeoutMs?: number): Promise<TResult<void, TDbError>> {
+		const options = this._options()
+		return withTxTimeout(timeoutMs, async (signal) => {
+			let db: Firebird.Database
 			try {
-				const transaction = await new Promise<Firebird.Transaction>((resolve, reject) => {
-					db.transaction(Firebird.ISOLATION_READ_COMMITTED, (err, tx) => { if (err) reject(err); else resolve(tx) })
+				db = await new Promise<Firebird.Database>((resolve, reject) => {
+					Firebird.attach(options, (err, d) => { if (err) reject(err); else resolve(d) })
 				})
-				try {
-					const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
-						const { sql: sqlStr, values } = buildQuery(query, params)
-						return new Promise<TDbTxResult>((resolve, reject) => {
-							transaction.query(sqlStr, values, (err: Error | null, rows: Record<string, unknown>[]) => {
-								if (err) reject(err)
-								else resolve({ rows: rows ?? [] })
-							})
-						})
-					}
-					await cb(exec)
-					await new Promise<void>((resolve, reject) => {
-						transaction.commit((err: Error | null) => { if (err) reject(err); else resolve() })
-					})
-					db.detach()
-					return { ok: true, result: undefined }
-				} catch (err) {
-					try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {}
-					db.detach()
-					return { ok: false, error: String(err) }
-				}
 			} catch (err) {
-				try { db.detach() } catch {}
-				return { ok: false, error: String(err) }
+				return { ok: false, error: toDbError(err, 'connect') }
 			}
-		}
-		if (!timeoutMs) return txWork()
-		let timer: ReturnType<typeof setTimeout> | undefined
-		const timeoutPromise = new Promise<TResult<void>>((resolve) => {
-			timer = setTimeout(() => {
-				try { db.detach() } catch {}
-				resolve({ ok: false, error: 'TIMEOUT' })
-			}, timeoutMs)
+			// detach() waits for the server's answer, which a transaction the server is
+			// still running will not send; drop the connection outright instead.
+			const teardown = (): void => { dropConnection(db) }
+			signal.addEventListener('abort', teardown, { once: true })
+			let tx: Firebird.Transaction | undefined
+			try {
+				tx = await new Promise<Firebird.Transaction>((resolve, reject) => {
+					db.transaction(Firebird.ISOLATION_READ_COMMITTED, (err, t) => { if (err) reject(err); else resolve(t) })
+				})
+				const transaction = tx
+				const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
+					const { sql: sqlStr, values } = buildQuery(query, params)
+					return new Promise<TDbTxResult>((resolve, reject) => {
+						transaction.query(sqlStr, values, (err: Error | null, rows: Record<string, unknown>[]) => {
+							if (err) reject(err)
+							else resolve({ rows: rows ?? [] })
+						})
+					})
+				}
+				await cb(exec, signal)
+				await new Promise<void>((resolve, reject) => {
+					transaction.commit((err: Error | null) => { if (err) reject(err); else resolve() })
+				})
+				return { ok: true, result: undefined }
+			} catch (err) {
+				if (tx) {
+					try { await new Promise<void>((resolve) => { tx!.rollback(() => resolve()) }) } catch {}
+				}
+				return { ok: false, error: toDbError(err, 'query') }
+			} finally {
+				signal.removeEventListener('abort', teardown)
+				if (!signal.aborted) {
+					try { db.detach() } catch {}
+				}
+			}
 		})
-		try {
-			return await Promise.race([txWork(), timeoutPromise])
-		} finally {
-			clearTimeout(timer)
-		}
 	}
 }
