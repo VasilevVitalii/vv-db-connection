@@ -1,9 +1,10 @@
 import sql from 'mssql'
+import type { ISqlType } from 'mssql'
 import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
 import type { TConnMssql } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM_MSSQL } from '../placeholders'
-import { toDbError, isDbError, withTxTimeout } from '../helpers'
+import { toDbError, isDbError, withTxTimeout, abortError } from '../helpers'
 
 // Converts :name placeholders to @name for mssql named parameters. A colon inside a
 // string literal, a quoted identifier or a comment is left as it is, and a bracket-quoted
@@ -23,8 +24,8 @@ function buildMssqlQuery(query: string, params: TDbParam[]): string {
 // the JS value - a Date becomes DateTime (losing sub-second precision) and a long string
 // becomes NVarChar - so a caller can pin the exact type here. Unknown names throw before
 // the query is sent rather than failing server-side.
-export function mssqlType(name: string): any {
-	const t = (sql.TYPES as Record<string, any>)[name]
+export function mssqlType(name: string): () => ISqlType {
+	const t = (sql.TYPES as unknown as Record<string, (() => ISqlType) | undefined>)[name]
 	if (t === undefined) throw new Error(`mssql: unknown param type: ${name}`)
 	return t
 }
@@ -120,7 +121,10 @@ export class MssqlAdapter implements IDbAdapter {
 			callback({ kind: 'finish', error: toDbError(err, 'connect') })
 			return
 		}
-		if (signal?.aborted) return
+		if (signal?.aborted) {
+			callback({ kind: 'finish', error: abortError(signal.reason) })
+			return
+		}
 
 		return new Promise<void>((resolve) => {
 			const request = pool.request()
@@ -156,49 +160,39 @@ export class MssqlAdapter implements IDbAdapter {
 			}
 			signal?.addEventListener('abort', onAbort)
 
-			// mssql's `done.rowsAffected` has one entry per statement, but it does not say
-			// which entries are DML: a SELECT entry is the number of rows it returned, so it
-			// is numerically indistinguishable from an affected count. The reliable signal is
-			// that a SELECT also emits `recordset` + `row` events while DML emits neither.
-			// Track the row count of each SELECT so `done` can tell a SELECT entry (already
-			// emitted as schema+rows) from a DML entry (emit it as an empty-schema result).
-			let sawRecordset = false
-			let currentRows = 0
-			const rowCounts: number[] = []
+			// mssql streams a `rowsaffected` event once per statement, in execution order:
+			// a SELECT reports the number of rows it returned, a DML the rows it changed -
+			// numerically indistinguishable. The reliable way to tell them apart is the
+			// `recordset` event, which only a SELECT emits before its rows. So a
+			// `rowsaffected` that follows an unclosed `recordset` belongs to that SELECT
+			// (its rows are already emitted); one without a pending `recordset` is a DML and
+			// becomes its own empty-schema result. This keeps DML results in statement order
+			// and cannot be confused by equal counts (the old `done`-side value matching
+			// dropped a DML whose count collided with a SELECT's row count, e.g. UPDATE; SELECT).
+			let inSelect = false
 
 			request.on('recordset', (columns: Record<string, unknown>) => {
-				if (sawRecordset) rowCounts.push(currentRows)
-				sawRecordset = true
-				currentRows = 0
+				inSelect = true
 				if (!done) callback({ kind: 'schema', schema: toSchema(columns) })
 			})
 			request.on('row', (row: object) => {
-				currentRows += 1
 				if (!done) callback({ kind: 'row', row: row as Record<string, unknown> })
+			})
+			request.on('rowsaffected', (count: number) => {
+				if (inSelect) {
+					inSelect = false // SELECT: its schema+rows were already emitted above
+				} else if (typeof count === 'number') {
+					callback({ kind: 'schema', schema: [] })
+					callback({ kind: 'rowsAffected', count })
+				}
 			})
 			request.on('error', (err: Error) => {
 				// `done` does not always follow an error in every mssql release; waiting
 				// for it would leave the query open until the 12h watchdog fires. Fail now.
 				settle(toDbError(err, 'query'))
 			})
-			request.on('done', (result: { rowsAffected?: number[] }) => {
+			request.on('done', () => {
 				if (done) return
-				if (sawRecordset) rowCounts.push(currentRows)
-				// Match each SELECT's returned-row count against the entries; whatever is
-				// left is a DML statement and becomes its own result. An all-DML batch has no
-				// row counts, so every entry is reported - the old code read only [0] and
-				// dropped every statement after the first.
-				const remaining = [...rowCounts]
-				for (const count of result?.rowsAffected ?? []) {
-					if (typeof count !== 'number') continue
-					const i = remaining.indexOf(count)
-					if (i >= 0) {
-						remaining.splice(i, 1) // SELECT: schema+rows already emitted above
-					} else {
-						callback({ kind: 'schema', schema: [] })
-						callback({ kind: 'rowsAffected', count })
-					}
-				}
 				settle()
 			})
 
@@ -206,7 +200,7 @@ export class MssqlAdapter implements IDbAdapter {
 		})
 	}
 
-	async execTxDynamic(cb: TDbTxCb, timeoutMs?: number, external?: AbortSignal): Promise<TResult<void, TDbError>> {
+	async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, external?: AbortSignal): Promise<TResult<T, TDbError>> {
 		return withTxTimeout(timeoutMs, async (signal) => {
 			// A transaction owns its connection for its whole lifetime and must be torn
 			// down hard on timeout (a stuck statement never answers rollback), so it gets
@@ -238,7 +232,7 @@ export class MssqlAdapter implements IDbAdapter {
 			// an aborted signal. Tear the connection down here instead of leaking it.
 			if (signal.aborted) {
 				teardown()
-				return { ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }
+				return { ok: false, error: abortError(signal.reason) }
 			}
 			try {
 				tx = new sql.Transaction(pool)
@@ -261,15 +255,27 @@ export class MssqlAdapter implements IDbAdapter {
 					return req.query(q).then(
 						(res) => ({
 							rows:         (res.recordset ?? []) as Record<string, unknown>[],
-							rowsAffected: res.rowsAffected?.[0],
+							// DML only (TDbRes.rowsAffected contract): a SELECT's recordset
+							// carries the rows and mssql's rowsAffected array doubles as its
+							// row count, so leave rowsAffected unset for a result set. A batch
+							// of several DML statements reports one count each; sum them so
+							// INSERT; UPDATE; DELETE inside one call totals the real row change
+							// instead of dropping everything after the first statement.
+							rowsAffected: res.recordset === undefined
+								? res.rowsAffected?.reduce((sum, n) => sum + n, 0) || undefined
+								: undefined,
 						}),
 						// Tag the failure as a DB query error so it stays 'query' even when
 						// it bubbles through the user's callback (which may re-throw it).
 						(err) => { throw toDbError(err, 'query') },
 					)
 				}
+				// The callback's resolved value is the transaction's result: it is only
+				// assigned on success (the catch below always returns), so the `!` is the
+				// "assigned before every fall-through" assertion, not a suppressed init bug.
+				let result!: T
 				try {
-					await cb(exec, signal)
+					result = await cb(exec, signal)
 				} catch (err) {
 					try { await transaction.rollback() } catch {}
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
@@ -280,7 +286,7 @@ export class MssqlAdapter implements IDbAdapter {
 					try { await transaction.rollback() } catch {}
 					return { ok: false, error: toDbError(err, 'tx') }
 				}
-				return { ok: true, result: undefined }
+				return { ok: true, result }
 			} catch (err) {
 				// begin() failing is the only thing that reaches here now.
 				if (tx) { try { await tx.rollback() } catch {} }

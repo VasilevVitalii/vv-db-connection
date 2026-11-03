@@ -142,7 +142,7 @@ test('execTxDynamic exec returns rowsAffected for a DML statement', async (t) =>
 	})
 	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
 	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
-	t.mock.method(sql.Request.prototype, 'query', () => Promise.resolve({ recordset: [], rowsAffected: [5] }))
+	t.mock.method(sql.Request.prototype, 'query', () => Promise.resolve({ recordset: undefined, rowsAffected: [5] }))
 
 	const adapter = new MssqlAdapter(conn)
 	let affected: number | undefined
@@ -153,4 +153,23 @@ test('execTxDynamic exec returns rowsAffected for a DML statement', async (t) =>
 
 	assert.equal(r.ok, true, r.ok ? '' : r.error.message)
 	assert.equal(affected, 5)
+})
+
+// review4 §3.2: execTxDynamic<T> returns the callback's resolved value as the result, so
+// a value computed inside the transaction no longer needs a closure to escape.
+test('execTxDynamic returns the callback value as result', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = { socket: { destroy() {} } }
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+
+	const adapter = new MssqlAdapter(conn)
+	const r = await adapter.execTxDynamic(async () => 42)
+
+	assert.equal(r.ok, true)
+	if (r.ok) assert.equal(r.result, 42)
 })

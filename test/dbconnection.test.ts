@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DbConnection } from '../src/db/index'
 import type { TConnectionParam, TConnOra, TConnPg } from '../src/db/connection'
-import type { TDbError, TDbRes, TDbStreamEvent } from '../src/db/types'
+import type { TDbError, TDbParam, TDbRes, TDbStreamEvent } from '../src/db/types'
 import type { TResult } from '../src/tresult'
 
 const unknown = { kind: 'unknown' } as unknown as TConnectionParam
@@ -30,12 +30,18 @@ test('version/ping/execTxDynamic return { ok: false } when the driver kind is un
 })
 
 // review3 §2.3: a negative / NaN / infinite silence deadline is a programming error and
-// must reject up front, not fire at once (or never) once the stream has started.
-test('execStream rejects a negative, NaN or infinite silence timeout', async () => {
+// must fail up front with a finish event, not fire at once (or never) once the stream has
+// started - and not reject bare, which would bypass the finish contract.
+test('execStream ends with a finish event on a negative, NaN or infinite silence timeout', async () => {
 	const db = new DbConnection({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
-	await assert.rejects(db.execStream('SELECT 1', [], () => {}, { firstDataTimeoutMs: -1 }), /non-negative/)
-	await assert.rejects(db.execStream('SELECT 1', [], () => {}, { idleTimeoutMs: NaN }), /non-negative/)
-	await assert.rejects(db.execStream('SELECT 1', [], () => {}, { idleTimeoutMs: Infinity }), /non-negative/)
+	for (const options of [{ firstDataTimeoutMs: -1 }, { idleTimeoutMs: NaN }, { idleTimeoutMs: Infinity }]) {
+		const events: TDbStreamEvent[] = []
+		await db.execStream('SELECT 1', [], (e) => events.push(e), options)
+		assert.equal(events.length, 1)
+		const e = events[0] as { kind: 'finish'; error: TDbError }
+		assert.equal(e.kind, 'finish')
+		assert.match(e.error.message, /non-negative/)
+	}
 })
 
 // review3 §2.4: the Oracle version fallback (v$version -> PRODUCT_COMPONENT_VERSION) must
@@ -59,4 +65,41 @@ test('version still falls back to the second query on a query failure', async (t
 	)
 	await db.version()
 	assert.equal(exec.mock.callCount(), 2)
+})
+
+// review4 §2.6: execTxDynamic validated its timeout after loading the driver, so an invalid
+// timeout on an unknown kind surfaced as a connect error instead of the TypeError the docs
+// promise. The validation must run first and reject before any driver is touched.
+test('execTxDynamic rejects an invalid timeout before the driver is loaded', async () => {
+	const db = new DbConnection(unknown)
+	await assert.rejects(db.execTxDynamic(async () => {}, -5), /non-negative/)
+	await assert.rejects(db.execTxDynamic(async () => {}, NaN), /non-negative/)
+	await assert.rejects(db.execTxDynamic(async () => {}, Infinity), /non-negative/)
+})
+
+// review4 §2.8: close() awaited _adapterPromise bare, so a load that failed while close() was
+// in flight rejected the close itself. It must swallow a failed adapter load.
+test('close() does not reject when a concurrent adapter load fails', async () => {
+	const db = new DbConnection(unknown)
+	const execP = db.exec('SELECT 1', []) // sets _adapterPromise synchronously, then rejects
+	await db.close() // must not throw
+	await execP // settles on its own ({ ok: false, connect })
+})
+
+// review4 §2.9: rowsAffected/outParams may legally arrive with no preceding schema (a DML
+// statement, an out-only bind); exec() used to drop them. They must attach to an empty result.
+test('exec() keeps rowsAffected/outParams that arrive before any schema', async (t) => {
+	const db = new DbConnection(unknown)
+	t.mock.method(db, 'execStream', async (_q: string, _p: TDbParam[], cb: (e: TDbStreamEvent) => void) => {
+		cb({ kind: 'rowsAffected', count: 5 })
+		cb({ kind: 'outParams', params: { n: 1 } })
+		cb({ kind: 'finish' })
+	})
+	const r = await db.exec('UPDATE t SET x = 1', [])
+	assert.equal(r.ok, true)
+	if (!r.ok) return
+	assert.equal(r.result.length, 1)
+	assert.deepEqual(r.result[0]!.schema, [])
+	assert.equal(r.result[0]!.rowsAffected, 5)
+	assert.deepEqual(r.result[0]!.outParams, { n: 1 })
 })

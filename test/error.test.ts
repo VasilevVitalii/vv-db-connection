@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DbConnection } from '../src/index'
-import { toDbError } from '../src/db/helpers'
+import { toDbError, abortError } from '../src/db/helpers'
 import type { TConnMssql } from '../src/db/connection'
 
 // A connection that is never actually opened: the cases below end before the adapter
@@ -88,4 +88,28 @@ test('execStream with an already-aborted signal emits a single aborted finish', 
 	assert.deepEqual(events, ['finish'])
 	assert.equal(error.kind, 'aborted')
 	assert.equal(error.message, 'cancelled')
+})
+
+// review4 §3.1: TDbError is a plain object, not an Error, so it carries no stack by
+// default. A driver Error is the one input that has one - forward it so a caller can
+// see where the failure came from, without widening TDbError into an Error subclass.
+test('toDbError forwards the stack of a real Error', () => {
+	const err = new Error('boom')
+	assert.equal(toDbError(err, 'query').stack, err.stack)
+})
+
+test('toDbError leaves stack unset for a non-Error input', () => {
+	assert.equal('stack' in toDbError({ message: 'boom', code: '23505' }, 'query'), false)
+})
+
+test('abortError forwards the stack of a real Error reason', () => {
+	const reason = new Error('cancelled')
+	const mapped = abortError(reason)
+	assert.equal(mapped.kind, 'aborted')
+	assert.equal(mapped.message, 'cancelled')
+	assert.equal(mapped.stack, reason.stack)
+})
+
+test('abortError leaves stack unset for a non-Error reason', () => {
+	assert.equal('stack' in abortError('cancelled'), false)
 })

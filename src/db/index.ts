@@ -2,7 +2,7 @@ import type { TResult } from '../tresult'
 import type { TConnectionParam, TDbKind } from './connection'
 import { dbTitle, dbUser } from './connection'
 import type { IDbAdapter, TDbError, TDbParam, TDbRes, TDbStreamEvent, TDbTxCb, TExecOptions, TTxOptions } from './types'
-import { toDbError } from './helpers'
+import { toDbError, assertTimeoutMs } from './helpers'
 
 // How long a streaming query may stay silent by default: until the first data after it
 // was sent, and between one portion of data and the next. Both are overridable per call
@@ -71,6 +71,16 @@ export class DbConnection {
 		const results: TDbRes[] = []
 		let current: TDbRes | undefined
 		let execError: TDbError | undefined
+		// rowsAffected / outParams may legally arrive with no preceding schema (a DML
+		// statement, or an out-only bind), so give them a result to attach to instead of
+		// silently dropping them. A row with no schema is a driver bug and stays dropped.
+		const ensureCurrent = (): TDbRes => {
+			if (!current) {
+				current = { schema: [], rows: [] }
+				results.push(current)
+			}
+			return current
+		}
 		try {
 			await this.execStream(query, params, (event) => {
 				if (event.kind === 'schema') {
@@ -79,9 +89,9 @@ export class DbConnection {
 				} else if (event.kind === 'row') {
 					current?.rows.push(event.row)
 				} else if (event.kind === 'rowsAffected') {
-					if (current) current.rowsAffected = event.count
+					ensureCurrent().rowsAffected = event.count
 				} else if (event.kind === 'outParams') {
-					if (current) current.outParams = event.params
+					ensureCurrent().outParams = event.params
 				} else if (event.kind === 'finish') {
 					execError = event.error
 				}
@@ -105,9 +115,14 @@ export class DbConnection {
 		const idleTimeout  = options?.idleTimeoutMs ?? NEXT_ROW_TIMEOUT_MS
 		// Validate the silence deadlines first, before any driver is loaded: a negative,
 		// NaN or infinite value would otherwise fire at once (or never) instead of failing
-		// as the programming error it is. 0 means "no deadline for this phase".
-		for (const [name, ms] of [['firstDataTimeoutMs', firstTimeout], ['idleTimeoutMs', idleTimeout]] as const) {
-			if (!Number.isFinite(ms) || ms < 0) throw new TypeError(`execStream: ${name} must be a non-negative finite number of milliseconds, got ${ms}`)
+		// as the programming error it is. 0 means "no deadline for this phase". Like every
+		// other failure it ends the call with a finish, not a bare rejection.
+		try {
+			assertTimeoutMs('execStream: firstDataTimeoutMs', firstTimeout)
+			assertTimeoutMs('execStream: idleTimeoutMs', idleTimeout)
+		} catch (err) {
+			callback({ kind: 'finish', error: toDbError(err, 'query') })
+			return
 		}
 		let adapter: IDbAdapter
 		try {
@@ -274,16 +289,24 @@ export class DbConnection {
 	// Accepts either the legacy positional timeout in milliseconds or a TTxOptions
 	// object ({ timeoutMs, signal }). A number is kept for backward compatibility - a
 	// bare timeout is the old call shape, and a signal alone is now expressible via
-	// { signal }.
-	public async execTxDynamic(cb: TDbTxCb, options?: number | TTxOptions): Promise<TResult<void, TDbError>> {
+	// { signal }. The callback's resolved value is returned as the result, so a value
+	// computed inside the transaction does not need a closure to escape.
+	/** @deprecated Pass { timeoutMs } instead of a bare number of milliseconds. */
+	public async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number): Promise<TResult<T, TDbError>>
+	public async execTxDynamic<T = void>(cb: TDbTxCb<T>, options?: TTxOptions): Promise<TResult<T, TDbError>>
+	public async execTxDynamic<T = void>(cb: TDbTxCb<T>, options?: number | TTxOptions): Promise<TResult<T, TDbError>> {
+		const timeoutMs = typeof options === 'number' ? options : options?.timeoutMs
+		const signal = typeof options === 'number' ? undefined : options?.signal
+		// Validate the deadline before touching any driver: an invalid timeoutMs is a
+		// programming error (a TypeError, per README) and must not be masked by a
+		// connect error when the driver is missing.
+		assertTimeoutMs('execTxDynamic: timeoutMs', timeoutMs)
 		let adapter: IDbAdapter
 		try {
 			adapter = await this._adapter()
 		} catch (err) {
 			return { ok: false, error: toDbError(err, 'connect') }
 		}
-		const timeoutMs = typeof options === 'number' ? options : options?.timeoutMs
-		const signal = typeof options === 'number' ? undefined : options?.signal
 		return adapter.execTxDynamic(cb, timeoutMs, signal)
 	}
 
@@ -292,8 +315,11 @@ export class DbConnection {
 	// the adapter was never loaded, there is nothing to release.
 	public async close(): Promise<void> {
 		if (!this._adapterPromise) return
-		const adapter = await this._adapterPromise
-		return adapter.close()
+		// A load still in flight can reject (missing driver / unknown kind); there is
+		// nothing to close then, so swallow it instead of making close() throw on a
+		// machine that never had the driver installed.
+		const adapter = await this._adapterPromise.catch(() => undefined)
+		if (adapter) await adapter.close()
 	}
 
 	public async ping(options?: TExecOptions): Promise<TResult<null, TDbError>> {

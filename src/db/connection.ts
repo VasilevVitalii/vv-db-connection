@@ -75,8 +75,7 @@ export type TDbKind = TConnectionParam['kind']
 
 // Static connection metadata, computed straight from the connection settings. DbConnection
 // serves these synchronously without loading a driver module, so they must not depend on
-// the adapter. Keep the formats in sync with the adapters' own title()/user() (which the
-// adapters still carry for their own use).
+// the adapter.
 export function dbTitle(c: TConnectionParam): string {
 	switch (c.kind) {
 		case 'mssql': return `${c.server}:${c.port ?? 1433} [${c.database ?? 'default'}]`

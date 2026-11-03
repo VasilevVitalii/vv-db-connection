@@ -3,7 +3,7 @@ import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, T
 import type { TConnPg } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM_PG } from '../placeholders'
-import { toDbError, isDbError, withTxTimeout } from '../helpers'
+import { toDbError, isDbError, withTxTimeout, abortError } from '../helpers'
 
 // PostgreSQL RowDescription carries only the type OID, not its name. Map the built-in
 // scalar and array types to their canonical names so `kind` is readable instead of a
@@ -144,6 +144,17 @@ export class PgAdapter implements IDbAdapter {
 	}
 
 	async execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void> {
+		// Validate params and rewrite the query before borrowing a pool slot: buildQuery
+		// throws on a missing param, and a throw after connect() would occupy the slot
+		// (and route the error through a client that was never needed). Same order as
+		// mssql, ora and fb.
+		let q: ReturnType<typeof buildQuery>
+		try {
+			q = buildQuery(query, params)
+		} catch (err) {
+			callback({ kind: 'finish', error: toDbError(err, 'query') })
+			return
+		}
 		let client: PoolClient
 		try {
 			client = await this.pool().connect()
@@ -164,8 +175,19 @@ export class PgAdapter implements IDbAdapter {
 			this._teardownClient(client)
 		}
 		signal?.addEventListener('abort', onAbort)
+		// connect() may have resolved after the deadline already fired: the listener
+		// above was added too late to ever run, and the try/finally below would otherwise
+		// hand a healthy client back while its query still runs on the server. Tear the
+		// client down and drop it here, exactly as execTxDynamic's early-abort branch does.
+		if (signal?.aborted) {
+			onAbort()
+			client.removeListener('error', onError)
+			client.release(true)
+			callback({ kind: 'finish', error: abortError(signal.reason) })
+			return
+		}
 		try {
-			const { text, values } = buildQuery(query, params)
+			const { text, values } = q
 			// Multi-statement works only on the simple query protocol (no parameters) and
 			// comes back buffered as an array of results. A parameterized query goes over
 			// the extended protocol, where Query streams rows instead of buffering them.
@@ -224,7 +246,7 @@ export class PgAdapter implements IDbAdapter {
 		}
 	}
 
-	async execTxDynamic(cb: TDbTxCb, timeoutMs?: number, external?: AbortSignal): Promise<TResult<void, TDbError>> {
+	async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, external?: AbortSignal): Promise<TResult<T, TDbError>> {
 		return withTxTimeout(timeoutMs, async (signal) => {
 			let client: PoolClient
 			try {
@@ -254,7 +276,7 @@ export class PgAdapter implements IDbAdapter {
 				teardown()
 				client.removeListener('error', onError)
 				client.release(true)
-				return { ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }
+				return { ok: false, error: abortError(signal.reason) }
 			}
 			try {
 				await client.query('BEGIN')
@@ -271,15 +293,19 @@ export class PgAdapter implements IDbAdapter {
 					return client.query({ text: q.text, values: q.values }).then(
 						(res) => ({
 							rows:         res.rows as Record<string, unknown>[],
-							rowsAffected: res.rowCount ?? undefined,
+							// DML only (TDbRes.rowsAffected contract): pg's rowCount doubles
+							// as the SELECT row count, so report it only when the command
+							// returned no result columns (the same signal execStream uses).
+							rowsAffected: (res.fields ?? []).length === 0 ? res.rowCount ?? undefined : undefined,
 						}),
 						// Tag the failure as a DB query error so it stays 'query' even when
 						// it bubbles through the user's callback (which may re-throw it).
 						(err) => { throw toDbError(err, 'query') },
 					)
 				}
+				let result!: T
 				try {
-					await cb(exec, signal)
+					result = await cb(exec, signal)
 				} catch (err) {
 					try { await client.query('ROLLBACK') } catch {}
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
@@ -290,7 +316,7 @@ export class PgAdapter implements IDbAdapter {
 					try { await client.query('ROLLBACK') } catch {}
 					return { ok: false, error: toDbError(err, 'tx') }
 				}
-				return { ok: true, result: undefined }
+				return { ok: true, result }
 			} catch (err) {
 				// BEGIN failing is the only thing that reaches here now.
 				try { await client.query('ROLLBACK') } catch {}

@@ -8,7 +8,7 @@ import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, T
 import type { TConnFb } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM } from '../placeholders'
-import { toDbError, isDbError, withTxTimeout } from '../helpers'
+import { toDbError, isDbError, withTxTimeout, abortError } from '../helpers'
 
 // ---- monkey-patch: node-firebird@2 leaks the TCP socket on a failed attach ----
 // Connection.attach() answers an attach error with doError(err, cb) and never
@@ -204,8 +204,8 @@ export class FbAdapter implements IDbAdapter {
 	// global, each attach captures its own connection right after calling attach(), before
 	// a concurrent attach can overwrite it - the timeout then tears that socket, not
 	// whichever connection a later attach happened to create. The same teardown is shared
-	// with an external abort signal so close()/abort() during a stuck attach also releases
-	// the descriptor instead of leaving it until the OS TCP timeout.
+	// with an external abort signal so an abort() during a stuck attach also releases the
+	// descriptor instead of leaving it until the OS TCP timeout.
 	private attach(options: Firebird.Options, timeoutMs?: number, signal?: AbortSignal): Promise<Firebird.Database> {
 		return new Promise((resolve, reject) => {
 			let settled = false
@@ -232,7 +232,7 @@ export class FbAdapter implements IDbAdapter {
 			}
 			const onAbort = (): void => {
 				if (settled) return
-				done(reject)(new Error(String(signal?.reason ?? 'aborted')))
+				done(reject)(new Error(abortError(signal?.reason).message))
 				tear()
 			}
 			fbLive.attach(options, (err, db) => {
@@ -284,9 +284,9 @@ export class FbAdapter implements IDbAdapter {
 			}
 			const onAbort = (): void => {
 				if (db) dropConnection(db)
-				finish({ message: String(signal?.reason ?? 'aborted'), kind: 'aborted' })
+				finish(abortError(signal?.reason))
 			}
-			if (signal?.aborted) { finish({ message: String(signal.reason ?? 'aborted'), kind: 'aborted' }); return }
+			if (signal?.aborted) { finish(abortError(signal.reason)); return }
 			signal?.addEventListener('abort', onAbort)
 
 			this.attach(options, this.p.connectTimeout, signal).then(
@@ -382,7 +382,7 @@ export class FbAdapter implements IDbAdapter {
 		}
 	}
 
-	async execTxDynamic(cb: TDbTxCb, timeoutMs?: number, external?: AbortSignal): Promise<TResult<void, TDbError>> {
+	async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, external?: AbortSignal): Promise<TResult<T, TDbError>> {
 		const options = this._options()
 		return withTxTimeout(timeoutMs, async (signal) => {
 			let db: Firebird.Database
@@ -400,7 +400,7 @@ export class FbAdapter implements IDbAdapter {
 			// an aborted signal. Drop the socket here instead of leaking it.
 			if (signal.aborted) {
 				teardown()
-				return { ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }
+				return { ok: false, error: abortError(signal.reason) }
 			}
 			let tx: Firebird.Transaction | undefined
 			try {
@@ -418,17 +418,25 @@ export class FbAdapter implements IDbAdapter {
 						// and tagging it 'query' keeps it from being misreported as 'user'.
 						throw toDbError(err, 'query')
 					}
-					return new Promise<TDbTxResult>((resolve, reject) => {
-						transaction.query(q.sql, q.values, (err: Error | null, rows: Record<string, unknown>[]) => {
-							// Tag the failure as a DB query error so it stays 'query' even
-							// when it bubbles through the user's callback.
-							if (err) reject(toDbError(err, 'query'))
-							else resolve({ rows: rows ?? [] })
-						})
-					})
+					try {
+						// withMeta requests the per-verb DML counts (one lightweight
+						// statementInfo round-trip) so a DML statement reports rowsAffected
+						// exactly as execStream does; recordCounts is set only for DML, so a
+						// SELECT still leaves rowsAffected unset (the "DML only" contract).
+						const res = await transaction.queryAsync<Record<string, unknown>>(q.sql, q.values, { withMeta: true })
+						return {
+							rows: res.rows == null ? [] : (Array.isArray(res.rows) ? res.rows : [res.rows]),
+							...(res.recordCounts ? { rowsAffected: res.affectedRows } : {}),
+						}
+					} catch (err) {
+						// Tag the failure as a DB query error so it stays 'query' even
+						// when it bubbles through the user's callback.
+						throw toDbError(err, 'query')
+					}
 				}
+				let result!: T
 				try {
-					await cb(exec, signal)
+					result = await cb(exec, signal)
 				} catch (err) {
 					try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {}
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
@@ -441,7 +449,7 @@ export class FbAdapter implements IDbAdapter {
 					try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {}
 					return { ok: false, error: toDbError(err, 'tx') }
 				}
-				return { ok: true, result: undefined }
+				return { ok: true, result }
 			} catch (err) {
 				// db.transaction() failing is the only thing that reaches here now.
 				if (tx) {

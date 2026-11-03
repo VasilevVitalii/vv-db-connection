@@ -113,22 +113,21 @@ type TExecOptions = {
 }
 ```
 
-An external `signal` aborts the running query — the call ends with `{ kind: 'aborted', ... }`; a silence timeout ends it with `{ kind: 'timeout', ... }`.
+An external `signal` aborts the running query — the call ends with `{ kind: 'aborted', ... }`; a silence timeout ends it with `{ kind: 'timeout', ... }`. A negative, `NaN` or infinite `firstDataTimeoutMs`/`idleTimeoutMs` is a programming error: `execStream` ends at once with a `finish` carrying the error (and `exec` rejects) rather than timing out instantly or never.
 
 ### `execTxDynamic` — transaction
 
 ```ts
-const result = await db.execTxDynamic(async (exec, signal) => {
-  if (signal.aborted) return
+const result = await db.execTxDynamic<number>(async (exec, signal) => {
+  if (signal.aborted) return 0
   await exec('INSERT INTO t (id) VALUES (:id)', [{ name: 'id', value: 1 }])
-  const res = await exec('SELECT MAX(id) AS id FROM t', [])
-  // res.rows: Record<string, unknown>[]
+  return 42
 }, { timeoutMs, signal })  // or a bare timeoutMs number (legacy)
 
-// result: TResult<void, TDbError>
+// result: TResult<number, TDbError> — result.result === 42
 ```
 
-Opens a transaction, hands the callback an `exec` bound to it and an `AbortSignal`, and commits once the callback resolves. The signal aborts when the timeout expires or the external `signal` is aborted — check it between long-running steps to stop your own work early. Anything thrown inside rolls back and comes out as `{ ok: false, error }`, where `error` is a `TDbError`. Statements use the same `:name` parameters, and every call returns `{ rows }`, so a value generated inside the transaction can be read back before commit. On Oracle, a PL/SQL block that calls `DBMS_SQL.RETURN_RESULT` additionally returns `implicitResults` — one `{ schema, rows }` per implicit result set, while the statement's own `rows`/`rowsAffected` stay empty/undefined.
+Opens a transaction, hands the callback an `exec` bound to it and an `AbortSignal`, and commits once the callback resolves. The signal aborts when the timeout expires or the external `signal` is aborted — check it between long-running steps to stop your own work early. Anything thrown inside rolls back and comes out as `{ ok: false, error }`, where `error` is a `TDbError`. Statements use the same `:name` parameters, and every call returns `{ rows }`, so a value generated inside the transaction can be read back before commit. The callback's own resolved value is returned as the result — `execTxDynamic<T>` resolves to `TResult<T, TDbError>` — so a scalar computed inside the transaction does not need a closure to escape. On Oracle, a PL/SQL block that calls `DBMS_SQL.RETURN_RESULT` additionally returns `implicitResults` — one `{ schema, rows }` per implicit result set, while the statement's own `rows`/`rowsAffected` stay empty/undefined.
 
 A failed transaction reports which side failed via `error.kind`: `connect` (getting the connection), `tx` (`BEGIN`/commit), `query` (a statement — even one whose error bubbles through the callback), or `user` (the callback threw its own error). Telling `user` from `query` matters for retry logic: retry a deadlock, not a bug in your code.
 
@@ -183,7 +182,7 @@ All methods accept named parameters in `:name` syntax, regardless of the underly
 | Oracle     | `:name` (native bind)                | passed as a named bind object |
 | Firebird   | `?` (positional)                     | replaced in left-to-right order of appearance |
 
-In every dialect a `:name` inside a string literal, a quoted identifier or a comment is left as plain text — placeholder scanning skips those. A backslash is an ordinary character in all four dialects (there is no backslash escaping), so `WHERE path = 'C:\' AND id = :id` keeps the string intact and still binds `:id`; only PostgreSQL `E'...'` strings treat a backslash as an escape and are parsed with their own rules, and Oracle `q'[...]'` alternative quoting is recognised too. In a Firebird `EXECUTE BLOCK` only the header — everything up to the `AS` that closes it — is treated as placeholders; past that begins PSQL, where `:name` refers to a local variable or a block parameter and is passed through untouched. MSSQL's bracket-quoted identifiers (`[a:b]`) are also left untouched, but only by the MSSQL adapter — PostgreSQL, Oracle and Firebird treat brackets as ordinary SQL, so `ARRAY[:a, :b]` and array subscripts like `arr[:i]` bind their placeholders normally.
+In every dialect a `:name` inside a string literal, a quoted identifier or a comment is left as plain text — placeholder scanning skips those. A backslash is an ordinary character in all four dialects (there is no backslash escaping), so `WHERE path = 'C:\' AND id = :id` keeps the string intact and still binds `:id`; only PostgreSQL `E'...'` strings treat a backslash as an escape and are parsed with their own rules, and Oracle `q'[...]'` alternative quoting is recognised too. PostgreSQL dollar-quoted strings (`$$...$$` or `$tag$...$tag$`) are recognised only by the PostgreSQL adapter — in MSSQL, Oracle and Firebird `$` is an ordinary character, so a `$` inside an identifier there stays literal. In a Firebird `EXECUTE BLOCK` only the header — everything up to the `AS` that closes it — is treated as placeholders; past that begins PSQL, where `:name` refers to a local variable or a block parameter and is passed through untouched. MSSQL's bracket-quoted identifiers (`[a:b]`) are also left untouched, but only by the MSSQL adapter — PostgreSQL, Oracle and Firebird treat brackets as ordinary SQL, so `ARRAY[:a, :b]` and array subscripts like `arr[:i]` bind their placeholders normally.
 
 A parameter's SQL type is normally inferred from its JS `value`. To pin the exact type, pass `type` with a driver-native type name:
 
@@ -192,7 +191,7 @@ A parameter's SQL type is normally inferred from its JS `value`. To pin the exac
 { name: 'n',  value: '0123',      type: 'NUMBER' }    // oracle: number, not a string
 ```
 
-`type` is honoured by MSSQL (`sql.TYPES` names) and Oracle (`VARCHAR2`, `NVARCHAR2`, `CHAR`, `NUMBER`, `DATE`, `TIMESTAMP`, `CLOB`, `BLOB`, `RAW`, `BOOLEAN`, `JSON`). PostgreSQL and Firebird infer from the JS value and ignore it. An unknown type name throws before the query is sent.
+`type` is honoured by MSSQL (`sql.TYPES` names) and Oracle (`VARCHAR2`, `NVARCHAR2`, `CHAR`, `NUMBER`, `DATE`, `TIMESTAMP`, `CLOB`, `BLOB`, `RAW`, `BOOLEAN`, `JSON`). PostgreSQL and Firebird infer from the JS value and ignore it. An unknown type name throws before the query is sent in MSSQL and Oracle (the adapters that map `type`); PostgreSQL and Firebird never read it, so nothing is thrown there.
 
 `direction` makes a bind `out`/`inout`. Only Oracle supports it: `oracledb` maps it to `BIND_OUT`/`BIND_INOUT` and the returned value lands in `TDbRes.outParams` (keyed by parameter name). A pure `out` parameter omits `value` (there is nothing to send); `inout` keeps it as the input value. Both need `type` — the driver has no type to allocate the out buffer with — and the other adapters reject the direction rather than silently binding `undefined`.
 
@@ -252,14 +251,14 @@ type TTxOptions = {
   signal?: AbortSignal
 }
 
-type TDbTxResult = { rows: Record<string, unknown>[]; rowsAffected?: number; outParams?: Record<string, unknown> }
+type TDbTxResult = { rows: Record<string, unknown>[]; rowsAffected?: number; outParams?: Record<string, unknown>; implicitResults?: TDbRes[] }
 type TDbTxExec   = (query: string, params: TDbParam[]) => Promise<TDbTxResult>
-type TDbTxCb     = (exec: TDbTxExec, signal: AbortSignal) => Promise<void>
+type TDbTxCb<T = void> = (exec: TDbTxExec, signal: AbortSignal) => Promise<T>
 ```
 
-Every failure is a `TDbError`: `kind` says what happened (`connect` — could not open the connection, `query` — the query failed, `timeout` — no data in time, `aborted` — an external `signal` fired), `code` carries the driver's own error code, and `message` the human text. Failures are told apart by `code`/`kind`, not by parsing `message`.
+Every failure is a `TDbError`: `kind` says what happened (`connect` — could not open the connection, `query` — the query failed, `tx` — `BEGIN`/commit failed, `user` — the callback threw its own error, `timeout` — no data in time, `aborted` — an external `signal` fired), `code` carries the driver's own error code, and `message` the human text. Failures are told apart by `code`/`kind`, not by parsing `message`.
 
-Unlike `exec`, a statement inside a transaction returns a single set of rows — no schema and no multi-result-set handling.
+Unlike `exec`, a statement inside a transaction returns a single set of rows — no schema and no multi-result-set handling, apart from Oracle `implicitResults`, which arrive as separate `{ schema, rows }` sets (see `execTxDynamic`).
 
 ## Adapter notes
 

@@ -49,6 +49,11 @@ export type TDbError = {
 	message: string
 	code?: string
 	kind: TDbErrorKind
+	// The underlying Error's stack, when the failure came from a real Error object (a
+	// driver throw). Synthetic errors (a deadline, a missing driver) carry none, so the
+	// field stays optional - but a consumer's `catch (e) { e.stack }` now works for a
+	// query failure inside a transaction.
+	stack?: string
 }
 
 // Per-call knobs for exec/execStream: an external AbortSignal to cancel the query, and
@@ -76,6 +81,8 @@ export type TDbStreamEvent =
 
 export type TDbTxResult = {
 	rows: Record<string, unknown>[]
+	// DML only, like TDbRes.rowsAffected: a SELECT leaves this unset — its row
+	// count is not a "rows affected" count.
 	rowsAffected?: number
 	outParams?: Record<string, unknown>
 	// Oracle PL/SQL with DBMS_SQL.RETURN_RESULT returns extra result sets in
@@ -84,7 +91,10 @@ export type TDbTxResult = {
 	implicitResults?: TDbRes[]
 }
 export type TDbTxExec   = (query: string, params: TDbParam[]) => Promise<TDbTxResult>
-export type TDbTxCb     = (exec: TDbTxExec, signal: AbortSignal) => Promise<void>
+// The transaction body. Its resolved value is carried out of execTxDynamic as the
+// result's `result`, so a value computed inside the transaction (a new id, a computed
+// total) does not need a closure to escape.
+export type TDbTxCb<T = void> = (exec: TDbTxExec, signal: AbortSignal) => Promise<T>
 
 export interface IDbAdapter {
 	versionQuery(): string
@@ -95,6 +105,6 @@ export interface IDbAdapter {
 	// signal: the caller has given up on the query - tear the connection down without
 	// waiting for the server. Events that still come after it are not looked at.
 	execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void>
-	execTxDynamic(cb: TDbTxCb, timeoutMs?: number, signal?: AbortSignal): Promise<TResult<void, TDbError>>
+	execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, signal?: AbortSignal): Promise<TResult<T, TDbError>>
 	close(): Promise<void>
 }

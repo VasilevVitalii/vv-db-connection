@@ -1,4 +1,5 @@
 export { DbConnection } from './db'
+export { dbTitle, dbUser } from './db/connection'
 
 export type { TResult } from './tresult'
 export type {

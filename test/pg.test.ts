@@ -67,6 +67,22 @@ test('pg: toSchema decodes length and precision from dataTypeModifier', async (t
 	assert.equal(schema[2]!.len, undefined)
 })
 
+// review4 2.12: buildQuery used to run after pool.connect(), so a bad param occupied a pool
+// slot and routed a validation error through an unneeded connection. It must fail before
+// connect() is ever called (same order as mssql/ora/fb).
+test('pg: param not found fails before connecting', async (t) => {
+	let connected = 0
+	t.mock.method(Pool.prototype, 'connect', async () => { connected += 1; throw new Error('unreachable') })
+	const adapter = new PgAdapter({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
+	const events: { kind: string; error?: { kind?: string; message?: string } }[] = []
+	await adapter.execStream('SELECT :missing AS x', [], (e) => events.push(e))
+	assert.equal(connected, 0)
+	assert.equal(events.length, 1)
+	assert.equal(events[0]!.kind, 'finish')
+	assert.equal(events[0]!.error?.kind, 'query')
+	assert.match(events[0]!.error?.message ?? '', /param not found: missing/)
+})
+
 // review3 1.1: when the tx deadline fires while connect() is still in flight, the abort
 // event has already fired before the listener is attached, so the listener never runs,
 // and the finally below skips release() on an aborted signal - the freshly-connected pool
@@ -119,4 +135,38 @@ test('pg: execStream removes its error listener before returning the client to t
 		await adapter.execStream('SELECT 1', [], () => {})
 	}
 	assert.equal(fakeClient.listenerCount('error'), 0)
+})
+
+// review4 1.1: the deadline can fire while pool.connect() is still in flight; the abort
+// event has already fired by the time the listener is attached, so it never runs, and the
+// query would go on to execute on a healthy client while the slot is held. The fix tears
+// the client down and drops it as soon as connect() resolves on an aborted signal.
+test('pg: execStream tears down and drops the client when abort fires during connect', async (t) => {
+	let release!: () => void
+	const gate = new Promise<void>((resolve) => { release = resolve })
+	let released = 0
+	let destroyed = 0
+	let queried = 0
+	const fakeClient = {
+		on(): void {},
+		removeListener(): void {},
+		release(): void { released += 1 },
+		query: async (): Promise<unknown> => { queried += 1; return { fields: [], rows: [], rowCount: null } },
+		connection: { stream: { destroy(): void { destroyed += 1 } } },
+	}
+	t.mock.method(Pool.prototype, 'connect', function (this: Pool) {
+		return gate.then(() => fakeClient as unknown as PoolClient)
+	})
+
+	const adapter = new PgAdapter({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
+	const abort = new AbortController()
+	const run = adapter.execStream('SELECT 1', [], () => {}, abort.signal)
+
+	abort.abort(new Error('timeout: no data'))
+	release()
+	await run
+
+	assert.equal(queried, 0, 'the query must not run after an abort during connect')
+	assert.equal(released, 1, 'the client must be dropped, not returned to the pool')
+	assert.equal(destroyed, 1, 'the socket must be ripped so nothing runs on the server')
 })

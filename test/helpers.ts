@@ -201,4 +201,31 @@ export function runDbSuite(name: TProvider, conn: TConnectionParam | null, selec
 			await db.exec(dml.drop, [])
 		}
 	})
+
+	// review4 §3.3/§3.2: a DML statement inside a transaction reports rowsAffected exactly
+	// as exec/execStream do, and the callback's resolved value comes back as result. §3.3
+	// unified the contract across all four dialects: DML reports rowsAffected, a SELECT
+	// leaves it unset (its row count is not a "rows affected" count).
+	test(`${name} execTxDynamic reports rowsAffected for DML and returns the value`, { skip }, async () => {
+		await db.exec(dml.drop, [])
+		const created = await db.exec(dml.create, [])
+		assert.equal(created.ok, true, created.ok ? '' : created.error.message)
+		try {
+			const r = await db.execTxDynamic<number>(async (exec) => {
+				const ins = await exec(dml.insert, [])
+				assert.equal(ins.rowsAffected, 1, 'tx INSERT must report rowsAffected')
+				const upd = await exec(dml.update, [])
+				assert.equal(upd.rowsAffected, 1, 'tx UPDATE must report rowsAffected')
+				const sel = await exec(selectOne, [{ name: 'v', value: 'x' }])
+				assert.equal(sel.rowsAffected, undefined, 'tx SELECT must not report rowsAffected')
+				const del = await exec(dml.del, [])
+				assert.equal(del.rowsAffected, 1, 'tx DELETE must report rowsAffected')
+				return 42
+			})
+			assert.equal(r.ok, true, r.ok ? '' : r.error.message)
+			if (r.ok) assert.equal(r.result, 42, 'tx value must come back as result')
+		} finally {
+			await db.exec(dml.drop, [])
+		}
+	})
 }

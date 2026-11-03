@@ -15,6 +15,7 @@ export function toDbError(err: unknown, kind: TDbErrorKind): TDbError {
 		message: typeof e?.message === 'string' ? e.message : String(err),
 		kind,
 		...(code != null ? { code: String(code) } : {}),
+		...(err instanceof Error ? { stack: err.stack } : {}),
 	}
 }
 
@@ -43,9 +44,7 @@ export function withTxTimeout<T>(
 	// at once, NaN / Infinity would disable it silently. Neither is a meaningful
 	// deadline: reject it as the programming error it is rather than pretending the
 	// transaction has timed out (or never will).
-	if (timeoutMs !== undefined && timeoutMs !== 0 && (!Number.isFinite(timeoutMs) || timeoutMs < 0)) {
-		throw new TypeError(`withTxTimeout: timeoutMs must be a positive finite number of milliseconds, got ${timeoutMs}`)
-	}
+	assertTimeoutMs('withTxTimeout: timeoutMs', timeoutMs)
 
 	const controller = new AbortController()
 	const hasDeadline = timeoutMs !== undefined && timeoutMs !== 0
@@ -93,5 +92,33 @@ export function withTxTimeout<T>(
 }
 
 function abortedError(reason: unknown): TDbError {
-	return { message: reason instanceof Error ? reason.message : String(reason ?? 'aborted'), kind: 'aborted' }
+	return {
+		message: reason instanceof Error ? reason.message : String(reason ?? 'aborted'),
+		kind: 'aborted',
+		...(reason instanceof Error ? { stack: reason.stack } : {}),
+	}
+}
+
+// Maps an AbortSignal's reason to a TDbError. The internal transaction deadline aborts
+// with the sentinel Error('TIMEOUT') (see withTxTimeout), so that case reports kind
+// 'timeout'; every other reason is an external abort and reports kind 'aborted'. The
+// adapters call this from their abort handlers and early-abort branches, so an external
+// abort is never mislabelled 'timeout' and an Error reason is never stringified into
+// "Error: <message>".
+export function abortError(reason: unknown): TDbError {
+	if (reason instanceof Error && reason.message === 'TIMEOUT') {
+		return { message: 'TIMEOUT', kind: 'timeout' }
+	}
+	return abortedError(reason)
+}
+
+// Validates a timeout option: undefined and 0 are the "no deadline" sentinel, anything
+// else must be a finite non-negative number of milliseconds. A negative value would fire
+// the timer at once, NaN too, and Infinity would disable it - none is a meaningful
+// deadline. Throws a TypeError naming the option, so the caller fails as the programming
+// error it is instead of getting "instant" or "never".
+export function assertTimeoutMs(label: string, ms: number | undefined): void {
+	if (ms !== undefined && ms !== 0 && (!Number.isFinite(ms) || ms < 0)) {
+		throw new TypeError(`${label} must be a non-negative finite number of milliseconds, got ${ms}`)
+	}
 }

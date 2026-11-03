@@ -19,18 +19,18 @@ test('withTxTimeout treats 0 as no deadline (as before)', async () => {
 test('withTxTimeout rejects a negative deadline', () => {
 	assert.throws(
 		() => withTxTimeout(-5, async () => ({ ok: true as const, result: 1 })),
-		/positive finite number/,
+		/non-negative finite number/,
 	)
 })
 
 test('withTxTimeout rejects NaN and Infinity deadlines', () => {
 	assert.throws(
 		() => withTxTimeout(NaN, async () => ({ ok: true as const, result: 1 })),
-		/positive finite number/,
+		/non-negative finite number/,
 	)
 	assert.throws(
 		() => withTxTimeout(Infinity, async () => ({ ok: true as const, result: 1 })),
-		/positive finite number/,
+		/non-negative finite number/,
 	)
 })
 

@@ -3,7 +3,7 @@ import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbRes, TDbStreamEvent, TD
 import type { TConnOra } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM_ORA } from '../placeholders'
-import { toDbError, isDbError, withTxTimeout } from '../helpers'
+import { toDbError, isDbError, withTxTimeout, abortError } from '../helpers'
 
 type OraMetadata = { name: string; dbTypeName: string; byteSize?: number; scale?: number; precision?: number }
 type OraBindValue = oracledb.BindParameter | string | number | bigint | Date | Buffer | null | undefined
@@ -12,7 +12,7 @@ type OraBindValue = oracledb.BindParameter | string | number | bigint | Date | B
 // 'VARCHAR2', 'DATE', 'CLOB', ...) to the oracledb DbType. Without it the driver infers
 // the type from the JS value; forcing it pins the exact bind type. Unknown names throw
 // before the query is sent rather than failing server-side.
-const ORA_IN_TYPES: Record<string, any> = {
+const ORA_IN_TYPES: Record<string, oracledb.DbType> = {
 	VARCHAR2:  oracledb.DB_TYPE_VARCHAR,
 	NVARCHAR2: oracledb.DB_TYPE_NVARCHAR,
 	CHAR:      oracledb.DB_TYPE_CHAR,
@@ -80,12 +80,26 @@ export function buildQuery(query: string, params: TDbParam[]): { sql: string; bi
 	const used = new Set<string>()
 	// SQL_ATOM_ORA additionally treats q'[...]' alternative quoting as one string, so a
 	// :name inside it is plain text. :new/:old are trigger correlation names, but only
-	// inside a CREATE [OR REPLACE] TRIGGER, and without regard to case (:NEW, :Old, ...).
+	// inside a CREATE [OR REPLACE] [EDITIONABLE|NONEDITIONABLE] TRIGGER, and without
+	// regard to case (:NEW, :Old, ...). A REFERENCING clause renames them (REFERENCING
+	// NEW AS n OLD AS o, AS optional) and those custom names are correlation names too.
 	// Outside a trigger they are ordinary bind names, so UPDATE ... WHERE ver = :old must
 	// still bind instead of being silently skipped (the server would answer ORA-01008).
-	const isTrigger = /^\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b/i.test(query)
+	const isTrigger = /^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:EDITIONABLE\s+|NONEDITIONABLE\s+)?TRIGGER\b/i.test(query)
+	const correlation = new Set(['new', 'old'])
+	if (isTrigger) {
+		// Bound the REFERENCING clause by the first token that starts the row/body part,
+		// so a stray OLD/NEW/PARENT word in the trigger body is not mistaken for a rename.
+		const clause = /\bREFERENCING\b([\s\S]*?)(?=\b(?:FOR\s+EACH\s+ROW|WHEN|BEGIN|DECLARE|CALL|COMPOUND)\b|$)/i.exec(query)?.[1]
+		if (clause) {
+			for (const m of clause.matchAll(/\b(?:OLD|NEW|PARENT)\s+(?:AS\s+)?([A-Za-z_]\w*)/gi)) {
+				const name = m[1]
+				if (name) correlation.add(name.toLowerCase())
+			}
+		}
+	}
 	const sql = mapPlaceholders(query, (name) => {
-		if (isTrigger && /^(?:new|old)$/i.test(name)) return `:${name}`
+		if (isTrigger && correlation.has(name.toLowerCase())) return `:${name}`
 		used.add(name)
 		return `:${name}`
 	}, undefined, SQL_ATOM_ORA)
@@ -177,7 +191,14 @@ export class OraAdapter implements IDbAdapter {
 					poolIncrement: this.p.poolIncrement ?? 1,
 					...(this.p.queueTimeout !== undefined ? { queueTimeout: this.p.queueTimeout } : {}),
 				})
-			})()
+			})().catch((err) => {
+				// A transient createPool failure (network down, misconfiguration, the
+				// Thick-mode check above) must not be cached forever: clear the promise so
+				// the next call retries instead of replaying the same stale rejection until
+				// close(). Mirrors DbConnection._adapter's non-caching failure.
+				this._pool = undefined
+				throw err
+			})
 		}
 		return this._pool
 	}
@@ -230,9 +251,18 @@ export class OraAdapter implements IDbAdapter {
 				const onAbort = (): void => {
 					interrupt = conn.break().catch(() => {})
 					stream?.destroy()
-					finish({ message: String(signal?.reason ?? 'aborted'), kind: 'aborted' })
+					finish(abortError(signal?.reason))
 				}
-				if (signal?.aborted) { onAbort(); return }
+				// getConnection() may have resolved after the deadline already fired (the
+				// listener above was never registered in time). Nothing is executing on this
+				// connection yet, so there is nothing to break - finish without break(); the
+				// finally below closes the connection back to the pool. break() on an idle
+				// connection leaves the session cancelled and its next statement answering
+				// ORA-01013 (same rule as execTxDynamic's early-abort branch).
+				if (signal?.aborted) {
+					finish(abortError(signal?.reason))
+					return
+				}
 				signal?.addEventListener('abort', onAbort)
 
 				// queryStream only runs a query that returns rows; DML and PL/SQL have to go
@@ -288,7 +318,7 @@ export class OraAdapter implements IDbAdapter {
 		}
 	}
 
-	async execTxDynamic(cb: TDbTxCb, timeoutMs?: number, external?: AbortSignal): Promise<TResult<void, TDbError>> {
+	async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, external?: AbortSignal): Promise<TResult<T, TDbError>> {
 		return withTxTimeout(timeoutMs, async (signal) => {
 			let conn: oracledb.Connection
 			try {
@@ -328,7 +358,7 @@ export class OraAdapter implements IDbAdapter {
 				// idle connection would leave the session cancelled and its next statement
 				// answering ORA-01013.
 				await release()
-				return { ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }
+				return { ok: false, error: abortError(signal.reason) }
 			}
 			try {
 				const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
@@ -369,8 +399,9 @@ export class OraAdapter implements IDbAdapter {
 						})
 						.catch((err) => { throw toDbError(err, 'query') })
 				}
+				let result!: T
 				try {
-					await cb(exec, signal)
+					result = await cb(exec, signal)
 				} catch (err) {
 					// On an abort the teardown already owns the connection (break + close in
 					// flight); rolling back here would race its close() and, if the slot has
@@ -381,10 +412,13 @@ export class OraAdapter implements IDbAdapter {
 				try {
 					await conn.commit()
 				} catch (err) {
-					try { await conn.rollback() } catch {}
+					// Same race as the cb path above: on an abort the teardown already owns
+					// the connection (break + close in flight), so rolling back here would
+					// race its close(). Only roll back a real commit failure.
+					if (!signal.aborted) { try { await conn.rollback() } catch {} }
 					return { ok: false, error: toDbError(err, 'tx') }
 				}
-				return { ok: true, result: undefined }
+				return { ok: true, result }
 			} finally {
 				signal.removeEventListener('abort', teardown)
 				if (!signal.aborted) {

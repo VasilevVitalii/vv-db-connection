@@ -153,9 +153,9 @@ test('fb: an attach that completes after the timeout drops the connection', asyn
 	assert.equal(dropped, 1, 'the late connection must be dropped, not leaked')
 })
 
-// review3 4.20 (second half): aborting/close() during an in-flight attach must rip the
-// socket at once instead of leaving it until the OS TCP timeout. The attach timeout
-// already tore it down; the same teardown is now shared with the external abort signal.
+// review3 4.20 (second half): aborting during an in-flight attach must rip the socket at
+// once instead of leaving it until the OS TCP timeout. The attach timeout already tore it
+// down; the same teardown is now shared with the external abort signal.
 test('fb: aborting execStream during a stuck attach tears the socket down', async (t) => {
 	let destroyed = 0
 	const fakeConn = { _isDetach: false, _retry_connection_id: undefined, _socket: { destroy: () => { destroyed += 1 } } }

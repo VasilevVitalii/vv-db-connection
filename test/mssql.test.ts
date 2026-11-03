@@ -123,7 +123,11 @@ test('mssql: a multi-statement DML batch reports one result per statement', asyn
 		stream = false
 		input(): void {}
 		query(): void {
-			setImmediate(() => this.emit('done', { rowsAffected: [5, 7] }))
+			setImmediate(() => {
+				this.emit('rowsaffected', 5)
+				this.emit('rowsaffected', 7)
+				this.emit('done', { rowsAffected: [5, 7] })
+			})
 		}
 	}
 	const req = new FakeRequest()
@@ -148,6 +152,8 @@ test('mssql: a mixed SELECT; UPDATE batch keeps the DML result', async () => {
 			setImmediate(() => {
 				this.emit('recordset', { v: { name: 'v', type: sql.Int, length: 4, scale: undefined, precision: 10 } })
 				this.emit('row', { v: 1 })
+				this.emit('rowsaffected', 1) // SELECT: returned 1 row
+				this.emit('rowsaffected', 3) // UPDATE: affected 3
 				this.emit('done', { rowsAffected: [1, 3] })
 			})
 		}
@@ -172,6 +178,7 @@ test('mssql: a lone SELECT emits no DML result', async () => {
 			setImmediate(() => {
 				this.emit('recordset', { v: { name: 'v', type: sql.Int, length: 4, scale: undefined, precision: 10 } })
 				this.emit('row', { v: 1 })
+				this.emit('rowsaffected', 1) // SELECT: returned 1 row
 				this.emit('done', { rowsAffected: [1] })
 			})
 		}
@@ -183,6 +190,66 @@ test('mssql: a lone SELECT emits no DML result', async () => {
 	const events: { kind: string; count?: number }[] = []
 	await adapter.execStream('SELECT v FROM t', [], (e) => events.push(e))
 	assert.deepEqual(events.map((e) => e.kind), ['schema', 'row', 'finish'])
+})
+
+// review4 §2.1: the old code matched `done.rowsAffected` entries to SELECT row counts by
+// value, so an UPDATE whose affected count equalled a SELECT's returned-row count was
+// dropped (or a DML that ran before a SELECT was misattributed to it). The per-statement
+// `rowsaffected` order keeps both, in statement order.
+test('mssql: UPDATE; SELECT with equal counts keeps both results in order', async () => {
+	class FakeRequest extends EventEmitter {
+		stream = false
+		input(): void {}
+		query(): void {
+			setImmediate(() => {
+				this.emit('rowsaffected', 2) // UPDATE: affected 2, no recordset
+				this.emit('recordset', { v: { name: 'v', type: sql.Int, length: 4, scale: undefined, precision: 10 } })
+				this.emit('row', { v: 1 })
+				this.emit('row', { v: 2 })
+				this.emit('rowsaffected', 2) // SELECT: returned 2 rows
+				this.emit('done', { rowsAffected: [2, 2] })
+			})
+		}
+	}
+	const req = new FakeRequest()
+	const pool = { request: () => req }
+	const adapter = new MssqlAdapter({ kind: 'mssql', server: 'x', auth: { kind: 'mssql', user: 'u', password: 'p' } })
+	;(adapter as unknown as { _pool: unknown })._pool = { connect: async () => pool }
+	const events: { kind: string; count?: number }[] = []
+	await adapter.execStream('UPDATE b SET x = 2; SELECT v FROM t', [], (e) => events.push(e))
+	const affected = events.filter((e) => e.kind === 'rowsAffected').map((e) => e.count)
+	assert.deepEqual(affected, [2])
+	assert.deepEqual(events.map((e) => e.kind), ['schema', 'rowsAffected', 'schema', 'row', 'row', 'finish'])
+})
+
+// review4 §2.1: DML results must be emitted in statement order, not bunched after every
+// SELECT at `done`. SELECT; UPDATE; SELECT emits the DML count between the two SELECTs.
+test('mssql: SELECT; UPDATE; SELECT keeps the DML result in statement order', async () => {
+	class FakeRequest extends EventEmitter {
+		stream = false
+		input(): void {}
+		query(): void {
+			setImmediate(() => {
+				this.emit('recordset', { v: { name: 'v', type: sql.Int, length: 4, scale: undefined, precision: 10 } })
+				this.emit('row', { v: 1 })
+				this.emit('rowsaffected', 1) // SELECT 1
+				this.emit('rowsaffected', 2) // UPDATE
+				this.emit('recordset', { v: { name: 'v', type: sql.Int, length: 4, scale: undefined, precision: 10 } })
+				this.emit('row', { v: 9 })
+				this.emit('rowsaffected', 1) // SELECT 2
+				this.emit('done', { rowsAffected: [1, 2, 1] })
+			})
+		}
+	}
+	const req = new FakeRequest()
+	const pool = { request: () => req }
+	const adapter = new MssqlAdapter({ kind: 'mssql', server: 'x', auth: { kind: 'mssql', user: 'u', password: 'p' } })
+	;(adapter as unknown as { _pool: unknown })._pool = { connect: async () => pool }
+	const events: { kind: string; count?: number }[] = []
+	await adapter.execStream('SELECT v FROM t; UPDATE b SET x = 2; SELECT v FROM t', [], (e) => events.push(e))
+	const affected = events.filter((e) => e.kind === 'rowsAffected').map((e) => e.count)
+	assert.deepEqual(affected, [2])
+	assert.deepEqual(events.map((e) => e.kind), ['schema', 'row', 'schema', 'rowsAffected', 'schema', 'row', 'finish'])
 })
 
 // review3 §2.12: a bad param (missing, out, unknown type) must fail before connecting, so
@@ -204,6 +271,22 @@ test('mssql: an out param fails before connecting', async () => {
 		/mssql: out parameters are not supported/,
 	)
 	assert.equal(connected, 0)
+})
+
+// review4 §2.2: execStream with an already-aborted signal used to `return` silently after
+// connect(), breaking the adapter's contract that every call ends with one finish. A
+// direct adapter call must still emit exactly one aborted finish, not zero events.
+test('mssql: execStream with an already-aborted signal emits one aborted finish', async () => {
+	const adapter = new MssqlAdapter({ kind: 'mssql', server: 'x', auth: { kind: 'mssql', user: 'u', password: 'p' } })
+	;(adapter as unknown as { _pool: unknown })._pool = { connect: async () => ({ request: () => ({}) }) }
+	const controller = new AbortController()
+	controller.abort(new Error('cancelled'))
+	const events: { kind: string; error?: { kind?: string; message?: string } }[] = []
+	await adapter.execStream('SELECT 1 AS x', [], (e) => events.push(e), controller.signal)
+	assert.equal(events.length, 1)
+	assert.equal(events[0]!.kind, 'finish')
+	assert.equal(events[0]!.error?.kind, 'aborted')
+	assert.equal(events[0]!.error?.message, 'cancelled')
 })
 
 // review3 §4 (MSSQL): onAbort hard-closes the borrowed tedious connection via

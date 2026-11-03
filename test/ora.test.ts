@@ -189,6 +189,105 @@ test('ora: execTxDynamic closes only after break() lands on a mid-transaction ab
 	assert.equal(closed, 1)
 })
 
+// review4 §2.3: an abort that lands while commit() is in flight tears the connection down
+// in the abort handler (break + close). The commit catch used to roll back unconditionally,
+// so rollback() raced the handler's close() on the same connection. The fix only rolls back
+// a real commit failure (signal not aborted) and leaves the aborted path to the teardown.
+test('ora: an abort during commit skips rollback (no race with the closing connection)', async (t) => {
+	let breakResolve!: () => void
+	let commitReject!: (err: Error) => void
+	let rollbackCalls = 0
+	let closed = 0
+	const fakeConn = {
+		// break() interrupts the in-flight commit on the server, which rejects it.
+		break: () => {
+			commitReject(Object.assign(new Error('ORA-01013: user requested cancel'), { code: 'NJS-005' }))
+			return new Promise<void>((resolve) => { breakResolve = resolve })
+		},
+		close: () => { closed += 1; return Promise.resolve() },
+		execute: async () => ({ rowsAffected: 0, implicitResults: undefined, outBinds: undefined }),
+		rollback: () => { rollbackCalls += 1; return Promise.resolve() },
+		commit: () => new Promise<void>((_res, rej) => { commitReject = rej }),
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: '127.0.0.1', port: 1521, service: 'x', user: 'u', password: 'p' } as TConnOra)
+	// The callback succeeds immediately, so the transaction reaches commit(); the 50 ms
+	// deadline then fires while commit() is still pending.
+	const r = await adapter.execTxDynamic(async () => {}, 50)
+	assert.equal(r.ok, false)
+
+	// Let the abort handler finish its teardown (release() awaits break(), then closes).
+	await new Promise((resolve) => setImmediate(resolve))
+	breakResolve()
+	await new Promise((resolve) => setImmediate(resolve))
+
+	assert.equal(rollbackCalls, 0, 'an aborted commit must not rollback against the closing connection')
+	assert.equal(closed, 1, 'the teardown must close the connection exactly once')
+})
+
+// review4 1.2: the deadline can fire while getConnection() is still in flight; break() on
+// a connection where nothing is executing would leave the session cancelled, so its next
+// statement answers ORA-01013. The fix finishes without break() and lets the finally close
+// the idle connection back to the pool.
+test('ora: execStream early abort closes without break() on an idle connection', async (t) => {
+	let release!: () => void
+	const gate = new Promise<void>((resolve) => { release = resolve })
+	let broken = 0
+	let closed = 0
+	const fakeConn = {
+		break: () => { broken += 1; return Promise.resolve() },
+		close: () => { closed += 1; return Promise.resolve() },
+		execute: () => new Promise(() => {}),
+		queryStream: () => { throw new Error('must not be reached') },
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({
+		getConnection: () => gate.then(() => fakeConn),
+		close: async () => {},
+	}))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: '127.0.0.1', port: 1521, service: 'x', user: 'u', password: 'p' } as TConnOra)
+	const controller = new AbortController()
+	const events: string[] = []
+	const run = adapter.execStream('SELECT 1 FROM dual', [], (e) => events.push(e.kind), controller.signal)
+
+	controller.abort(new Error('timeout: no data'))
+	release()
+	await run
+
+	assert.equal(broken, 0, 'break() must not poison an idle connection')
+	assert.equal(closed, 1, 'the idle connection must be closed back to the pool')
+	assert.equal(events[events.length - 1], 'finish')
+})
+
+// review4 1.3: a rejected createPool used to be cached in this._pool forever, so a
+// transient failure (network down, misconfiguration) replayed the same stale rejection on
+// every call until close(). The fix clears the promise on rejection so the next call
+// retries, mirroring DbConnection._adapter's non-caching failure.
+test('ora: a rejected createPool is retried on the next call', async (t) => {
+	let attempts = 0
+	const m = t.mock.method(oracledb, 'createPool', () => {
+		attempts += 1
+		if (attempts === 1) return Promise.reject(new Error('network down'))
+		return Promise.resolve({
+			getConnection: async () => ({ close: () => Promise.resolve(), execute: async () => ({ rowsAffected: 0, implicitResults: undefined, outBinds: undefined }) }),
+			close: async () => {},
+		})
+	})
+	try {
+		const adapter = new OraAdapter({ kind: 'ora', host: 'h', port: 1521, service: 's', user: 'u', password: 'p' } as TConnOra)
+		let firstKind: string | undefined
+		await adapter.execStream('UPDATE t SET x = 1', [], (e) => {
+			if (e.kind === 'finish' && e.error) firstKind = e.error.kind
+		})
+		assert.equal(firstKind, 'connect', 'the first call must surface the connect failure')
+		await adapter.execStream('UPDATE t SET x = 1', [], () => {})
+	} finally {
+		m.mock.restore()
+	}
+	assert.equal(attempts, 2, 'the second call must create the pool afresh, not replay the stale rejection')
+})
+
 // review3 §4 (Oracle): the review left open whether a connection torn down mid-transaction
 // (break() while a statement is still running) comes back into the pool in a healthy state
 // or leaks its slot. Prove it live: abort more transactions than the pool has slots while
@@ -231,6 +330,17 @@ test('ora: :NEW/:OLD are correlation names only inside CREATE TRIGGER', async ()
 	assert.ok('new' in v.binds)
 })
 
+// review4 §2.4: the isTrigger probe missed CREATE [OR REPLACE] EDITIONABLE/NONEDITIONABLE
+// TRIGGER and the REFERENCING clause, so :new/:old inside those were treated as binds (the
+// server answers ORA-01008) and a REFERENCING NEW AS n / OLD AS o rename was never honoured
+// (param not found: n). Both must be correlation names, not placeholders.
+test('ora: EDITIONABLE trigger and REFERENCING NEW AS are correlation names', async () => {
+	const a = buildQuery('CREATE OR REPLACE EDITIONABLE TRIGGER trg BEFORE INSERT ON x FOR EACH ROW BEGIN :NEW.n := :OLD.o; END;', [])
+	assert.deepEqual(a.binds, {})
+	const b = buildQuery('CREATE OR REPLACE NONEDITIONABLE TRIGGER trg BEFORE UPDATE ON x REFERENCING NEW AS n OLD AS o FOR EACH ROW BEGIN :n.x := :o.y; END;', [])
+	assert.deepEqual(b.binds, {})
+})
+
 // review3 §2.7: connection.ts documents queueTimeout 0 as "never", but the pool dropped it
 // and fell back to the driver default. It must be passed through verbatim.
 test('ora: queueTimeout 0 is passed through to createPool', async (t) => {
@@ -246,6 +356,21 @@ test('ora: queueTimeout 0 is passed through to createPool', async (t) => {
 		m.mock.restore()
 	}
 	assert.equal(opts.queueTimeout, 0)
+})
+
+// review4 §2.10: the abort finish used to carry String(signal.reason), so an Error reason
+// surfaced as "Error: timeout: ...". abortError() must take Error.message instead.
+test('ora: execStream abort reason is the error message, not "Error: ..."', async (t) => {
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => ({ close: async () => {} }), close: async () => {} }))
+	const adapter = new OraAdapter({ kind: 'ora', host: '127.0.0.1', port: 1521, service: 'x', user: 'u', password: 'p' } as TConnOra)
+	const controller = new AbortController()
+	controller.abort(new Error('cancelled by client'))
+	const events: { kind: string; error?: { kind?: string; message?: string } }[] = []
+	await adapter.execStream('SELECT 1 FROM dual', [], (e) => events.push(e), controller.signal)
+	assert.equal(events.length, 1)
+	assert.equal(events[0]!.kind, 'finish')
+	assert.equal(events[0]!.error?.kind, 'aborted')
+	assert.equal(events[0]!.error?.message, 'cancelled by client')
 })
 
 // review3 §2.8: a parenthesised subquery still returns rows; it must route to queryStream,

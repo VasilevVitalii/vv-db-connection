@@ -67,8 +67,14 @@ test('substitutes placeholders inside brackets for the other dialects', () => {
 })
 
 test('leaves a dollar-quoted string alone (pg DO block)', () => {
-	assert.equal(mapPlaceholders('DO $$ SELECT :v $$', toAt), 'DO $$ SELECT :v $$')
-	assert.equal(mapPlaceholders('SELECT $body$ :x $body$', toAt), 'SELECT $body$ :x $body$')
+	assert.equal(mapPlaceholders('DO $$ SELECT :v $$', toAt, undefined, SQL_ATOM_PG), 'DO $$ SELECT :v $$')
+	assert.equal(mapPlaceholders('SELECT $body$ :x $body$', toAt, undefined, SQL_ATOM_PG), 'SELECT $body$ :x $body$')
+})
+
+test('treats $...$ as code in the non-pg dialects', () => {
+	// Dollar-quoting is pg-only: in mssql/oracle/firebird a $ is an ordinary character,
+	// so a :name inside $...$ is a real placeholder, not text.
+	assert.equal(mapPlaceholders('SELECT $body$ :x $body$', toAt), 'SELECT $body$ @x $body$')
 })
 
 test('handles a backslash-escaped quote in a pg E string', () => {
