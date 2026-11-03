@@ -50,12 +50,14 @@ The connection is opened lazily — `new DbConnection(...)` only holds the confi
 |-----------|--------------|-------------------------------------------------------------------------------|
 | `mssql` | `TConnMssql` | `server`, `port?`, `database?`, `auth`, `trustServerCertificate?`, `encrypt?`, `ca?`, `connectTimeout?` |
 | `pg`    | `TConnPg`    | `host`, `port?`, `database`, `user`, `password`, `ssl?: boolean \| { ca?, trustServerCertificate? }`, `connectTimeout?` |
-| `ora`   | `TConnOra`   | `host`, `port?`, `service`, `user`, `password`, `privilege?`, `connectTimeout?` |
+| `ora`   | `TConnOra`   | `host`, `port?`, `service`, `user`, `password`, `privilege?`, `connectTimeout?`, `poolMin?`, `poolMax?`, `poolIncrement?`, `queueTimeout?` |
 | `fb`    | `TConnFb`    | `host`, `port?`, `database`, `user`, `password`, `charset?`, `numericMode?`, `connectTimeout?`  |
 
 MSSQL `auth` is a union: `{ kind: 'mssql', user, password }` or `{ kind: 'ntlm', domain, user, password }`.
 
 Oracle `privilege` is one of `SYSDBA | SYSOPER | SYSASM | SYSBACKUP | SYSDG | SYSKM | SYSRAC`; the connection string is assembled internally as `host:port/service`. Privileged connections are only supported by the pool in **Thin mode** (the default — no Oracle Client installed). In Thick mode (after `oracledb.initOracleClient()`) a pool cannot be privileged, so the adapter fails loudly instead of handing back a connection that is not actually privileged.
+
+Oracle pool sizing defaults to a minimum of 0 and a maximum of 4; raise `poolMax` for more concurrency, and set `queueTimeout` (milliseconds) to bound how long acquiring a connection waits for a free slot instead of the driver default of 60 s.
 
 Firebird `charset` is `'UTF8'` (default) or `'WIN1251'`; `numericMode` is `'lossy'` (default) | `'safe'` | `'string'` and controls how `BIGINT`/`INT128` and fixed-point `NUMERIC`/`DECIMAL` results are decoded (see Data types).
 
@@ -84,7 +86,7 @@ if (!result.ok) {
 }
 ```
 
-Collects all rows into memory and returns `TResult<TDbRes[], TDbError>`. Each element of the array is one result set (relevant for multi-statement queries on MSSQL). A DML statement (INSERT/UPDATE/DELETE) produces one result set with an empty `schema`, no rows, and `rowsAffected` set to how many rows the database actually changed; a `SELECT` leaves `rowsAffected` unset.
+Collects all rows into memory and returns `TResult<TDbRes[], TDbError>`. Each element of the array is one result set — a multi-statement query on MSSQL or PostgreSQL returns one element per statement. A DML statement (INSERT/UPDATE/DELETE) produces one result set with an empty `schema`, no rows, and `rowsAffected` set to how many rows the database actually changed; a `SELECT` leaves `rowsAffected` unset.
 
 ### `execStream` — streaming query
 
@@ -132,7 +134,7 @@ A failed transaction reports which side failed via `error.kind`: `connect` (gett
 
 `execTxDynamic` takes either a legacy positional `timeoutMs` number or a `TTxOptions` object `{ timeoutMs?, signal? }` (`0` or omitted — no deadline). On expiry the signal aborts, the connection is torn down, and the call resolves as `{ ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }`; an external `signal` cancels the transaction from outside and ends it as `{ ok: false, error: { ..., kind: 'aborted' } }`, mirroring `exec`.
 
-A connection is taken from the pool for the transaction and released back afterwards, on the commit and rollback paths alike. Firebird opens its own attach (it has no pool). Firebird runs with `READ COMMITTED` isolation; the other adapters use the driver default.
+PostgreSQL and Oracle take a connection from the pool for the transaction and release it back afterwards, on the commit and rollback paths alike. MSSQL opens its own dedicated `ConnectionPool` per transaction and closes it when the transaction finishes, whichever way it ends. Firebird opens its own attach (it has no pool). Firebird runs with `READ COMMITTED` isolation; the other adapters use the driver default.
 
 Statements inside one transaction are not safe to run in parallel: `exec` is bound to a single connection, and the adapters behave differently — MSSQL rejects a second concurrent request («another request in progress»), PostgreSQL queues it, Oracle serializes it. `await` each `exec` before starting the next.
 
@@ -142,7 +144,7 @@ Statements inside one transaction are not safe to run in parallel: `exec` is bou
 const result = await db.ping() // TResult<null, TDbError>
 ```
 
-A minimal read-only query that requires no privileges; returns `{ ok: true }` on success. Useful for waiting for the database to come up.
+A minimal read-only query that requires no privileges; returns `{ ok: true }` on success. Useful for waiting for the database to come up — it accepts the same `options` (`signal`, `firstDataTimeoutMs`, `idleTimeoutMs`) as `exec`, so pass a bounded timeout. Firebird has no connect timeout of its own, so `ping` against an unreachable Firebird host relies on that deadline.
 
 ### `version`
 
@@ -150,7 +152,7 @@ A minimal read-only query that requires no privileges; returns `{ ok: true }` on
 const result = await db.version() // TResult<string, TDbError>
 ```
 
-Queries the server version string.
+Queries the server version string, accepting the same `options` as `exec`. On Oracle the `v$version` banner needs `SELECT_CATALOG_ROLE`; without it the adapter falls back to `PRODUCT_COMPONENT_VERSION`, which any user can read.
 
 ### `close`
 
@@ -181,7 +183,7 @@ All methods accept named parameters in `:name` syntax, regardless of the underly
 | Oracle     | `:name` (native bind)                | passed as a named bind object |
 | Firebird   | `?` (positional)                     | replaced in left-to-right order of appearance |
 
-In Firebird a `:name` inside a string literal, a quoted identifier or a comment is left as it is. In an `EXECUTE BLOCK` only the header — everything up to the `AS` that closes it — is treated as placeholders; past that begins PSQL, where `:name` refers to a local variable or a block parameter and is passed through untouched.
+In every dialect a `:name` inside a string literal, a quoted identifier or a comment is left as plain text — placeholder scanning skips those. A backslash is an ordinary character in all four dialects (there is no backslash escaping), so `WHERE path = 'C:\' AND id = :id` keeps the string intact and still binds `:id`; only PostgreSQL `E'...'` strings treat a backslash as an escape and are parsed with their own rules, and Oracle `q'[...]'` alternative quoting is recognised too. In a Firebird `EXECUTE BLOCK` only the header — everything up to the `AS` that closes it — is treated as placeholders; past that begins PSQL, where `:name` refers to a local variable or a block parameter and is passed through untouched.
 
 A parameter's SQL type is normally inferred from its JS `value`. To pin the exact type, pass `type` with a driver-native type name:
 
@@ -193,6 +195,8 @@ A parameter's SQL type is normally inferred from its JS `value`. To pin the exac
 `type` is honoured by MSSQL (`sql.TYPES` names) and Oracle (`VARCHAR2`, `NVARCHAR2`, `CHAR`, `NUMBER`, `DATE`, `TIMESTAMP`, `CLOB`, `BLOB`, `RAW`, `BOOLEAN`, `JSON`). PostgreSQL and Firebird infer from the JS value and ignore it. An unknown type name throws before the query is sent.
 
 `direction` makes a bind `out`/`inout`. Only Oracle supports it: `oracledb` maps it to `BIND_OUT`/`BIND_INOUT` and the returned value lands in `TDbRes.outParams` (keyed by parameter name). A pure `out` parameter omits `value` (there is nothing to send); `inout` keeps it as the input value. Both need `type` — the driver has no type to allocate the out buffer with — and the other adapters reject the direction rather than silently binding `undefined`.
+
+A placeholder with no matching parameter is an error in every adapter: the query is rejected client-side with `param not found` before it is sent, instead of letting the server answer an opaque bind error. Extra parameters that the SQL does not mention are ignored.
 
 Firebird uploads a `Buffer` (or string) value to a `BLOB` column automatically and sends a JS `bigint` as `INT128`, so LOBs and 64-bit integers work with no extra setup on the way in. Reading a `BIGINT`/`INT128` beyond 2^53 back exactly needs `numericMode: 'string'` (or `'safe'`) on the connection; the default `'lossy'` decodes through `Number` and silently rounds.
 
@@ -245,11 +249,11 @@ Unlike `exec`, a statement inside a transaction returns a single set of rows —
 
 ## Adapter notes
 
-**MSSQL** — `request.stream = true`, rows delivered via events without driver-side buffering. One `ConnectionPool` per `DbConnection`, created lazily and reused across queries.
+**MSSQL** — `request.stream = true`, rows delivered via events without driver-side buffering. One `ConnectionPool` per `DbConnection`, created lazily and reused across queries (a transaction opens its own pool — see `execTxDynamic`). `connectTimeout` drives tedious `connectionTimeout` and the tarn pool's `acquireTimeoutMillis`/`createTimeoutMillis`; without it, a request for a slot from an exhausted pool can wait for the 12-hour watchdog.
 
-**PostgreSQL** — a `pg.Pool` per `DbConnection`. Parameterized queries stream rows via `pg.Query` (`'row'` event) without buffering; a multi-statement string has no parameters and goes through the simple query protocol, which buffers. A backend does not notice its client is gone until it has something to send, so an aborted query is cancelled from a connection of its own (`pg_cancel_backend`).
+**PostgreSQL** — a `pg.Pool` per `DbConnection`. Parameterized queries stream rows via `pg.Query` (`'row'` event) without buffering. Any query with no parameters — an unparameterized `SELECT * FROM big` or a multi-statement string — goes through the simple query protocol, which buffers the whole result in memory; bind one `:name` to a parameter to force the streaming path. A backend does not notice its client is gone until it has something to send, so an aborted query is cancelled from a connection of its own (`pg_cancel_backend`), which needs the same role and a spare connection slot.
 
-**Oracle** — `conn.queryStream()` with `OUT_FORMAT_OBJECT` for `SELECT`, rows arrive as plain objects; DML and PL/SQL go through `conn.execute()` (auto-committed). Connections come from an `oracledb` pool (`createPool`) and are released back in a `finally` block.
+**Oracle** — `conn.queryStream()` with `OUT_FORMAT_OBJECT` for `SELECT`/`WITH` (leading whitespace and comments are ignored when routing), rows arrive as plain objects; DML and PL/SQL go through `conn.execute()` (auto-committed). Connections come from an `oracledb` pool (`createPool`, sized via `poolMin`/`poolMax`/`poolIncrement`/`queueTimeout`) and are released back in a `finally` block.
 
 **Firebird** — `node-firebird` has no streaming API; the adapter drives the low-level `Transaction`/`Statement` wire API directly, so a single prepared statement serves the column schema, the streamed rows and the affected-row count (the high-level `sequentially()` re-prepares internally and cannot do all three). The column schema comes from the statement's describe (`newStatement`), so it carries the real driver type names and is emitted even for an empty result — never inferred from the first row. DML reports `rowsAffected` from the statement's record counts (`isc_info_sql_records`). Text blobs are fetched as text (`blobAsText`); binary blobs (`SUB_TYPE 0`) are not supported. A lost connection ends the query with `fb: connection lost`: on a closed socket the driver would quietly attach anew and leave the read waiting for an answer that never comes, so that reconnect is cancelled and the driver's `error` / `reconnect` events are taken as the same loss.
 

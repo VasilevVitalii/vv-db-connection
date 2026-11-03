@@ -40,6 +40,13 @@ export type TConnOra = {
 	password: string
 	privilege?: TOraPrivilege
 	connectTimeout?: number // ms; converted to seconds for oracledb connectTimeout
+	// oracledb pool sizing; pooled connections default to a minimum of 0 and a maximum of 4.
+	poolMin?: number
+	poolMax?: number
+	poolIncrement?: number
+	// ms; how long a getConnection() call waits for a free slot before failing
+	// (oracledb queueTimeout, 0 = never).
+	queueTimeout?: number
 }
 
 export type TConnFb = {
@@ -72,10 +79,10 @@ export type TDbKind = TConnectionParam['kind']
 // adapters still carry for their own use).
 export function dbTitle(c: TConnectionParam): string {
 	switch (c.kind) {
-		case 'mssql': return `${c.server}:${c.port || 'DEFAULT'} [${c.database ?? 'default'}]`
-		case 'pg':    return `${c.host}:${c.port || 'DEFAULT'} [${c.database}]`
-		case 'ora':   return `${c.host}:${c.port || 'DEFAULT'} [${c.service}]`
-		case 'fb':    return `${c.host}:${c.port || 'DEFAULT'} [${c.database}]`
+		case 'mssql': return `${c.server}:${c.port ?? 1433} [${c.database ?? 'default'}]`
+		case 'pg':    return `${c.host}:${c.port ?? 5432} [${c.database}]`
+		case 'ora':   return `${c.host}:${c.port ?? 1521} [${c.service}]`
+		case 'fb':    return `${c.host}:${c.port ?? 3050} [${c.database}]`
 	}
 }
 

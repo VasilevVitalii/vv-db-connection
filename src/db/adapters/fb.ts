@@ -18,7 +18,8 @@ import { toDbError, isDbError, withTxTimeout } from '../helpers'
 // descriptors up to EMFILE, and short-lived scripts/tests never exit. The driver
 // does not hand the connection out on the error path, so this is patched at the
 // prototype, with the same teardown dropConnection() uses. The driver version is
-// pinned in package.json; see .hermes.md and re-check this patch on upgrade.
+// pinned in package.json exactly because of this patch; re-check `Connection.attach`
+// and the teardown fields on any driver upgrade (see the Firebird note in the README).
 type FbConnInternal = {
 	_isDetach?: boolean
 	_retry_connection_id?: ReturnType<typeof setTimeout>
@@ -171,7 +172,7 @@ export class FbAdapter implements IDbAdapter {
 	async close(): Promise<void> {}
 
 	kind(): 'fb' { return 'fb' }
-	title(): string { return `${this.p.host}:${this.p.port || 'DEFAULT'} [${this.p.database}]` }
+	title(): string { return `${this.p.host}:${this.p.port ?? 3050} [${this.p.database}]` }
 	user(): string { return this.p.user }
 	versionQuery(): string { return "SELECT rdb$get_context('SYSTEM', 'ENGINE_VERSION') AS ver FROM rdb$database" }
 	pingQuery(): string { return 'SELECT 1 AS p FROM rdb$database' }

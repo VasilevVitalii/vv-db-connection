@@ -86,6 +86,9 @@ export interface IDbAdapter {
 	title(): string
 	user(): string
 	versionQuery(): string
+	// A second query to try when versionQuery() is not reachable (Oracle: v$version is
+	// not visible without SELECT_CATALOG_ROLE, but PRODUCT_COMPONENT_VERSION is public).
+	versionFallbackQuery?(): string
 	pingQuery(): string
 	// signal: the caller has given up on the query - tear the connection down without
 	// waiting for the server. Events that still come after it are not looked at.

@@ -203,11 +203,21 @@ export class DbConnection {
 	public async version(options?: TExecOptions): Promise<TResult<string, TDbError>> {
 		const adapter = await this._adapter()
 		const res = await this.exec(adapter.versionQuery(), [], options)
-		if (!res.ok) return { ok: false, error: res.error }
-		const firstRow = res.result[0]?.rows[0]
-		if (!firstRow) return { ok: false, error: { message: 'no version returned', kind: 'query' } }
-		const val = Object.values(firstRow)[0]
-		return { ok: true, result: String(val) }
+		if (res.ok) {
+			const firstRow = res.result[0]?.rows[0]
+			if (firstRow) return { ok: true, result: String(Object.values(firstRow)[0]) }
+			return { ok: false, error: { message: 'no version returned', kind: 'query' } }
+		}
+		// Some servers hide the primary version source from unprivileged users (Oracle's
+		// v$version needs SELECT_CATALOG_ROLE). Fall back to a query anyone can run.
+		if (adapter.versionFallbackQuery) {
+			const fb = await this.exec(adapter.versionFallbackQuery(), [], options)
+			if (fb.ok) {
+				const firstRow = fb.result[0]?.rows[0]
+				if (firstRow) return { ok: true, result: String(Object.values(firstRow)[0]) }
+			}
+		}
+		return { ok: false, error: res.error }
 	}
 
 	public kind(): TDbKind {

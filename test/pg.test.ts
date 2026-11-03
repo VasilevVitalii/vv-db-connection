@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DbConnection } from '../src/index'
+import { toSchema } from '../src/db/adapters/pg'
 import { loadConnections, reachable, runDbSuite, connHost, connPort } from './helpers'
 
 const conns = await loadConnections()
@@ -43,4 +44,22 @@ test('pg: kind maps OIDs to readable type names', { skip }, async (t) => {
 	assert.equal(kindByName.t, 'text')
 	assert.equal(kindByName.n, 'numeric')
 	assert.equal(kindByName.ts, 'timestamptz')
+})
+
+// review2 4.9: the schema carried only the type name; the declared length/precision was
+// dropped. dataTypeModifier (the catalog's atttypmod) encodes it: varchar(n)/char(n) →
+// len, numeric(p,s) → precision/scale. Unit test against the FieldDef shape, no live DB.
+test('pg: toSchema decodes length and precision from dataTypeModifier', () => {
+	const schema = toSchema([
+		{ name: 'v', tableID: 0, columnID: 0, dataTypeID: 1043, dataTypeSize: -1, dataTypeModifier: 20 + 4, format: 'text' },
+		{ name: 'n', tableID: 0, columnID: 0, dataTypeID: 1700, dataTypeSize: -1, dataTypeModifier: ((10 << 16) | 2) + 4, format: 'text' },
+		{ name: 't', tableID: 0, columnID: 0, dataTypeID: 25, dataTypeSize: -1, dataTypeModifier: -1, format: 'text' },
+	])
+	assert.equal(schema[0]!.kind, 'varchar')
+	assert.equal(schema[0]!.len, 20)
+	assert.equal(schema[1]!.kind, 'numeric')
+	assert.equal(schema[1]!.precision, 10)
+	assert.equal(schema[1]!.scale, 2)
+	assert.equal(schema[2]!.kind, 'text')
+	assert.equal(schema[2]!.len, undefined)
 })

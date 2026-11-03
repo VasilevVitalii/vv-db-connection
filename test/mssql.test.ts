@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import sql from 'mssql'
 import { DbConnection } from '../src/index'
-import { toSchema, mssqlType, mssqlInput } from '../src/db/adapters/mssql'
+import { toSchema, mssqlType, mssqlInput, MssqlAdapter } from '../src/db/adapters/mssql'
 import { loadConnections, reachable, runDbSuite, connHost, connPort } from './helpers'
 
 const conns = await loadConnections()
@@ -79,4 +80,35 @@ test('mssql: an out param is rejected', () => {
 		() => mssqlInput(request, { name: 'x', value: 1, type: 'Int', direction: 'out' }),
 		/mssql: out parameters are not supported/,
 	)
+})
+
+// review2 4.4: pool() must keep one ConnectionPool across calls, and a failed connect()
+// must not strand it - the next call reconnects on the same pool. mssql's ConnectionPool
+// serializes concurrent connect() calls on an internal stack, so there is no create race
+// here (unlike the ora pool). This pins the adapter's own behaviour: one pool, and
+// connect() is tried again after a rejection.
+test('mssql: pool() keeps one ConnectionPool and reconnects after a failed connect', async () => {
+	const orig = sql.ConnectionPool
+	let created = 0
+	let connects = 0
+	class FakePool {
+		constructor() { created += 1 }
+		on() { /* swallow the pool-level error re-emit */ }
+		connect() {
+			connects += 1
+			return connects === 1 ? Promise.reject(new Error('login failed')) : Promise.resolve(this)
+		}
+		close() { return Promise.resolve() }
+	}
+	try {
+		;(sql as any).ConnectionPool = FakePool
+		const adapter = new MssqlAdapter({ kind: 'mssql', server: 'x', auth: { kind: 'mssql', user: 'u', password: 'p' } })
+		await assert.rejects(() => (adapter as any).pool(), /login failed/)
+		const pool = await (adapter as any).pool()
+		assert.ok(pool instanceof FakePool)
+		assert.equal(created, 1)
+		assert.equal(connects, 2)
+	} finally {
+		;(sql as any).ConnectionPool = orig
+	}
 })

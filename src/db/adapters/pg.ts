@@ -29,8 +29,26 @@ const PG_TYPE_NAME: Record<number, string> = {
 	1231: 'numeric[]', 2951: 'uuid[]', 3807: 'jsonb[]',
 }
 
-function toSchema(fields: FieldDef[]): TDbCol[] {
-	return fields.map((f) => ({ name: f.name, kind: PG_TYPE_NAME[f.dataTypeID] ?? String(f.dataTypeID) }))
+// RowDescription carries the type OID plus a dataTypeModifier (the catalog's atttypmod)
+// that encodes the declared length/precision. Decode it for the types where it means
+// something: varchar(n)/char(n)/bit(n)/varbit(n) report their length, numeric(p,s) its
+// precision and scale. -1 (the modifier of an unbounded type) is left alone.
+export function toSchema(fields: FieldDef[]): TDbCol[] {
+	return fields.map((f) => {
+		const col: TDbCol = { name: f.name, kind: PG_TYPE_NAME[f.dataTypeID] ?? String(f.dataTypeID) }
+		const mod = f.dataTypeModifier
+		if (mod >= 4) {
+			const m = mod - 4
+			// numeric: ((precision << 16) | scale) + 4
+			if (f.dataTypeID === 1700) {
+				col.precision = m >> 16
+				col.scale = m & 0xffff
+			} else if (f.dataTypeID === 1043 || f.dataTypeID === 1042 || f.dataTypeID === 18 || f.dataTypeID === 1560 || f.dataTypeID === 1562) {
+				col.len = m
+			}
+		}
+		return col
+	})
 }
 
 // Converts :name placeholders to $1, $2, ... and collects values.
@@ -56,7 +74,7 @@ export class PgAdapter implements IDbAdapter {
 	constructor(private readonly p: TConnPg) {}
 
 	kind(): 'pg' { return 'pg' }
-	title(): string { return `${this.p.host}:${this.p.port || 'DEFAULT'} [${this.p.database}]` }
+	title(): string { return `${this.p.host}:${this.p.port ?? 5432} [${this.p.database}]` }
 	user(): string { return this.p.user }
 	versionQuery(): string { return 'SELECT version() AS ver' }
 	pingQuery(): string { return 'SELECT 1 AS p' }

@@ -91,7 +91,7 @@ export class MssqlAdapter implements IDbAdapter {
 	}
 
 	kind(): 'mssql' { return 'mssql' }
-	title(): string { return `${this.p.server}:${this.p.port || 'DEFAULT'} [${this.p.database ?? 'default'}]` }
+	title(): string { return `${this.p.server}:${this.p.port ?? 1433} [${this.p.database ?? 'default'}]` }
 	user(): string {
 		if (this.p.auth.kind === 'ntlm') return `${this.p.auth.domain}\\${this.p.auth.user}`
 		return this.p.auth.user
@@ -116,7 +116,6 @@ export class MssqlAdapter implements IDbAdapter {
 				mssqlInput(request, p)
 			}
 
-			let error: TDbError | undefined
 			let done = false
 			// Whether the current statement produced a recordset. DML has none, and
 			// then rowsAffected from `done` is the only thing worth reporting.
@@ -136,6 +135,15 @@ export class MssqlAdapter implements IDbAdapter {
 				} catch {}
 				resolve()
 			}
+			// Ends the request: hands the error (if any) to the callback and resolves the
+			// stream. The abort handler and the done/error events all funnel through here.
+			const settle = (err?: TDbError): void => {
+				if (done) return
+				done = true
+				signal?.removeEventListener('abort', onAbort)
+				callback({ kind: 'finish', error: err })
+				resolve()
+			}
 			signal?.addEventListener('abort', onAbort)
 
 			request.on('recordset', (columns: Record<string, unknown>) => {
@@ -146,12 +154,12 @@ export class MssqlAdapter implements IDbAdapter {
 				if (!done) callback({ kind: 'row', row: row as Record<string, unknown> })
 			})
 			request.on('error', (err: Error) => {
-				error = toDbError(err, 'query')
+				// `done` does not always follow an error in every mssql release; waiting
+				// for it would leave the query open until the 12h watchdog fires. Fail now.
+				settle(toDbError(err, 'query'))
 			})
 			request.on('done', (result: { rowsAffected?: number[] }) => {
 				if (done) return
-				done = true
-				signal?.removeEventListener('abort', onAbort)
 				// A statement with no recordset is DML: give it an empty schema and the
 				// number of rows it changed, so `exec` returns one result per statement
 				// instead of dropping DML statements silently. The streaming driver
@@ -162,8 +170,7 @@ export class MssqlAdapter implements IDbAdapter {
 					const affected = result?.rowsAffected?.[0]
 					if (typeof affected === 'number') callback({ kind: 'rowsAffected', count: affected })
 				}
-				callback({ kind: 'finish', error })
-				resolve()
+				settle()
 			})
 
 			request.query(buildMssqlQuery(query, params))

@@ -1,6 +1,6 @@
 {
   "name": "vv-db-connection",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "The wrapper for connecting to various database servers",
   "keywords": [
     "MSSQL",

@@ -105,9 +105,11 @@ export class OraAdapter implements IDbAdapter {
 	constructor(private readonly p: TConnOra) {}
 
 	kind(): 'ora' { return 'ora' }
-	title(): string { return `${this.p.host}:${this.p.port || 'DEFAULT'} [${this.p.service}]` }
+	title(): string { return `${this.p.host}:${this.p.port ?? 1521} [${this.p.service}]` }
 	user(): string { return this.p.user }
 	versionQuery(): string { return 'SELECT banner AS ver FROM v$version WHERE rownum = 1' }
+	// v$version is hidden from users without SELECT_CATALOG_ROLE; this view is public.
+	versionFallbackQuery(): string { return 'SELECT version AS ver FROM PRODUCT_COMPONENT_VERSION WHERE rownum = 1' }
 	pingQuery(): string { return 'SELECT 1 AS p FROM dual' }
 
 	private _connParams() {
@@ -139,7 +141,13 @@ export class OraAdapter implements IDbAdapter {
 				if (this.p.privilege && !oracledb.thin) {
 					throw new Error('ora: privileged connections need Thin mode; a Thick-mode pool cannot be privileged')
 				}
-				return oracledb.createPool({ ...this._connParams(), poolMin: 0, poolMax: 4, poolIncrement: 1 })
+				return oracledb.createPool({
+					...this._connParams(),
+					poolMin:       this.p.poolMin ?? 0,
+					poolMax:       this.p.poolMax ?? 4,
+					poolIncrement: this.p.poolIncrement ?? 1,
+					...(this.p.queueTimeout ? { queueTimeout: this.p.queueTimeout } : {}),
+				})
 			})()
 		}
 		return this._pool
