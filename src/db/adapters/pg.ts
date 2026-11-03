@@ -3,10 +3,34 @@ import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, T
 import type { TConnPg } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM_PG } from '../placeholders'
-import { toDbError, withTxTimeout } from '../helpers'
+import { toDbError, isDbError, withTxTimeout } from '../helpers'
+
+// PostgreSQL RowDescription carries only the type OID, not its name. Map the built-in
+// scalar and array types to their canonical names so `kind` is readable instead of a
+// numeric OID; anything unmapped (extension/custom types) falls back to the OID string.
+const PG_TYPE_NAME: Record<number, string> = {
+	16: 'bool', 17: 'bytea', 18: 'char', 19: 'name', 20: 'int8', 21: 'int2', 22: 'int2vector',
+	23: 'int4', 24: 'regproc', 25: 'text', 26: 'oid', 27: 'tid', 28: 'xid', 29: 'cid',
+	30: 'oidvector', 114: 'json', 142: 'xml', 194: 'pg_node_tree', 600: 'point', 601: 'lseg',
+	602: 'path', 603: 'box', 604: 'polygon', 628: 'line', 650: 'cidr', 700: 'float4',
+	701: 'float8', 705: 'unknown', 718: 'circle', 774: 'macaddr8', 790: 'money', 829: 'macaddr',
+	869: 'inet', 1042: 'bpchar', 1043: 'varchar', 1082: 'date', 1083: 'time', 1114: 'timestamp',
+	1184: 'timestamptz', 1186: 'interval', 1266: 'timetz', 1560: 'bit', 1562: 'varbit',
+	1700: 'numeric', 1790: 'refcursor', 2202: 'regprocedure', 2203: 'regoper', 2204: 'regoperator',
+	2205: 'regclass', 2206: 'regtype', 2950: 'uuid', 3220: 'pg_lsn', 3614: 'tsvector',
+	3615: 'tsquery', 3642: 'gtsvector', 3734: 'regconfig', 3769: 'regdictionary', 3802: 'jsonb',
+	3904: 'int4range', 3906: 'numrange', 3908: 'tsrange', 3910: 'tstzrange', 3912: 'daterange',
+	3926: 'int8range', 4089: 'regnamespace', 4096: 'regrole',
+	// built-in array types (fixed OIDs)
+	199: 'json[]', 651: 'cidr[]', 1000: 'bool[]', 1001: 'bytea[]', 1002: 'char[]', 1003: 'name[]',
+	1005: 'int2[]', 1007: 'int4[]', 1009: 'text[]', 1014: 'bpchar[]', 1015: 'varchar[]',
+	1016: 'int8[]', 1021: 'float4[]', 1022: 'float8[]', 1040: 'macaddr8[]', 1041: 'inet[]',
+	1115: 'timestamp[]', 1182: 'date[]', 1183: 'time[]', 1185: 'timestamptz[]', 1187: 'interval[]',
+	1231: 'numeric[]', 2951: 'uuid[]', 3807: 'jsonb[]',
+}
 
 function toSchema(fields: FieldDef[]): TDbCol[] {
-	return fields.map((f) => ({ name: f.name, kind: String(f.dataTypeID) }))
+	return fields.map((f) => ({ name: f.name, kind: PG_TYPE_NAME[f.dataTypeID] ?? String(f.dataTypeID) }))
 }
 
 // Converts :name placeholders to $1, $2, ... and collects values.
@@ -19,6 +43,7 @@ function buildQuery(query: string, params: TDbParam[]): { text: string; values: 
 		if (!nameToIndex.has(name)) {
 			const found = params.find((p) => p.name === name)
 			if (!found) throw new Error(`pg: param not found: ${name}`)
+			if (found.direction !== undefined && found.direction !== 'in') throw new Error(`pg: ${found.direction} parameters are not supported`)
 			values.push(found.value)
 			nameToIndex.set(name, values.length)
 		}
@@ -102,8 +127,12 @@ export class PgAdapter implements IDbAdapter {
 		}
 		// The socket is destroyed rather than ended: a graceful end waits for a server
 		// that may be the very thing that stopped answering. The query then fails, and the
-		// client also emits "error" - with nobody listening that would be thrown.
-		client.on('error', () => {})
+		// client also emits "error" - with nobody listening that would be thrown. That same
+		// event is the one reliable signal that the connection itself died (a SQL error
+		// rejects the query but leaves the client healthy), so it also decides whether the
+		// client is returned to the pool or dropped.
+		let broken = false
+		client.on('error', () => { broken = true })
 		const onAbort = (): void => {
 			const internals = client as unknown as { processID?: number; connection?: { stream?: { destroy(): void } } }
 			if (internals.processID) this._cancelBackend(internals.processID)
@@ -123,6 +152,10 @@ export class PgAdapter implements IDbAdapter {
 					for (const row of rs.rows) {
 						callback({ kind: 'row', row })
 					}
+					// A DML statement has no result columns: report the rows it changed.
+					if ((rs.fields ?? []).length === 0 && typeof rs.rowCount === 'number') {
+						callback({ kind: 'rowsAffected', count: rs.rowCount })
+					}
 				}
 			} else {
 				await new Promise<void>((resolve, reject) => {
@@ -136,9 +169,14 @@ export class PgAdapter implements IDbAdapter {
 						callback({ kind: 'row', row })
 					})
 					q.on('error', (err: Error) => reject(err))
-					q.on('end', (result: { fields?: FieldDef[] }) => {
+					q.on('end', (result: { fields?: FieldDef[]; rowCount?: number | null }) => {
 						if (!schemaEmitted) {
 							callback({ kind: 'schema', schema: toSchema(result.fields ?? []) })
+						}
+						// A parameterized DML streams no rows and has no result columns:
+						// report the rows it changed before finishing.
+						if ((result.fields ?? []).length === 0 && typeof result.rowCount === 'number') {
+							callback({ kind: 'rowsAffected', count: result.rowCount })
 						}
 						resolve()
 					})
@@ -150,11 +188,14 @@ export class PgAdapter implements IDbAdapter {
 			callback({ kind: 'finish', error: toDbError(err, 'query') })
 		} finally {
 			signal?.removeEventListener('abort', onAbort)
-			client.release(signal?.aborted)
+			// release(err) drops the client from the pool: pass it on a broken connection so
+			// a dead socket is not handed to the next query. A plain SQL error keeps the
+			// client healthy and is released back normally.
+			client.release(broken || signal?.aborted)
 		}
 	}
 
-	async execTxDynamic(cb: TDbTxCb, timeoutMs?: number): Promise<TResult<void, TDbError>> {
+	async execTxDynamic(cb: TDbTxCb, timeoutMs?: number, external?: AbortSignal): Promise<TResult<void, TDbError>> {
 		return withTxTimeout(timeoutMs, async (signal) => {
 			let client: PoolClient
 			try {
@@ -163,8 +204,11 @@ export class PgAdapter implements IDbAdapter {
 				return { ok: false, error: toDbError(err, 'connect') }
 			}
 			// A connection lost with no query in flight emits "error" on the client; with
-			// nobody listening that would be thrown. Queries reject on their own.
-			client.on('error', () => {})
+			// nobody listening that would be thrown. Queries reject on their own. The same
+			// event marks the connection as broken so release() drops it instead of returning
+			// a dead socket to the pool.
+			let broken = false
+			client.on('error', () => { broken = true })
 			// On a timeout a graceful end() would send Terminate, which the backend only
 			// reads after the running query has finished - so a stuck query would outlive
 			// it. Cancel it on the server and rip the socket, as execStream's onAbort does.
@@ -185,18 +229,34 @@ export class PgAdapter implements IDbAdapter {
 				await client.query('BEGIN')
 				const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
 					const { text, values } = buildQuery(query, params)
-					return client.query({ text, values }).then((res) => ({ rows: res.rows as Record<string, unknown>[] }))
+					return client.query({ text, values }).then(
+						(res) => ({ rows: res.rows as Record<string, unknown>[] }),
+						// Tag the failure as a DB query error so it stays 'query' even when
+						// it bubbles through the user's callback (which may re-throw it).
+						(err) => { throw toDbError(err, 'query') },
+					)
 				}
-				await cb(exec, signal)
-				await client.query('COMMIT')
+				try {
+					await cb(exec, signal)
+				} catch (err) {
+					try { await client.query('ROLLBACK') } catch {}
+					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
+				}
+				try {
+					await client.query('COMMIT')
+				} catch (err) {
+					try { await client.query('ROLLBACK') } catch {}
+					return { ok: false, error: toDbError(err, 'tx') }
+				}
 				return { ok: true, result: undefined }
 			} catch (err) {
+				// BEGIN failing is the only thing that reaches here now.
 				try { await client.query('ROLLBACK') } catch {}
-				return { ok: false, error: toDbError(err, 'query') }
+				return { ok: false, error: toDbError(err, 'tx') }
 			} finally {
 				signal.removeEventListener('abort', teardown)
-				client.release(signal.aborted)
+				client.release(broken || signal.aborted)
 			}
-		})
+		}, external)
 	}
 }

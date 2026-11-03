@@ -50,9 +50,36 @@ export type TConnFb = {
 	user: string
 	password: string
 	charset?: 'UTF8' | 'WIN1251'
+	// How BIGINT/INT128 and fixed-point NUMERIC/DECIMAL results are exposed:
+	// 'lossy' (default) decodes through JS Number and may lose precision beyond
+	// 2^53; 'safe' returns a number when exact and a string otherwise; 'string'
+	// always returns an exact scaled string. JS bigint inputs are sent as INT128.
+	numericMode?: 'lossy' | 'safe' | 'string'
 }
 
 // The discriminated union over all supported connections; its "kind" is the single
 // source for the list of databases this package talks to.
 export type TConnectionParam = TConnMssql | TConnOra | TConnPg | TConnFb
 export type TDbKind = TConnectionParam['kind']
+
+// Static connection metadata, computed straight from the connection settings. DbConnection
+// serves these synchronously without loading a driver module, so they must not depend on
+// the adapter. Keep the formats in sync with the adapters' own title()/user() (which the
+// adapters still carry for their own use).
+export function dbTitle(c: TConnectionParam): string {
+	switch (c.kind) {
+		case 'mssql': return `${c.server}:${c.port || 'DEFAULT'} [${c.database ?? 'default'}]`
+		case 'pg':    return `${c.host}:${c.port || 'DEFAULT'} [${c.database}]`
+		case 'ora':   return `${c.host}:${c.port || 'DEFAULT'} [${c.service}]`
+		case 'fb':    return `${c.host}:${c.port || 'DEFAULT'} [${c.database}]`
+	}
+}
+
+export function dbUser(c: TConnectionParam): string {
+	switch (c.kind) {
+		case 'mssql': return c.auth.kind === 'ntlm' ? `${c.auth.domain}\\${c.auth.user}` : c.auth.user
+		case 'pg':    return c.user
+		case 'ora':   return c.user
+		case 'fb':    return c.user
+	}
+}

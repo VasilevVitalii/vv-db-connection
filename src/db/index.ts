@@ -1,11 +1,8 @@
 import type { TResult } from '../tresult'
 import type { TConnectionParam, TDbKind } from './connection'
-import type { IDbAdapter, TDbError, TDbParam, TDbRes, TDbStreamEvent, TDbTxCb, TExecOptions } from './types'
+import { dbTitle, dbUser } from './connection'
+import type { IDbAdapter, TDbError, TDbParam, TDbRes, TDbStreamEvent, TDbTxCb, TExecOptions, TTxOptions } from './types'
 import { toDbError } from './helpers'
-import { MssqlAdapter } from './adapters/mssql'
-import { PgAdapter } from './adapters/pg'
-import { OraAdapter } from './adapters/ora'
-import { FbAdapter } from './adapters/fb'
 
 // How long a streaming query may stay silent by default: until the first data after it
 // was sent, and between one portion of data and the next. Both are overridable per call
@@ -13,19 +10,51 @@ import { FbAdapter } from './adapters/fb'
 const FIRST_DATA_TIMEOUT_MS = 12 * 60 * 60 * 1000
 const NEXT_ROW_TIMEOUT_MS   = 12 * 60 * 60 * 1000
 
-function hours(ms: number): string {
+function humanMs(ms: number): string {
+	if (ms < 1000) return `${ms} ms`
+	if (ms < 60_000) return `${ms / 1000} s`
+	if (ms < 3_600_000) return `${ms / 60_000} min`
 	return `${ms / 3_600_000} h`
 }
 
 export class DbConnection {
-	private _adapter!: IDbAdapter
+	private readonly _connection: TConnectionParam
+	private _adapterPromise: Promise<IDbAdapter> | undefined
 
 	constructor(connection: TConnectionParam) {
+		this._connection = connection
+	}
+
+	// Loads the adapter for this connection's driver on first use. The driver module is
+	// imported only when its database is actually used - a consumer who talks to one
+	// database never loads the other three drivers, which live in optional peer
+	// dependencies and may not even be installed. Loading happens lazily (not in the
+	// constructor) so that importing the package itself never requires any driver.
+	private async _adapter(): Promise<IDbAdapter> {
+		if (!this._adapterPromise) {
+			this._adapterPromise = this._createAdapter(this._connection)
+		}
+		return this._adapterPromise
+	}
+
+	private async _createAdapter(connection: TConnectionParam): Promise<IDbAdapter> {
 		switch (connection.kind) {
-			case 'mssql': this._adapter = new MssqlAdapter(connection); break
-			case 'pg':    this._adapter = new PgAdapter(connection);    break
-			case 'ora':   this._adapter = new OraAdapter(connection);   break
-			case 'fb':    this._adapter = new FbAdapter(connection);    break
+			case 'mssql': {
+				const { MssqlAdapter } = await import('./adapters/mssql')
+				return new MssqlAdapter(connection)
+			}
+			case 'pg': {
+				const { PgAdapter } = await import('./adapters/pg')
+				return new PgAdapter(connection)
+			}
+			case 'ora': {
+				const { OraAdapter } = await import('./adapters/ora')
+				return new OraAdapter(connection)
+			}
+			case 'fb': {
+				const { FbAdapter } = await import('./adapters/fb')
+				return new FbAdapter(connection)
+			}
 			default:
 				throw new Error(`unsupported db kind: ${JSON.stringify((connection as { kind: unknown }).kind)}`)
 		}
@@ -42,6 +71,10 @@ export class DbConnection {
 					results.push(current)
 				} else if (event.kind === 'row') {
 					current?.rows.push(event.row)
+				} else if (event.kind === 'rowsAffected') {
+					if (current) current.rowsAffected = event.count
+				} else if (event.kind === 'outParams') {
+					if (current) current.outParams = event.params
 				} else if (event.kind === 'finish') {
 					execError = event.error
 				}
@@ -61,6 +94,7 @@ export class DbConnection {
 	// asked to drop its connection, so a driver stuck in its own teardown cannot hold
 	// it either.
 	public async execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, options?: TExecOptions): Promise<void> {
+		const adapter = await this._adapter()
 		const abort = new AbortController()
 		let settled = false
 		let timer: ReturnType<typeof setTimeout> | undefined
@@ -72,8 +106,8 @@ export class DbConnection {
 
 		const timeoutError = (phase: 'first' | 'idle', ms: number): TDbError => ({
 			message: phase === 'first'
-				? `timeout: no data from the database within ${hours(ms)} after the query was sent`
-				: `timeout: no new data from the database within ${hours(ms)}`,
+				? `timeout: no data from the database within ${humanMs(ms)} after the query was sent`
+				: `timeout: no new data from the database within ${humanMs(ms)}`,
 			kind: 'timeout',
 		})
 		const abortedError = (reason: unknown): TDbError => ({
@@ -97,9 +131,23 @@ export class DbConnection {
 			giveUp()
 		}
 
+		// Re-arming the silence timer per row used to be clearTimeout + setTimeout, which
+		// allocates a fresh Timeout object on every row - measurable on millions of rows.
+		// The deadline and the error text stay the same between rows, so refresh() the
+		// existing timer (O(1), no allocation) and only rebuild it when the deadline itself
+		// changes (first data -> idle). pendingError is read at fire time so the timer always
+		// reports the current phase, not the one it was first armed with.
+		let timerMs: number | undefined
+		let pendingError: TDbError | undefined
 		const arm = (ms: number, error: TDbError): void => {
-			clearTimeout(timer)
-			timer = setTimeout(() => finishEarly(error), ms)
+			pendingError = error
+			if (timer !== undefined && timerMs === ms) {
+				timer.refresh()
+			} else {
+				clearTimeout(timer)
+				timerMs = ms
+				timer = setTimeout(() => finishEarly(pendingError!), ms)
+			}
 		}
 		arm(firstTimeout, timeoutError('first', firstTimeout))
 
@@ -115,7 +163,7 @@ export class DbConnection {
 			options.signal.addEventListener('abort', onExternalAbort, { once: true })
 		}
 
-		const run = this._adapter.execStream(query, params, (event) => {
+		const run = adapter.execStream(query, params, (event) => {
 			if (settled) return
 			if (event.kind === 'finish') {
 				settled = true
@@ -141,14 +189,20 @@ export class DbConnection {
 
 		try {
 			await Promise.race([run, gaveUp])
+		} catch (err) {
+			// A synchronous throw from the adapter (e.g. queryStream on Oracle) rejects run
+			// without emitting a finish. exec() catches this above, but a direct execStream
+			// call must also end with a finish rather than a bare rejection.
+			finishEarly(toDbError(err, 'query'))
 		} finally {
 			clearTimeout(timer)
 			if (options?.signal && onExternalAbort) options.signal.removeEventListener('abort', onExternalAbort)
 		}
 	}
 
-	public async version(): Promise<TResult<string, TDbError>> {
-		const res = await this.exec(this._adapter.versionQuery(), [])
+	public async version(options?: TExecOptions): Promise<TResult<string, TDbError>> {
+		const adapter = await this._adapter()
+		const res = await this.exec(adapter.versionQuery(), [], options)
 		if (!res.ok) return { ok: false, error: res.error }
 		const firstRow = res.result[0]?.rows[0]
 		if (!firstRow) return { ok: false, error: { message: 'no version returned', kind: 'query' } }
@@ -157,35 +211,43 @@ export class DbConnection {
 	}
 
 	public kind(): TDbKind {
-		return this._adapter.kind()
+		return this._connection.kind
 	}
 
 	public title(): string {
-		return this._adapter.title()
+		return dbTitle(this._connection)
 	}
 
 	public user(): string {
-		return this._adapter.user()
+		return dbUser(this._connection)
 	}
 
-	public async execTxDynamic(cb: TDbTxCb, timeoutMs?: number): Promise<TResult<void, TDbError>> {
-		return this._adapter.execTxDynamic(cb, timeoutMs)
+	// Accepts either the legacy positional timeout in milliseconds or a TTxOptions
+	// object ({ timeoutMs, signal }). A number is kept for backward compatibility - a
+	// bare timeout is the old call shape, and a signal alone is now expressible via
+	// { signal }.
+	public async execTxDynamic(cb: TDbTxCb, options?: number | TTxOptions): Promise<TResult<void, TDbError>> {
+		const adapter = await this._adapter()
+		const timeoutMs = typeof options === 'number' ? options : options?.timeoutMs
+		const signal = typeof options === 'number' ? undefined : options?.signal
+		return adapter.execTxDynamic(cb, timeoutMs, signal)
 	}
 
 	// Releases whatever the adapter holds between calls - the connection pool where the
-	// driver has one, nothing for Firebird (each attach is closed by its own query).
+	// driver has one, nothing for Firebird (each attach is closed by its own query). If
+	// the adapter was never loaded, there is nothing to release.
 	public async close(): Promise<void> {
-		return this._adapter.close()
+		if (!this._adapterPromise) return
+		const adapter = await this._adapterPromise
+		return adapter.close()
 	}
 
-	public async ping(): Promise<TResult<null, TDbError>> {
-		const res = await this.exec(this._adapter.pingQuery(), [])
+	public async ping(options?: TExecOptions): Promise<TResult<null, TDbError>> {
+		const adapter = await this._adapter()
+		const res = await this.exec(adapter.pingQuery(), [], options)
 		if (!res.ok) return { ok: false, error: res.error }
 		return { ok: true, result: null }
 	}
 
 }
 
-export function createDbConnection(connection: TConnectionParam): DbConnection {
-	return new DbConnection(connection)
-}

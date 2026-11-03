@@ -1,10 +1,13 @@
 import * as Firebird from 'node-firebird'
 import Connection from 'node-firebird/lib/wire/connection'
+import Const from 'node-firebird/lib/wire/const'
+import { parseRecordCounts } from 'node-firebird/lib/wire/xsqlvar'
+import type Transaction from 'node-firebird/lib/wire/transaction'
 import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
 import type { TConnFb } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM } from '../placeholders'
-import { toDbError, withTxTimeout } from '../helpers'
+import { toDbError, isDbError, withTxTimeout } from '../helpers'
 
 // ---- monkey-patch: node-firebird@2 leaks the TCP socket on a failed attach ----
 // Connection.attach() answers an attach error with doError(err, cb) and never
@@ -113,6 +116,7 @@ function buildQuery(query: string, params: TDbParam[]): { sql: string; values: u
 	const sql = mapPlaceholders(query, (name) => {
 		const found = params.find((p) => p.name === name)
 		if (!found) throw new Error(`fb: param not found: ${name}`)
+		if (found.direction !== undefined && found.direction !== 'in') throw new Error(`fb: ${found.direction} parameters are not supported`)
 		values.push(found.value)
 		return '?'
 	}, bodyAt < 0 ? undefined : bodyAt)
@@ -174,6 +178,7 @@ export class FbAdapter implements IDbAdapter {
 			user:     this.p.user,
 			password: this.p.password,
 			encoding: (this.p.charset ?? 'UTF8') as Firebird.SupportedCharacterSet,
+			numericMode: this.p.numericMode,
 			// Without it a text blob arrives as an async reader function instead of a
 			// value, and JSON.stringify silently drops such a field from the row.
 			blobAsText: true,
@@ -218,39 +223,89 @@ export class FbAdapter implements IDbAdapter {
 					dropConnection(attached)
 					finish(error)
 				})
-				// Schema comes from the statement's describe, not from the first row: it is
-				// there for an empty result too, and carries the real column types. The
-				// streaming APIs do not hand the describe back, so it is asked for on its
-				// own statement, then the rows are streamed separately.
-				attached.newStatement(sql, (stmtErr, statement) => {
-					if (stmtErr) {
-						attached.detach()
-						finish(toDbError(stmtErr, 'query'))
-						return
-					}
-					if (done) { dropConnection(attached); return }
-					callback({ kind: 'schema', schema: fbSchema((statement as { output?: FbColMeta[] }).output ?? []) })
-					statement.drop(() => {})
-					// Rows arrive one by one; the schema above has already been emitted, so
-					// the columns no longer depend on a first row.
-					attached.sequentially(
-						sql,
-						values,
-						(row: Record<string, unknown>) => {
-							if (!done) callback({ kind: 'row', row })
-						},
-						(seqErr?: Error) => {
-							if (done) return
-							attached.detach()
-							finish(seqErr ? toDbError(seqErr, 'query') : undefined)
-						},
-					)
-				})
+				// One prepared statement serves the schema, the streamed rows and the
+				// affected-row count. The high-level sequentially() re-prepares the
+				// statement internally, so this drives the low-level Transaction/Statement
+				// API directly (see sql-driver-adapters / node-firebird-internals).
+				void this._execStream(attached, sql, values, callback).then(
+					() => { dropConnection(attached); finish() },
+					(err) => { dropConnection(attached); finish(err) },
+				)
 			})
 		})
 	}
 
-	async execTxDynamic(cb: TDbTxCb, timeoutMs?: number): Promise<TResult<void, TDbError>> {
+	/**
+	 * Streams one query on a freshly attached database over the low-level
+	 * Transaction/Statement API. The statement is prepared exactly once and its
+	 * describe supplies the schema, so an empty result still carries columns.
+	 *
+	 * SELECT/WITH stream rows one fetch at a time; a statement without output
+	 * columns is DML/DDL, and DML reports the affected-row count via
+	 * isc_info_sql_records. EXECUTE PROCEDURE with a RETURNS clause delivers its
+	 * single row on execute (no cursor).
+	 */
+	private async _execStream(db: Firebird.Database, sql: string, values: unknown[], callback: (event: TDbStreamEvent) => void): Promise<void> {
+		const conn = (db as unknown as { connection: Connection }).connection
+		let tx: Transaction | undefined
+		try {
+			// A transaction is mandatory (Firebird has no autocommit), but the driver
+			// only exposes the low-level Transaction object through the Connection; the
+			// high-level Database.transaction() returns the public facade that hides
+			// output/type/statementInfo this method needs.
+			const transaction: Transaction = await new Promise((resolve, reject) => {
+				conn.startTransaction(Const.ISOLATION_READ_COMMITTED, (err: unknown, t: Transaction) => (err ? reject(err) : resolve(t)))
+			})
+			tx = transaction
+			const statement = await transaction.newStatementAsync(sql)
+			try {
+				const output = statement.output ?? []
+				const hasOutput = output.length > 0
+				callback({ kind: 'schema', schema: hasOutput ? fbSchema(output) : [] })
+				const ret = (await statement.executeAsync(transaction, values, { asObject: true })) as { data?: unknown[] } | undefined
+				if (hasOutput) {
+					// EXECUTE PROCEDURE with RETURNS delivers its single row on execute;
+					// a cursor (SELECT/WITH) streams the rows one fetch at a time.
+					if (statement.type === Const.isc_info_sql_stmt_exec_procedure && ret?.data && ret.data.length > 0) {
+						await new Promise<void>((resolve, reject) => statement.connection.resolveTextBlobs(transaction, ret, (err?: unknown) => (err ? reject(err) : resolve())))
+						for (const row of ret.data) callback({ kind: 'row', row: row as Record<string, unknown> })
+					} else {
+						for (;;) {
+							const fret = (await statement.fetchAsync(transaction, Const.DEFAULT_FETCHSIZE)) as { data?: unknown[]; fetched?: boolean }
+							const rows = fret?.data ?? []
+							if (rows.length > 0) {
+								await new Promise<void>((resolve, reject) => statement.connection.resolveTextBlobs(transaction, fret, (err?: unknown) => (err ? reject(err) : resolve())))
+								for (const row of rows) callback({ kind: 'row', row: row as Record<string, unknown> })
+							}
+							// fetched === true means the cursor is exhausted (fetch status 100).
+							if (fret?.fetched) break
+						}
+					}
+				} else {
+					// No output columns: DML/DDL. Only the data-changing verbs report a
+					// count; DDL (CREATE/ALTER/DROP) has no affected-row number.
+					const t = statement.type
+					if (t === Const.isc_info_sql_stmt_insert || t === Const.isc_info_sql_stmt_update || t === Const.isc_info_sql_stmt_delete || t === Const.isc_info_sql_stmt_exec_procedure) {
+						const info = await new Promise<{ buffer?: Buffer }>((resolve, reject) => {
+							statement.connection.statementInfo(statement, Const.RECORDS_INFO, (err?: unknown, r?: { buffer?: Buffer }) => (err ? reject(err) : resolve(r ?? {})))
+						})
+						const counts = parseRecordCounts(info.buffer)
+						callback({ kind: 'rowsAffected', count: counts.insertCount + counts.updateCount + counts.deleteCount })
+					}
+				}
+				await statement.releaseAsync()
+				await transaction.commitAsync()
+			} catch (err) {
+				try { await statement.releaseAsync() } catch { /* connection is gone; nothing left to release */ }
+				throw err
+			}
+		} catch (err) {
+			if (tx) { try { await tx.rollbackAsync() } catch { /* connection is gone */ } }
+			throw toDbError(err, 'query')
+		}
+	}
+
+	async execTxDynamic(cb: TDbTxCb, timeoutMs?: number, external?: AbortSignal): Promise<TResult<void, TDbError>> {
 		const options = this._options()
 		return withTxTimeout(timeoutMs, async (signal) => {
 			let db: Firebird.Database
@@ -282,27 +337,42 @@ export class FbAdapter implements IDbAdapter {
 					const { sql: sqlStr, values } = buildQuery(query, params)
 					return new Promise<TDbTxResult>((resolve, reject) => {
 						transaction.query(sqlStr, values, (err: Error | null, rows: Record<string, unknown>[]) => {
-							if (err) reject(err)
+							// Tag the failure as a DB query error so it stays 'query' even
+							// when it bubbles through the user's callback.
+							if (err) reject(toDbError(err, 'query'))
 							else resolve({ rows: rows ?? [] })
 						})
 					})
 				}
-				await cb(exec, signal)
-				await new Promise<void>((resolve, reject) => {
-					transaction.commit((err: Error | null) => { if (err) reject(err); else resolve() })
-				})
+				try {
+					await cb(exec, signal)
+				} catch (err) {
+					try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {}
+					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
+				}
+				try {
+					await new Promise<void>((resolve, reject) => {
+						transaction.commit((err: Error | null) => { if (err) reject(err); else resolve() })
+					})
+				} catch (err) {
+					try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {}
+					return { ok: false, error: toDbError(err, 'tx') }
+				}
 				return { ok: true, result: undefined }
 			} catch (err) {
+				// db.transaction() failing is the only thing that reaches here now.
 				if (tx) {
 					try { await new Promise<void>((resolve) => { tx!.rollback(() => resolve()) }) } catch {}
 				}
-				return { ok: false, error: toDbError(err, 'query') }
+				return { ok: false, error: toDbError(err, 'tx') }
 			} finally {
 				signal.removeEventListener('abort', teardown)
 				if (!signal.aborted) {
-					try { db.detach() } catch {}
+					// detach() waits for the server's answer and would hang on a server that
+					// is still running the (now rolled back) work; drop the socket outright.
+					dropConnection(db)
 				}
 			}
-		})
+		}, external)
 	}
 }

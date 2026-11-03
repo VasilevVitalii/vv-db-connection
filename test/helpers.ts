@@ -2,10 +2,21 @@ import { readFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { createDbConnection } from '../src/index'
+import { DbConnection } from '../src/index'
 import type { TConnectionParam } from '../src/db/connection'
 
 export type TProvider = 'mssql' | 'pg' | 'ora' | 'fb'
+
+// A DML scenario for the rowsAffected test: the suite creates a scratch table,
+// inserts one row, updates it, deletes it and drops the table again. The SQL is
+// per-dialect, so each provider passes its own statements.
+export type TDmlScenario = {
+	create: string
+	insert: string
+	update: string
+	del: string
+	drop: string
+}
 
 type TConnectRaw = {
 	mssql: { host: string; port: number; login: string; password: string; base: string }
@@ -59,13 +70,13 @@ export function connPort(conn: TConnectionParam): number {
 // parameter syntax in exec, execStream and execTxDynamic alike — each translates it to
 // its own native form. The returned column name differs per database (v vs V), so the
 // value is read through Object.values rather than by name.
-export function runDbSuite(name: TProvider, conn: TConnectionParam | null, selectOne: string, skip: string | false): void {
+export function runDbSuite(name: TProvider, conn: TConnectionParam | null, selectOne: string, dml: TDmlScenario, skip: string | false): void {
 	if (!conn) {
 		test(`${name} (no connection)`, { skip: skip || 'no connection' }, () => {})
 		return
 	}
 
-	const db = createDbConnection(conn)
+	const db = new DbConnection(conn)
 	// Release the pool after the suite: an idle oracledb pool keeps a ref'd handle
 	// alive, so without this the test process never exits cleanly.
 	after(async () => { await db.close() })
@@ -103,7 +114,8 @@ export function runDbSuite(name: TProvider, conn: TConnectionParam | null, selec
 		await db.execStream(selectOne, [{ name: 'v', value: 'hello' }], (ev) => {
 			if (ev.kind === 'schema') { kinds.push('schema'); schemaLen = ev.schema.length }
 			else if (ev.kind === 'row') { kinds.push('row'); rows++ }
-			else { kinds.push('finish'); if (ev.error) kinds.push(`finish(${ev.error.message})`) }
+			else if (ev.kind === 'rowsAffected') { kinds.push('rowsAffected') }
+			else if (ev.kind === 'finish') { kinds.push('finish'); if (ev.error) kinds.push(`finish(${ev.error.message})`) }
 		})
 		assert.deepEqual(kinds, ['schema', 'row', 'finish'])
 		assert.equal(schemaLen, 1)
@@ -122,6 +134,71 @@ export function runDbSuite(name: TProvider, conn: TConnectionParam | null, selec
 	test(`${name} execTxDynamic rollback on throw`, { skip }, async () => {
 		const r = await db.execTxDynamic(async () => { throw new Error('boom') })
 		assert.equal(r.ok, false)
-		if (!r.ok) assert.match(r.error.message, /boom/)
+		if (!r.ok) {
+			assert.match(r.error.message, /boom/)
+			// review2 §2: a throw from the user's callback is the caller's own bug, not a
+			// database failure — tell it apart via kind 'user' so retry logic doesn't loop.
+			assert.equal(r.error.kind, 'user')
+		}
+	})
+
+	// review2 §2: a statement that fails inside the transaction is a 'query' error even
+	// though it bubbles through the user's callback (which does not catch it).
+	test(`${name} execTxDynamic query error is kind query`, { skip }, async () => {
+		const r = await db.execTxDynamic(async (exec) => {
+			await exec('SELECT * FROM __no_such_table__', [])
+		})
+		assert.equal(r.ok, false)
+		if (!r.ok) assert.equal(r.error.kind, 'query')
+	})
+
+	// review2 2.11: a placeholder with no matching param must fail fast with a clear
+	// "param not found" - mssql and ora used to send the undeclared variable to the
+	// server instead and answer with a DB error that does not name the missing param.
+	test(`${name} exec missing param fails fast`, { skip }, async () => {
+		const r = await db.exec(selectOne, [])
+		assert.equal(r.ok, false)
+		if (!r.ok) assert.match(r.error.message, /param not found/)
+	})
+
+	// review2 §2.3: DML streams an empty schema, then a rowsAffected count, then
+	// finish - never a row - and exec() exposes the same count on its buffered result.
+	test(`${name} rowsAffected on DML`, { skip }, async () => {
+		// Drop a table left over from an interrupted run; "no such table" is ignored.
+		await db.exec(dml.drop, [])
+
+		const collect = async (sql: string) => {
+			const kinds: string[] = []
+			let count = -1
+			await db.execStream(sql, [], (ev) => {
+				if (ev.kind === 'schema') kinds.push('schema')
+				else if (ev.kind === 'row') kinds.push('row')
+				else if (ev.kind === 'rowsAffected') { kinds.push('rowsAffected'); count = ev.count }
+				else if (ev.kind === 'finish') { kinds.push('finish'); if (ev.error) kinds.push(`finish(${ev.error.message})`) }
+			})
+			return { kinds, count }
+		}
+
+		const created = await db.exec(dml.create, [])
+		assert.equal(created.ok, true, created.ok ? '' : created.error.message)
+		try {
+			const ins = await collect(dml.insert)
+			assert.deepEqual(ins.kinds, ['schema', 'rowsAffected', 'finish'])
+			assert.equal(ins.count, 1)
+
+			const upd = await collect(dml.update)
+			assert.deepEqual(upd.kinds, ['schema', 'rowsAffected', 'finish'])
+			assert.equal(upd.count, 1)
+
+			const del = await collect(dml.del)
+			assert.deepEqual(del.kinds, ['schema', 'rowsAffected', 'finish'])
+			assert.equal(del.count, 1)
+
+			const reIns = await db.exec(dml.insert, [])
+			assert.equal(reIns.ok, true, reIns.ok ? '' : reIns.error.message)
+			if (reIns.ok) assert.equal(reIns.result[0]?.rowsAffected, 1)
+		} finally {
+			await db.exec(dml.drop, [])
+		}
 	})
 }

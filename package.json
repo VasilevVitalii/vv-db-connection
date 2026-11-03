@@ -1,6 +1,6 @@
 {
   "name": "vv-db-connection",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "The wrapper for connecting to various database servers",
   "keywords": [
     "MSSQL",
@@ -21,6 +21,9 @@
   "license": "MIT",
   "author": "Vitalii Vasilev",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "main": "distjs/src/index.js",
   "types": "distjs/src/index.d.ts",
   "exports": {
@@ -35,19 +38,29 @@
   "scripts": {
     "build": "tsc && tsc-esm-fix --target=distjs",
     "test": "node --import tsx --test test/*.test.ts",
-    "test:smoke": "npm run build && node -e \"import('vv-db-connection').then((m) => { if (!m.DbConnection || !m.createDbConnection) { console.error('smoke: missing exports'); process.exit(1) } console.log('smoke ok: ' + Object.keys(m).join(', ')) }).catch((e) => { console.error(e); process.exit(1) })\""
+    "test:smoke": "npm run build && node -e \"import('vv-db-connection').then((m) => { if (!m.DbConnection) { console.error('smoke: missing exports'); process.exit(1) } console.log('smoke ok: ' + Object.keys(m).join(', ')) }).catch((e) => { console.error(e); process.exit(1) })\""
   },
-  "dependencies": {
+  "peerDependencies": {
     "mssql": "^12.5.0",
     "node-firebird": "2.19.1",
     "oracledb": "^26.0.0",
     "pg": "^8.20.0"
+  },
+  "peerDependenciesMeta": {
+    "mssql": { "optional": true },
+    "node-firebird": { "optional": true },
+    "oracledb": { "optional": true },
+    "pg": { "optional": true }
   },
   "devDependencies": {
     "@types/mssql": "^12.3.0",
     "@types/node": "^26.2.0",
     "@types/oracledb": "^26.0.1",
     "@types/pg": "^8.20.0",
+    "mssql": "^12.5.0",
+    "node-firebird": "2.19.1",
+    "oracledb": "^26.0.0",
+    "pg": "^8.20.0",
     "tsc-esm-fix": "^3.1.2",
     "tsx": "^4.21.0",
     "typescript": "^7.0.2"

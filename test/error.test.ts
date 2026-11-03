@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createDbConnection } from '../src/index'
+import { DbConnection } from '../src/index'
 import { toDbError } from '../src/db/helpers'
 import type { TConnMssql } from '../src/db/connection'
 
@@ -64,7 +64,7 @@ test('toDbError falls back to String(err) when there is no message', () => {
 })
 
 test('exec with an already-aborted signal ends as aborted without touching the database', async () => {
-	const db = createDbConnection(mssql)
+	const db = new DbConnection(mssql)
 	const controller = new AbortController()
 	controller.abort(new Error('caller cancelled'))
 	const r = await db.exec('SELECT 1', [], { signal: controller.signal })
@@ -76,7 +76,7 @@ test('exec with an already-aborted signal ends as aborted without touching the d
 })
 
 test('execStream with an already-aborted signal emits a single aborted finish', async () => {
-	const db = createDbConnection(mssql)
+	const db = new DbConnection(mssql)
 	const controller = new AbortController()
 	controller.abort(new Error('cancelled'))
 	const events: string[] = []

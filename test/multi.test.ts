@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { createDbConnection } from '../src/index'
+import { DbConnection } from '../src/index'
 import { loadConnections, reachable, connHost, connPort } from './helpers'
 
 const conns = await loadConnections()
@@ -15,8 +15,8 @@ if (mssql && pg) {
 }
 
 test('two connections in parallel (mssql + pg)', { skip }, async (t) => {
-	const mssqlDb = createDbConnection(mssql!)
-	const pgDb = createDbConnection(pg!)
+	const mssqlDb = new DbConnection(mssql!)
+	const pgDb = new DbConnection(pg!)
 	t.after(async () => { await mssqlDb.close(); await pgDb.close() })
 	assert.equal(mssqlDb.kind(), 'mssql')
 	assert.equal(pgDb.kind(), 'pg')

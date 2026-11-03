@@ -1,4 +1,4 @@
-export { createDbConnection, DbConnection } from './db'
+export { DbConnection } from './db'
 
 export type { TResult } from './tresult'
 export type {
@@ -19,6 +19,7 @@ export type {
 	TDbError,
 	TDbErrorKind,
 	TExecOptions,
+	TTxOptions,
 	TDbTxResult,
 	TDbTxExec,
 	TDbTxCb,
