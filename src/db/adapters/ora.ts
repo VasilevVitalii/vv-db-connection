@@ -304,6 +304,10 @@ export class OraAdapter implements IDbAdapter {
 			let interrupt: Promise<void> | undefined
 			const release = async (): Promise<void> => {
 				if (interrupt) { try { await interrupt } catch {} }
+				// close() blocks until the server-side cancel of the interrupted statement
+				// has fully landed, so the connection returns to the pool clean (a broken
+				// cancel would answer ORA-01013 to its next statement). If close() still
+				// fails, drop the connection instead of leaking it.
 				try { await conn.close() } catch {
 					try { await conn.close({ drop: true }) } catch {}
 				}
@@ -315,15 +319,19 @@ export class OraAdapter implements IDbAdapter {
 			signal.addEventListener('abort', teardown, { once: true })
 			// getConnection() may have resolved after the deadline already fired: the
 			// listener above was added too late to ever run, and the finally below skips
-			// close() on an aborted signal. Interrupt and release here, awaiting the close so
-			// the pool slot is returned before the timeout is reported.
+			// close() on an aborted signal. Release the idle connection here, awaiting the
+			// close so the pool slot is returned before the timeout is reported.
 			if (signal.aborted) {
-				interrupt = conn.break().catch(() => {})
+				// getConnection() resolved after the deadline fired (the listener above
+				// was added too late to run). Nothing is executing on this connection yet,
+				// so there is nothing to break - just return it to the pool. break() on an
+				// idle connection would leave the session cancelled and its next statement
+				// answering ORA-01013.
 				await release()
 				return { ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }
 			}
 			try {
-				const exec = async (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
+				const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
 					let q: ReturnType<typeof buildQuery>
 					try {
 						q = buildQuery(query, params)
@@ -331,7 +339,7 @@ export class OraAdapter implements IDbAdapter {
 						// buildQuery throws synchronously on a missing param; the async
 						// wrapper turns it into a rejection so exec(...).catch(...) sees it,
 						// and tagging it 'query' keeps it from being misreported as 'user'.
-						throw toDbError(err, 'query')
+						return Promise.reject(toDbError(err, 'query'))
 					}
 					return conn.execute<Record<string, unknown>>(q.sql, q.binds, { autoCommit: false, outFormat: oracledb.OUT_FORMAT_OBJECT, resultSet: true })
 						.then(async (res) => {
@@ -364,7 +372,10 @@ export class OraAdapter implements IDbAdapter {
 				try {
 					await cb(exec, signal)
 				} catch (err) {
-					try { await conn.rollback() } catch {}
+					// On an abort the teardown already owns the connection (break + close in
+					// flight); rolling back here would race its close() and, if the slot has
+					// already been handed to the next caller, corrupt that caller's statement.
+					if (!signal.aborted) { try { await conn.rollback() } catch {} }
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
 				}
 				try {

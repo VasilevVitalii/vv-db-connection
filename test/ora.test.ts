@@ -189,6 +189,35 @@ test('ora: execTxDynamic closes only after break() lands on a mid-transaction ab
 	assert.equal(closed, 1)
 })
 
+// review3 §4 (Oracle): the review left open whether a connection torn down mid-transaction
+// (break() while a statement is still running) comes back into the pool in a healthy state
+// or leaks its slot. Prove it live: abort more transactions than the pool has slots while
+// DBMS_LOCK.SLEEP keeps a statement running on the server, then run a plain query — it must
+// succeed on a healthy connection, so every slot was released and none left dangling.
+test('ora: pool stays healthy after repeated mid-transaction aborts', { skip }, async (t) => {
+	// A pool of 2 makes a leak impossible to hide: if a torn-down connection is not
+	// returned, the next getConnection() stalls and queueTimeout fails the test.
+	const oraConn = { ...(conn as TConnOra), poolMax: 2, queueTimeout: 8000 } as TConnOra
+	const db = new DbConnection(oraConn)
+	t.after(async () => { await db.close() })
+
+	for (let round = 0; round < 4; round++) {
+		const r = await db.execTxDynamic(async (exec) => {
+			// SLEEP(10) keeps the statement running on the server well past the deadline,
+			// so teardown has to break() a live statement and then close() the connection.
+			await exec('BEGIN DBMS_LOCK.SLEEP(10); END;', [])
+		}, { timeoutMs: 500 })
+		assert.equal(r.ok, false, `round ${round}: the deadline should have fired`)
+		if (r.ok) return
+		assert.equal(r.error.kind, 'timeout', `round ${round}: ${r.error.kind} (${r.error.message})`)
+	}
+
+	// After more aborts than poolMax, a plain query must still run on a healthy connection.
+	const r2 = await db.exec('SELECT 1 AS p FROM dual', [])
+	assert.equal(r2.ok, true, r2.ok ? '' : r2.error.message)
+	if (r2.ok) assert.equal(Object.values(r2.result[0]!.rows[0] as Record<string, unknown>)[0], 1)
+})
+
 // review3 §2.6: :new/:old are trigger correlation names only inside a CREATE [OR REPLACE]
 // TRIGGER, in any case. Outside a trigger they are ordinary bind names, so :old/:new must
 // still bind instead of being silently skipped (the server would answer ORA-01008).
