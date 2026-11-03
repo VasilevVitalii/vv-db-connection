@@ -132,7 +132,7 @@ Opens a transaction, hands the callback an `exec` bound to it and an `AbortSigna
 
 A failed transaction reports which side failed via `error.kind`: `connect` (getting the connection), `tx` (`BEGIN`/commit), `query` (a statement — even one whose error bubbles through the callback), or `user` (the callback threw its own error). Telling `user` from `query` matters for retry logic: retry a deadlock, not a bug in your code.
 
-`execTxDynamic` takes either a legacy positional `timeoutMs` number or a `TTxOptions` object `{ timeoutMs?, signal? }` (`0` or omitted — no deadline). On expiry the signal aborts, the connection is torn down, and the call resolves as `{ ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }`; an external `signal` cancels the transaction from outside and ends it as `{ ok: false, error: { ..., kind: 'aborted' } }`, mirroring `exec`.
+`execTxDynamic` takes either a legacy positional `timeoutMs` number or a `TTxOptions` object `{ timeoutMs?, signal? }` (`0` or omitted — no deadline). A negative, `NaN` or infinite `timeoutMs` is a programming error and throws a `TypeError` (the promise rejects) rather than timing out instantly or running without a deadline. On expiry the signal aborts, the connection is torn down, and the call resolves as `{ ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }`; an external `signal` cancels the transaction from outside and ends it as `{ ok: false, error: { ..., kind: 'aborted' } }`, mirroring `exec`.
 
 PostgreSQL and Oracle take a connection from the pool for the transaction and release it back afterwards, on the commit and rollback paths alike. MSSQL opens its own dedicated `ConnectionPool` per transaction and closes it when the transaction finishes, whichever way it ends. Firebird opens its own attach (it has no pool). Firebird runs with `READ COMMITTED` isolation; the other adapters use the driver default.
 
@@ -144,7 +144,7 @@ Statements inside one transaction are not safe to run in parallel: `exec` is bou
 const result = await db.ping() // TResult<null, TDbError>
 ```
 
-A minimal read-only query that requires no privileges; returns `{ ok: true }` on success. Useful for waiting for the database to come up — it accepts the same `options` (`signal`, `firstDataTimeoutMs`, `idleTimeoutMs`) as `exec`, so pass a bounded timeout. Firebird has no connect timeout of its own, so `ping` against an unreachable Firebird host relies on that deadline.
+A minimal read-only query that requires no privileges; returns `{ ok: true }` on success. Useful for waiting for the database to come up — it accepts the same `options` (`signal`, `firstDataTimeoutMs`, `idleTimeoutMs`) as `exec`, so pass a bounded timeout. Firebird's driver has no attach timeout of its own, so a `ping` against an unreachable Firebird host is cut off by the connection's `connectTimeout` (see Connection fields) rather than by the `firstDataTimeoutMs` deadline.
 
 ### `version`
 
@@ -183,7 +183,7 @@ All methods accept named parameters in `:name` syntax, regardless of the underly
 | Oracle     | `:name` (native bind)                | passed as a named bind object |
 | Firebird   | `?` (positional)                     | replaced in left-to-right order of appearance |
 
-In every dialect a `:name` inside a string literal, a quoted identifier or a comment is left as plain text — placeholder scanning skips those. A backslash is an ordinary character in all four dialects (there is no backslash escaping), so `WHERE path = 'C:\' AND id = :id` keeps the string intact and still binds `:id`; only PostgreSQL `E'...'` strings treat a backslash as an escape and are parsed with their own rules, and Oracle `q'[...]'` alternative quoting is recognised too. In a Firebird `EXECUTE BLOCK` only the header — everything up to the `AS` that closes it — is treated as placeholders; past that begins PSQL, where `:name` refers to a local variable or a block parameter and is passed through untouched.
+In every dialect a `:name` inside a string literal, a quoted identifier or a comment is left as plain text — placeholder scanning skips those. A backslash is an ordinary character in all four dialects (there is no backslash escaping), so `WHERE path = 'C:\' AND id = :id` keeps the string intact and still binds `:id`; only PostgreSQL `E'...'` strings treat a backslash as an escape and are parsed with their own rules, and Oracle `q'[...]'` alternative quoting is recognised too. In a Firebird `EXECUTE BLOCK` only the header — everything up to the `AS` that closes it — is treated as placeholders; past that begins PSQL, where `:name` refers to a local variable or a block parameter and is passed through untouched. MSSQL's bracket-quoted identifiers (`[a:b]`) are also left untouched, but only by the MSSQL adapter — PostgreSQL, Oracle and Firebird treat brackets as ordinary SQL, so `ARRAY[:a, :b]` and array subscripts like `arr[:i]` bind their placeholders normally.
 
 A parameter's SQL type is normally inferred from its JS `value`. To pin the exact type, pass `type` with a driver-native type name:
 
