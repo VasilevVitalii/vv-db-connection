@@ -56,8 +56,13 @@ if (!fbAttachProto.attach.__vvPatched) {
 
 // node-firebird assigns the in-flight Connection to `exports.connection` inside
 // attach(); an `import * as` namespace is a snapshot of the CJS exports and does
-// not see that late assignment, so reach it through a live require instead.
-const fbLive = createRequire(import.meta.url)('node-firebird') as { connection?: FbConnInternal }
+// not see that late assignment, so reach it through a live require instead. attach()
+// is reached the same way so tests can substitute it and the connection race is
+// observable; it is the very same function as Firebird.attach at require time.
+const fbLive = createRequire(import.meta.url)('node-firebird') as {
+	connection?: FbConnInternal
+	attach: typeof Firebird.attach
+}
 
 
 // Firebird reports each column's type as a numeric SQL code; map it back to the
@@ -155,6 +160,9 @@ function watchConnection(db: Firebird.Database, onLost: (error: TDbError) => voi
 }
 
 // Drops the connection at once, without a detach the server would have to answer.
+// A real detach() sends op_detach and waits for the reply, which hangs exactly like
+// attach() when the peer is gone (dropped SYN / dead server); ripping the socket ends
+// it immediately. The server sees the socket close and frees the attachment itself.
 function dropConnection(db: Firebird.Database): void {
 	const conn: any = (db as any).connection
 	if (!conn) return
@@ -171,9 +179,6 @@ export class FbAdapter implements IDbAdapter {
 	// nothing is held between calls to release.
 	async close(): Promise<void> {}
 
-	kind(): 'fb' { return 'fb' }
-	title(): string { return `${this.p.host}:${this.p.port ?? 3050} [${this.p.database}]` }
-	user(): string { return this.p.user }
 	versionQuery(): string { return "SELECT rdb$get_context('SYSTEM', 'ENGINE_VERSION') AS ver FROM rdb$database" }
 	pingQuery(): string { return 'SELECT 1 AS p FROM rdb$database' }
 
@@ -193,41 +198,65 @@ export class FbAdapter implements IDbAdapter {
 	}
 
 	// Attaches with an optional timeout. node-firebird keeps the in-flight connection on
-	// Firebird.connection (its exports.connection) and ripping that socket is the only way
-	// to abort a TCP connect / handshake that is still stuck; without it a firewalled host
-	// (SYN dropped rather than refused) hangs the attach for the OS's TCP timeout. The
-	// global handle means two concurrent attaches would race on the same socket - the
-	// adapter issues one attach per call, so this is acceptable.
-	private attach(options: Firebird.Options, timeoutMs?: number): Promise<Firebird.Database> {
+	// exports.connection and ripping that socket is the only way to abort a TCP connect /
+	// handshake that is still stuck; without it a firewalled host (SYN dropped rather than
+	// refused) hangs the attach for the OS's TCP timeout. Because that handle is a single
+	// global, each attach captures its own connection right after calling attach(), before
+	// a concurrent attach can overwrite it - the timeout then tears that socket, not
+	// whichever connection a later attach happened to create. The same teardown is shared
+	// with an external abort signal so close()/abort() during a stuck attach also releases
+	// the descriptor instead of leaving it until the OS TCP timeout.
+	private attach(options: Firebird.Options, timeoutMs?: number, signal?: AbortSignal): Promise<Firebird.Database> {
 		return new Promise((resolve, reject) => {
 			let settled = false
 			let timer: ReturnType<typeof setTimeout> | undefined
+			let conn: FbConnInternal | undefined
 			const done = <T>(fn: (v: T) => void) => (v: T): void => {
 				if (settled) return
 				settled = true
 				if (timer) clearTimeout(timer)
+				signal?.removeEventListener('abort', onAbort)
 				fn(v)
+			}
+			// Tear the in-flight Connection down the same way a failed attach does
+			// (_isDetach skips the driver's self-reconnect; the socket is not yet opened
+			// while a TCP connect is stuck, so destroy() exits cleanly).
+			const tear = (): void => {
+				if (conn) {
+					try {
+						conn._isDetach = true
+						clearTimeout(conn._retry_connection_id)
+						conn._socket?.destroy?.()
+					} catch { /* best effort */ }
+				}
+			}
+			const onAbort = (): void => {
+				if (settled) return
+				done(reject)(new Error(String(signal?.reason ?? 'aborted')))
+				tear()
+			}
+			fbLive.attach(options, (err, db) => {
+				if (err) done(reject)(err)
+				// Given up while the attach was on its way: the connection that just came
+				// back has no one waiting for it - drop it instead of leaking the socket.
+				else if (settled) dropConnection(db)
+				else done(resolve)(db)
+			})
+			// Capture the Connection this attach just created (node-firebird assigns it to
+			// exports.connection synchronously inside attach()) before the timer is armed.
+			conn = fbLive.connection
+			if (signal) {
+				signal.addEventListener('abort', onAbort)
+				if (signal.aborted) onAbort()
 			}
 			if (timeoutMs) {
 				timer = setTimeout(() => {
+					// If the attach already settled there is nothing left to abort.
+					if (settled) return
 					done(reject)(new Error(`fb: connect timeout after ${timeoutMs}ms`))
-					// Tear the in-flight Connection down the same way a failed attach
-					// does (_isDetach skips the driver's self-reconnect; the socket is not
-					// yet opened while a TCP connect is stuck, so 'close' exits cleanly).
-					const conn = fbLive.connection
-					if (conn) {
-						try {
-							conn._isDetach = true
-							clearTimeout(conn._retry_connection_id)
-							conn._socket?.destroy?.()
-						} catch { /* best effort */ }
-					}
+					tear()
 				}, timeoutMs)
 			}
-			Firebird.attach(options, (err, db) => {
-				if (err) done(reject)(err)
-				else done(resolve)(db)
-			})
 		})
 	}
 
@@ -260,7 +289,7 @@ export class FbAdapter implements IDbAdapter {
 			if (signal?.aborted) { finish({ message: String(signal.reason ?? 'aborted'), kind: 'aborted' }); return }
 			signal?.addEventListener('abort', onAbort)
 
-			this.attach(options, this.p.connectTimeout).then(
+			this.attach(options, this.p.connectTimeout, signal).then(
 				(attached) => {
 					// Given up while the attach was on its way - nobody is waiting for this one.
 					if (done) { dropConnection(attached); return }
@@ -272,7 +301,7 @@ export class FbAdapter implements IDbAdapter {
 					// One prepared statement serves the schema, the streamed rows and the
 					// affected-row count. The high-level sequentially() re-prepares the
 					// statement internally, so this drives the low-level Transaction/Statement
-					// API directly (see sql-driver-adapters / node-firebird-internals).
+					// API directly.
 					void this._execStream(attached, sql, values, callback).then(
 						() => { dropConnection(attached); finish() },
 						(err) => { dropConnection(attached); finish(err) },
@@ -358,7 +387,7 @@ export class FbAdapter implements IDbAdapter {
 		return withTxTimeout(timeoutMs, async (signal) => {
 			let db: Firebird.Database
 			try {
-				db = await this.attach(options, this.p.connectTimeout)
+				db = await this.attach(options, this.p.connectTimeout, signal)
 			} catch (err) {
 				return { ok: false, error: toDbError(err, 'connect') }
 			}
@@ -379,10 +408,18 @@ export class FbAdapter implements IDbAdapter {
 					db.transaction(Firebird.ISOLATION_READ_COMMITTED, (err, t) => { if (err) reject(err); else resolve(t) })
 				})
 				const transaction = tx
-				const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
-					const { sql: sqlStr, values } = buildQuery(query, params)
+				const exec = async (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
+					let q: ReturnType<typeof buildQuery>
+					try {
+						q = buildQuery(query, params)
+					} catch (err) {
+						// buildQuery throws synchronously on a missing param; the async
+						// wrapper turns it into a rejection so exec(...).catch(...) sees it,
+						// and tagging it 'query' keeps it from being misreported as 'user'.
+						throw toDbError(err, 'query')
+					}
 					return new Promise<TDbTxResult>((resolve, reject) => {
-						transaction.query(sqlStr, values, (err: Error | null, rows: Record<string, unknown>[]) => {
+						transaction.query(q.sql, q.values, (err: Error | null, rows: Record<string, unknown>[]) => {
 							// Tag the failure as a DB query error so it stays 'query' even
 							// when it bubbles through the user's callback.
 							if (err) reject(toDbError(err, 'query'))

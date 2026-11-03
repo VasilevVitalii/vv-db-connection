@@ -55,13 +55,16 @@ function toSchema(meta: OraMetadata[]): TDbCol[] {
 // answers NJS-098 on a bind that has no placeholder. A placeholder with no matching
 // parameter is rejected here - otherwise Oracle would answer ORA-01008 from the server
 // instead of a clear client-side "param not found" like pg and fb give.
-function buildQuery(query: string, params: TDbParam[]): { sql: string; binds: Record<string, OraBindValue> } {
+export function buildQuery(query: string, params: TDbParam[]): { sql: string; binds: Record<string, OraBindValue> } {
 	const used = new Set<string>()
 	// SQL_ATOM_ORA additionally treats q'[...]' alternative quoting as one string, so a
-	// :name inside it is plain text. :new and :old are trigger correlation names
-	// (CREATE TRIGGER ... FOR EACH ROW), never bind parameters - leave them for the server.
+	// :name inside it is plain text. :new/:old are trigger correlation names, but only
+	// inside a CREATE [OR REPLACE] TRIGGER, and without regard to case (:NEW, :Old, ...).
+	// Outside a trigger they are ordinary bind names, so UPDATE ... WHERE ver = :old must
+	// still bind instead of being silently skipped (the server would answer ORA-01008).
+	const isTrigger = /^\s*CREATE\s+(?:OR\s+REPLACE\s+)?TRIGGER\b/i.test(query)
 	const sql = mapPlaceholders(query, (name) => {
-		if (name === 'new' || name === 'old') return `:${name}`
+		if (isTrigger && /^(?:new|old)$/i.test(name)) return `:${name}`
 		used.add(name)
 		return `:${name}`
 	}, undefined, SQL_ATOM_ORA)
@@ -79,7 +82,7 @@ function buildQuery(query: string, params: TDbParam[]): { sql: string; binds: Re
 // comments (/* hint */, -- comment). queryStream() only runs a query that returns rows;
 // DML and PL/SQL go through execute(), which discards rows - a SELECT hidden behind a
 // leading comment used to be misrouted there and return an empty result silently.
-function isRowQuery(sql: string): boolean {
+export function isRowQuery(sql: string): boolean {
 	let i = 0
 	const n = sql.length
 	for (;;) {
@@ -98,15 +101,20 @@ function isRowQuery(sql: string): boolean {
 		}
 		break
 	}
+	// A parenthesised subquery - (SELECT ...) or (WITH ...) - still returns rows; skip
+	// the leading parens (and any whitespace between them) before deciding, or it is
+	// misrouted to execute() and the rows are discarded.
+	for (;;) {
+		while (i < n && /\s/.test(sql.charAt(i))) i++
+		if (i < n && sql.charAt(i) === '(') { i++; continue }
+		break
+	}
 	return /^(select|with)\b/i.test(sql.slice(i))
 }
 
 export class OraAdapter implements IDbAdapter {
 	constructor(private readonly p: TConnOra) {}
 
-	kind(): 'ora' { return 'ora' }
-	title(): string { return `${this.p.host}:${this.p.port ?? 1521} [${this.p.service}]` }
-	user(): string { return this.p.user }
 	versionQuery(): string { return 'SELECT banner AS ver FROM v$version WHERE rownum = 1' }
 	// v$version is hidden from users without SELECT_CATALOG_ROLE; this view is public.
 	versionFallbackQuery(): string { return 'SELECT version AS ver FROM PRODUCT_COMPONENT_VERSION WHERE rownum = 1' }
@@ -146,7 +154,7 @@ export class OraAdapter implements IDbAdapter {
 					poolMin:       this.p.poolMin ?? 0,
 					poolMax:       this.p.poolMax ?? 4,
 					poolIncrement: this.p.poolIncrement ?? 1,
-					...(this.p.queueTimeout ? { queueTimeout: this.p.queueTimeout } : {}),
+					...(this.p.queueTimeout !== undefined ? { queueTimeout: this.p.queueTimeout } : {}),
 				})
 			})()
 		}
@@ -165,6 +173,12 @@ export class OraAdapter implements IDbAdapter {
 	}
 
 	async execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void> {
+		// Rewrite and validate the query before touching the pool: a "param not found" (or
+		// any other build error) must never hold a pool slot, matching fb validating before
+		// its attach. A throw here rejects the call, which DbConnection turns into a finish
+		// event without a connection ever being acquired.
+		const { sql, binds } = buildQuery(query, params)
+		const rowQuery = isRowQuery(sql)
 		let conn: oracledb.Connection
 		try {
 			conn = await (await this.pool()).getConnection()
@@ -172,9 +186,11 @@ export class OraAdapter implements IDbAdapter {
 			callback({ kind: 'finish', error: toDbError(err, 'connect') })
 			return
 		}
+		// break() interrupts the statement on the server; close() must wait for it, or the
+		// driver answers NJS-032 and the connection never returns to the pool. The interrupt
+		// promise is remembered here so the finally can await it before closing.
+		let interrupt: Promise<void> | undefined
 		try {
-			const { sql, binds } = buildQuery(query, params)
-			const rowQuery = isRowQuery(sql)
 			await new Promise<void>((resolve) => {
 				let done = false
 				let stream: oracledb.QueryStream<any> | undefined
@@ -191,7 +207,7 @@ export class OraAdapter implements IDbAdapter {
 				// to skip this, so a slow UPDATE/PL-SQL block kept its connection past the
 				// abort until it finished on its own.
 				const onAbort = (): void => {
-					void conn.break().catch(() => {})
+					interrupt = conn.break().catch(() => {})
 					stream?.destroy()
 					finish({ message: String(signal?.reason ?? 'aborted'), kind: 'aborted' })
 				}
@@ -230,6 +246,9 @@ export class OraAdapter implements IDbAdapter {
 				stream.on('end', () => finish())
 			})
 		} finally {
+			// Wait for the interrupt before closing, so close() does not race the in-flight
+			// statement and get NJS-032 (which would drop the connection out of the pool).
+			if (interrupt) { try { await interrupt } catch {} }
 			try { await conn.close() } catch {}
 		}
 	}
@@ -243,28 +262,48 @@ export class OraAdapter implements IDbAdapter {
 				return { ok: false, error: toDbError(err, 'connect') }
 			}
 			// break() interrupts the statement running on the server, close() releases the
-			// connection; both fire-and-forget so the race is settled at once.
+			// connection. close() must wait for break() to land, or the driver answers
+			// NJS-032 and the connection never returns to the pool (poolMax is small enough
+			// to exhaust). The interrupt promise is remembered for both the abort handler and
+			// the early-abort branch, and a close() that still fails drops the connection.
+			let interrupt: Promise<void> | undefined
+			const release = async (): Promise<void> => {
+				if (interrupt) { try { await interrupt } catch {} }
+				try { await conn.close() } catch {
+					try { await conn.close({ drop: true }) } catch {}
+				}
+			}
 			const teardown = (): void => {
-				void conn.break().catch(() => {})
-				void conn.close().catch(() => {})
+				interrupt = conn.break().catch(() => {})
+				void release()
 			}
 			signal.addEventListener('abort', teardown, { once: true })
 			// getConnection() may have resolved after the deadline already fired: the
 			// listener above was added too late to ever run, and the finally below skips
-			// close() on an aborted signal. Release the connection here instead of leaking
-			// it from the shared pool (poolMax is small enough to exhaust).
+			// close() on an aborted signal. Interrupt and release here, awaiting the close so
+			// the pool slot is returned before the timeout is reported.
 			if (signal.aborted) {
-				teardown()
+				interrupt = conn.break().catch(() => {})
+				await release()
 				return { ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }
 			}
 			try {
-				const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
-					const { sql, binds } = buildQuery(query, params)
-					return conn.execute<Record<string, unknown>>(sql, binds, { autoCommit: false, outFormat: oracledb.OUT_FORMAT_OBJECT })
+				const exec = async (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
+					let q: ReturnType<typeof buildQuery>
+					try {
+						q = buildQuery(query, params)
+					} catch (err) {
+						// buildQuery throws synchronously on a missing param; the async
+						// wrapper turns it into a rejection so exec(...).catch(...) sees it,
+						// and tagging it 'query' keeps it from being misreported as 'user'.
+						throw toDbError(err, 'query')
+					}
+					return conn.execute<Record<string, unknown>>(q.sql, q.binds, { autoCommit: false, outFormat: oracledb.OUT_FORMAT_OBJECT })
 						.then(
 							(res) => ({
-								rows:      (res.rows ?? []) as Record<string, unknown>[],
-								outParams: res.outBinds as Record<string, unknown> | undefined,
+								rows:         (res.rows ?? []) as Record<string, unknown>[],
+								rowsAffected: res.rowsAffected,
+								outParams:    res.outBinds as Record<string, unknown> | undefined,
 							}),
 							// Tag the failure as a DB query error so it stays 'query' even
 							// when it bubbles through the user's callback.
@@ -287,7 +326,9 @@ export class OraAdapter implements IDbAdapter {
 			} finally {
 				signal.removeEventListener('abort', teardown)
 				if (!signal.aborted) {
-					try { await conn.close() } catch {}
+					try { await conn.close() } catch {
+						try { await conn.close({ drop: true }) } catch {}
+					}
 				}
 			}
 		}, external)

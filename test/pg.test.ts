@@ -1,7 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
+import { Pool, type PoolClient } from 'pg'
 import { DbConnection } from '../src/index'
-import { toSchema } from '../src/db/adapters/pg'
+import { PgAdapter, toSchema } from '../src/db/adapters/pg'
+import type { TConnPg } from '../src/db/connection'
 import { loadConnections, reachable, runDbSuite, connHost, connPort } from './helpers'
 
 const conns = await loadConnections()
@@ -49,7 +52,7 @@ test('pg: kind maps OIDs to readable type names', { skip }, async (t) => {
 // review2 4.9: the schema carried only the type name; the declared length/precision was
 // dropped. dataTypeModifier (the catalog's atttypmod) encodes it: varchar(n)/char(n) →
 // len, numeric(p,s) → precision/scale. Unit test against the FieldDef shape, no live DB.
-test('pg: toSchema decodes length and precision from dataTypeModifier', () => {
+test('pg: toSchema decodes length and precision from dataTypeModifier', async (t) => {
 	const schema = toSchema([
 		{ name: 'v', tableID: 0, columnID: 0, dataTypeID: 1043, dataTypeSize: -1, dataTypeModifier: 20 + 4, format: 'text' },
 		{ name: 'n', tableID: 0, columnID: 0, dataTypeID: 1700, dataTypeSize: -1, dataTypeModifier: ((10 << 16) | 2) + 4, format: 'text' },
@@ -62,4 +65,58 @@ test('pg: toSchema decodes length and precision from dataTypeModifier', () => {
 	assert.equal(schema[1]!.scale, 2)
 	assert.equal(schema[2]!.kind, 'text')
 	assert.equal(schema[2]!.len, undefined)
+})
+
+// review3 1.1: when the tx deadline fires while connect() is still in flight, the abort
+// event has already fired before the listener is attached, so the listener never runs,
+// and the finally below skips release() on an aborted signal - the freshly-connected pool
+// client would leak its slot forever. The fix releases the client right there (it is
+// broken anyway after the socket is ripped).
+test('pg: execTxDynamic releases the pool client when the deadline fires during connect', async (t) => {
+	let release!: () => void
+	const gate = new Promise<void>((resolve) => { release = resolve })
+	let released = 0
+	let destroyed = 0
+	const fakeClient = {
+		on(): void {},
+		removeListener(): void {},
+		release(): void { released += 1 },
+		connection: { stream: { destroy(): void { destroyed += 1 } } },
+	}
+
+	t.mock.method(Pool.prototype, 'connect', function (this: Pool) {
+		return gate.then(() => fakeClient as unknown as PoolClient)
+	})
+
+	const adapter = new PgAdapter({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
+	const r = await adapter.execTxDynamic(async () => { throw new Error('body must not run') }, 50)
+
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'timeout')
+
+	// Let connect() finish: the body resumes on an already-aborted signal and must
+	// release the client itself, since the abort event will not fire again.
+	release()
+	await new Promise((resolve) => setImmediate(resolve))
+
+	assert.equal(released, 1)
+	assert.equal(destroyed, 1)
+})
+
+// review3 follow-up (MaxListenersExceededWarning): the pool reuses the same PoolClient,
+// so the error listener added by execStream must be removed before release(), or it
+// accumulates one per query and trips the default 10-listener cap. Exercise more
+// iterations than the cap and assert the client comes back clean each time.
+test('pg: execStream removes its error listener before returning the client to the pool', async (t) => {
+	const fakeClient = Object.assign(new EventEmitter(), {
+		release: (): void => {},
+		query: async (): Promise<unknown> => ({ fields: [], rows: [], rowCount: null }),
+	})
+	t.mock.method(Pool.prototype, 'connect', async () => fakeClient as unknown as PoolClient)
+
+	const adapter = new PgAdapter({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
+	for (let i = 0; i < 12; i += 1) {
+		await adapter.execStream('SELECT 1', [], () => {})
+	}
+	assert.equal(fakeClient.listenerCount('error'), 0)
 })

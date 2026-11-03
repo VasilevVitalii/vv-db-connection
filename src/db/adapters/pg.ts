@@ -73,9 +73,6 @@ function buildQuery(query: string, params: TDbParam[]): { text: string; values: 
 export class PgAdapter implements IDbAdapter {
 	constructor(private readonly p: TConnPg) {}
 
-	kind(): 'pg' { return 'pg' }
-	title(): string { return `${this.p.host}:${this.p.port ?? 5432} [${this.p.database}]` }
-	user(): string { return this.p.user }
 	versionQuery(): string { return 'SELECT version() AS ver' }
 	pingQuery(): string { return 'SELECT 1 AS p' }
 
@@ -135,6 +132,17 @@ export class PgAdapter implements IDbAdapter {
 			.finally(() => { void c.end().catch(() => {}) })
 	}
 
+	// Cancel the running query on the server and rip the socket. A graceful end() would
+	// send Terminate, which the backend reads only after the running query has finished -
+	// so a stuck query would outlive it. Cancel + destroy is the instant exit shared by
+	// execStream's abort and execTxDynamic's timeout teardown, so the two paths cannot
+	// drift apart (previously each carried its own copy of these three lines).
+	private _teardownClient(client: PoolClient): void {
+		const internals = client as unknown as { processID?: number; connection?: { stream?: { destroy(): void } } }
+		if (internals.processID) this._cancelBackend(internals.processID)
+		try { internals.connection?.stream?.destroy() } catch {}
+	}
+
 	async execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void> {
 		let client: PoolClient
 		try {
@@ -150,11 +158,10 @@ export class PgAdapter implements IDbAdapter {
 		// rejects the query but leaves the client healthy), so it also decides whether the
 		// client is returned to the pool or dropped.
 		let broken = false
-		client.on('error', () => { broken = true })
+		const onError = (): void => { broken = true }
+		client.on('error', onError)
 		const onAbort = (): void => {
-			const internals = client as unknown as { processID?: number; connection?: { stream?: { destroy(): void } } }
-			if (internals.processID) this._cancelBackend(internals.processID)
-			try { internals.connection?.stream?.destroy() } catch {}
+			this._teardownClient(client)
 		}
 		signal?.addEventListener('abort', onAbort)
 		try {
@@ -206,6 +213,10 @@ export class PgAdapter implements IDbAdapter {
 			callback({ kind: 'finish', error: toDbError(err, 'query') })
 		} finally {
 			signal?.removeEventListener('abort', onAbort)
+			// Remove the error listener before handing the client back: the pool reuses the
+			// same PoolClient, so an un-removed listener accumulates one per query and trips
+			// MaxListeners (and each stale closure would keep a dead `broken` alive).
+			client.removeListener('error', onError)
 			// release(err) drops the client from the pool: pass it on a broken connection so
 			// a dead socket is not handed to the next query. A plain SQL error keeps the
 			// client healthy and is released back normally.
@@ -226,29 +237,42 @@ export class PgAdapter implements IDbAdapter {
 			// event marks the connection as broken so release() drops it instead of returning
 			// a dead socket to the pool.
 			let broken = false
-			client.on('error', () => { broken = true })
+			const onError = (): void => { broken = true }
+			client.on('error', onError)
 			// On a timeout a graceful end() would send Terminate, which the backend only
 			// reads after the running query has finished - so a stuck query would outlive
 			// it. Cancel it on the server and rip the socket, as execStream's onAbort does.
 			const teardown = (): void => {
-				const internals = client as unknown as { processID?: number; connection?: { stream?: { destroy(): void } } }
-				if (internals.processID) this._cancelBackend(internals.processID)
-				try { internals.connection?.stream?.destroy() } catch {}
+				this._teardownClient(client)
 			}
 			signal.addEventListener('abort', teardown, { once: true })
 			// connect() may have resolved after the deadline already fired: the listener
 			// above was added too late to ever run, and the finally below skips release()
-			// on an aborted signal. Rip the socket here instead of leaking the pool client.
+			// on an aborted signal. Rip the socket here and release the (now broken) client,
+			// so the pool slot is returned instead of leaking it.
 			if (signal.aborted) {
 				teardown()
+				client.removeListener('error', onError)
+				client.release(true)
 				return { ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }
 			}
 			try {
 				await client.query('BEGIN')
-				const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
-					const { text, values } = buildQuery(query, params)
-					return client.query({ text, values }).then(
-						(res) => ({ rows: res.rows as Record<string, unknown>[] }),
+				const exec = async (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
+					let q: ReturnType<typeof buildQuery>
+					try {
+						q = buildQuery(query, params)
+					} catch (err) {
+						// buildQuery throws synchronously on a missing param; the async
+						// wrapper turns it into a rejection so exec(...).catch(...) sees it,
+						// and tagging it 'query' keeps it from being misreported as 'user'.
+						throw toDbError(err, 'query')
+					}
+					return client.query({ text: q.text, values: q.values }).then(
+						(res) => ({
+							rows:         res.rows as Record<string, unknown>[],
+							rowsAffected: res.rowCount ?? undefined,
+						}),
 						// Tag the failure as a DB query error so it stays 'query' even when
 						// it bubbles through the user's callback (which may re-throw it).
 						(err) => { throw toDbError(err, 'query') },
@@ -273,6 +297,7 @@ export class PgAdapter implements IDbAdapter {
 				return { ok: false, error: toDbError(err, 'tx') }
 			} finally {
 				signal.removeEventListener('abort', teardown)
+				client.removeListener('error', onError)
 				client.release(broken || signal.aborted)
 			}
 		}, external)

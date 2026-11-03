@@ -1,7 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createRequire } from 'node:module'
 import { loadConnections, reachable, runDbSuite, connHost, connPort } from './helpers'
 import { DbConnection } from '../src/index'
+import { FbAdapter } from '../src/db/adapters/fb'
 import type { TConnFb } from '../src/db/connection'
 
 const conns = await loadConnections()
@@ -20,7 +22,7 @@ runDbSuite('fb', conn, 'SELECT CAST(:v AS VARCHAR(20)) AS v FROM rdb$database', 
 
 // review2 §3 (group A): out/inout binds are Oracle-only. fb rejects the direction in
 // buildQuery before any attach, so this runs without a live database.
-test('fb: an out param is rejected', async () => {
+test('fb: an out param is rejected', async (t) => {
 	const db = new DbConnection({ kind: 'fb', host: 'localhost', database: '/tmp/x.fdb', user: 'u', password: 'p' } as TConnFb)
 	const r = await db.exec('SELECT 1 FROM rdb$database WHERE 1 = :v', [{ name: 'v', value: 1, direction: 'out' }])
 	assert.equal(r.ok, false)
@@ -31,7 +33,7 @@ test('fb: an out param is rejected', async () => {
 // value to a BLOB column automatically, and sends a JS bigint as INT128. Reading a BIGINT
 // beyond 2^53 exactly needs numericMode 'string'/'safe' - 'lossy' (default) decodes via
 // JS Number and silently rounds.
-test('fb: Buffer round-trips through a BLOB column', { skip }, async () => {
+test('fb: Buffer round-trips through a BLOB column', { skip }, async (t) => {
 	const db = new DbConnection(conn as TConnFb)
 	try {
 		const created = await db.exec('CREATE TABLE vv_ra_blob (id INTEGER, data BLOB SUB_TYPE TEXT)', [])
@@ -49,7 +51,7 @@ test('fb: Buffer round-trips through a BLOB column', { skip }, async () => {
 	}
 })
 
-test('fb: bigint round-trips exactly with numericMode string', { skip }, async () => {
+test('fb: bigint round-trips exactly with numericMode string', { skip }, async (t) => {
 	const db = new DbConnection({ ...(conn as TConnFb), numericMode: 'string' } as TConnFb)
 	try {
 		const created = await db.exec('CREATE TABLE vv_ra_big (id INTEGER, n BIGINT)', [])
@@ -73,7 +75,7 @@ test('fb: bigint round-trips exactly with numericMode string', { skip }, async (
 // connectTimeout the socket is ripped and the call fails as kind 'connect' promptly.
 // 192.0.2.1 (TEST-NET-1) never answers: either the SYN is dropped and the timeout fires,
 // or the route is unreachable and the connect fails fast - both must end quickly.
-test('fb: a stuck attach to an unreachable host is cut off by connectTimeout', async () => {
+test('fb: a stuck attach to an unreachable host is cut off by connectTimeout', async (t) => {
 	const t0 = Date.now()
 	const db = new DbConnection({ kind: 'fb', host: '192.0.2.1', port: 3050, database: '/tmp/x.fdb', user: 'u', password: 'p', connectTimeout: 500 } as TConnFb)
 	const r = await db.exec('SELECT 1 FROM rdb$database', [])
@@ -82,4 +84,96 @@ test('fb: a stuck attach to an unreachable host is cut off by connectTimeout', a
 	assert.equal(r.ok, false)
 	if (!r.ok) assert.equal(r.error.kind, 'connect')
 	assert.ok(elapsed < 10000, `attach should be cut off, took ${elapsed}ms`)
+})
+
+// node-firebird stores the in-flight Connection on one global (exports.connection); the
+// adapter reaches it through the same live require used by the code under test, so the
+// attach function can be substituted and the connection handle observed.
+const fbLive = createRequire(import.meta.url)('node-firebird') as {
+	connection?: { _isDetach?: boolean; _retry_connection_id?: unknown; _socket?: { destroy(): void } | null }
+	attach: (options: unknown, callback: (err: unknown, db: unknown) => void) => void
+}
+
+// review3 1.3: two concurrent attaches overwrite the global handle, and the old timeout
+// handler read that global at fire time - so the first timeout ripped the *second* attach's
+// socket and left the first one hanging. The fix captures each attach's own connection
+// synchronously right after calling attach().
+test('fb: a connect timeout tears down its own socket, not a concurrent attach', async (t) => {
+	let destroyedA = 0
+	let destroyedB = 0
+	const connA = { _isDetach: false, _retry_connection_id: undefined, _socket: { destroy: () => { destroyedA += 1 } } }
+	const connB = { _isDetach: false, _retry_connection_id: undefined, _socket: { destroy: () => { destroyedB += 1 } } }
+
+	let attachCall = 0
+	t.mock.method(fbLive, 'attach', () => {
+		attachCall += 1
+		// node-firebird assigns the in-flight Connection to exports.connection
+		// synchronously inside attach() - the second attach overwrites the first.
+		fbLive.connection = attachCall === 1 ? connA : connB
+		// never call cb: both attaches stay stuck so the timeout tears the socket.
+	})
+
+	const adapter = new FbAdapter({ kind: 'fb', host: '127.0.0.1', database: '/tmp/x.fdb', user: 'u', password: 'p', connectTimeout: 50 } as TConnFb)
+	const a = adapter.execTxDynamic(async () => { throw new Error('body must not run') })
+	const b = adapter.execTxDynamic(async () => { throw new Error('body must not run') })
+
+	const [ra, rb] = await Promise.all([a, b])
+	assert.equal(ra.ok, false)
+	if (!ra.ok) assert.equal(ra.error.kind, 'connect')
+	assert.equal(rb.ok, false)
+	if (!rb.ok) assert.equal(rb.error.kind, 'connect')
+
+	assert.equal(destroyedA, 1, 'the first attach must tear down its own socket')
+	assert.equal(destroyedB, 1, 'the second attach must tear down its own socket')
+})
+
+// If the attach does complete after the deadline (the socket survived long enough), the
+// connection that came back has no one waiting for it. The fix drops it so it does not
+// leak a socket; the old code ignored it (done() is a no-op once the timeout settled).
+test('fb: an attach that completes after the timeout drops the connection', async (t) => {
+	let dropped = 0
+	let savedCb!: (err: unknown, db: unknown) => void
+	const fakeDbConn = { _isDetach: false, _retry_connection_id: undefined, _socket: null as { destroy(): void } | null }
+
+	t.mock.method(fbLive, 'attach', (_options: unknown, cb: (err: unknown, db: unknown) => void) => {
+		savedCb = cb
+		fbLive.connection = fakeDbConn
+	})
+
+	const adapter = new FbAdapter({ kind: 'fb', host: '127.0.0.1', database: '/tmp/x.fdb', user: 'u', password: 'p', connectTimeout: 50 } as TConnFb)
+	const p = adapter.execTxDynamic(async () => { throw new Error('body must not run') })
+	await new Promise((resolve) => setTimeout(resolve, 80)) // the connect timeout fires
+	// the attach now completes late, with an open socket
+	fakeDbConn._socket = { destroy: () => { dropped += 1 } }
+	savedCb(null, { connection: fakeDbConn })
+	const r = await p
+
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'connect')
+	assert.equal(dropped, 1, 'the late connection must be dropped, not leaked')
+})
+
+// review3 4.20 (second half): aborting/close() during an in-flight attach must rip the
+// socket at once instead of leaving it until the OS TCP timeout. The attach timeout
+// already tore it down; the same teardown is now shared with the external abort signal.
+test('fb: aborting execStream during a stuck attach tears the socket down', async (t) => {
+	let destroyed = 0
+	const fakeConn = { _isDetach: false, _retry_connection_id: undefined, _socket: { destroy: () => { destroyed += 1 } } }
+
+	t.mock.method(fbLive, 'attach', () => {
+		// node-firebird assigns the in-flight Connection synchronously; never call cb so
+		// the attach stays stuck until the abort signal fires.
+		fbLive.connection = fakeConn
+	})
+
+	const ac = new AbortController()
+	const adapter = new FbAdapter({ kind: 'fb', host: '127.0.0.1', database: '/tmp/x.fdb', user: 'u', password: 'p' } as TConnFb)
+	const events: { kind: string }[] = []
+	const p = adapter.execStream('SELECT 1 FROM rdb$database', [], (e) => events.push(e), ac.signal)
+	await new Promise((resolve) => setImmediate(resolve)) // let attach run and register its abort listener
+	ac.abort()
+	await p
+
+	assert.equal(destroyed, 1, 'the in-flight attach socket must be ripped on abort')
+	assert.equal(events[events.length - 1]?.kind, 'finish')
 })

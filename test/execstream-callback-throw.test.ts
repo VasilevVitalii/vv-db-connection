@@ -1,4 +1,4 @@
-import { test, mock } from 'node:test'
+import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import sql from 'mssql'
 import { DbConnection } from '../src/index'
@@ -30,11 +30,11 @@ class FakeRequest {
 	}
 }
 
-test('a throw from the row callback becomes a finish error, not an uncaughtException', async () => {
-	mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
+test('a throw from the row callback becomes a finish error, not an uncaughtException', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
 		return Promise.resolve(this)
 	})
-	mock.method(sql.ConnectionPool.prototype, 'request', function () {
+	t.mock.method(sql.ConnectionPool.prototype, 'request', function () {
 		return new FakeRequest() as unknown as sql.Request
 	})
 
@@ -51,11 +51,11 @@ test('a throw from the row callback becomes a finish error, not an uncaughtExcep
 	assert.equal(finish?.error?.kind, 'query')
 })
 
-test('a throw from the finish callback itself is dropped, not re-thrown', async () => {
-	mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
+test('a throw from the finish callback itself is dropped, not re-thrown', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
 		return Promise.resolve(this)
 	})
-	mock.method(sql.ConnectionPool.prototype, 'request', function () {
+	t.mock.method(sql.ConnectionPool.prototype, 'request', function () {
 		return new FakeRequest() as unknown as sql.Request
 	})
 

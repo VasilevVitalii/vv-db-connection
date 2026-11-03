@@ -1,6 +1,6 @@
 {
   "name": "vv-db-connection",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "The wrapper for connecting to various database servers",
   "keywords": [
     "MSSQL",
@@ -38,7 +38,7 @@
   "scripts": {
     "build": "tsc && tsc-esm-fix --target=distjs",
     "test": "node --import tsx --test test/*.test.ts",
-    "test:smoke": "npm run build && node -e \"import('vv-db-connection').then((m) => { if (!m.DbConnection) { console.error('smoke: missing exports'); process.exit(1) } console.log('smoke ok: ' + Object.keys(m).join(', ')) }).catch((e) => { console.error(e); process.exit(1) })\""
+    "test:smoke": "npm run build && node -e \"Promise.all([import('vv-db-connection'), import('./distjs/src/db/adapters/fb.js')]).then(([m]) => { if (!m.DbConnection) { console.error('smoke: missing exports'); process.exit(1) } console.log('smoke ok: ' + Object.keys(m).join(', ')) }).catch((e) => { console.error(e); process.exit(1) })\""
   },
   "peerDependencies": {
     "mssql": "^12.5.0",

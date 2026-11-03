@@ -1,5 +1,4 @@
 import type { TResult } from '../tresult'
-import type { TDbKind } from './connection'
 
 // A query/transaction parameter. The driver infers the SQL type from `value` unless
 // `type` forces a driver-native type name (mssql: 'DateTime2', 'NVarChar', ...; oracle:
@@ -11,10 +10,8 @@ export type TDbParam = {
 	// The bind value. Omit it for a pure out parameter (direction 'out') - the driver
 	// sends nothing on an OUT bind; inout keeps it as the input value.
 	value?: unknown
-	// Forces a driver-native type name (mssql: 'DateTime2', 'NVarChar', ...; oracle:
-	// 'NUMBER', 'VARCHAR2', 'DATE', 'CLOB', ...). Forcing it pins the exact bind type - e.g.
-	// a Date would otherwise arrive as mssql DateTime (losing sub-second precision) and a
-	// long string as NVarChar. firebird and postgres infer from the JS value and ignore `type`.
+	// Forces a driver-native type name; firebird and postgres infer from the value and
+	// ignore it (see the type-level comment above).
 	type?: string
 	// Bind direction. 'out' / 'inout' are supported only by Oracle (oracledb BIND_OUT /
 	// BIND_INOUT) and the returned value lands in TDbRes.outParams; the other adapters
@@ -77,14 +74,11 @@ export type TDbStreamEvent =
 	| { kind: 'outParams'; params: Record<string, unknown> }
 	| { kind: 'finish'; error?: TDbError }
 
-export type TDbTxResult = { rows: Record<string, unknown>[]; outParams?: Record<string, unknown> }
+export type TDbTxResult = { rows: Record<string, unknown>[]; rowsAffected?: number; outParams?: Record<string, unknown> }
 export type TDbTxExec   = (query: string, params: TDbParam[]) => Promise<TDbTxResult>
 export type TDbTxCb     = (exec: TDbTxExec, signal: AbortSignal) => Promise<void>
 
 export interface IDbAdapter {
-	kind(): TDbKind
-	title(): string
-	user(): string
 	versionQuery(): string
 	// A second query to try when versionQuery() is not reachable (Oracle: v$version is
 	// not visible without SELECT_CATALOG_ROLE, but PRODUCT_COMPONENT_VERSION is public).

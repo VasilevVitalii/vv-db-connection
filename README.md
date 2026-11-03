@@ -210,6 +210,8 @@ type TDbError = {
   kind: TDbErrorKind
 }
 
+type TDbKind = 'mssql' | 'pg' | 'ora' | 'fb' // the connection discriminator (db.kind())
+
 type TDbCol = {
   name: string
   kind: string      // driver-specific type name
@@ -238,7 +240,19 @@ type TExecOptions = {
   idleTimeoutMs?: number
 }
 
-type TDbTxResult = { rows: Record<string, unknown>[]; outParams?: Record<string, unknown> }
+type TDbParam = {
+  name: string
+  value?: unknown
+  type?: string      // forces a driver-native type name; firebird and postgres infer from the value
+  direction?: 'in' | 'out' | 'inout' // 'out'/'inout' are Oracle-only
+}
+
+type TTxOptions = {
+  timeoutMs?: number // transaction deadline; 0 or omitted — no deadline
+  signal?: AbortSignal
+}
+
+type TDbTxResult = { rows: Record<string, unknown>[]; rowsAffected?: number; outParams?: Record<string, unknown> }
 type TDbTxExec   = (query: string, params: TDbParam[]) => Promise<TDbTxResult>
 type TDbTxCb     = (exec: TDbTxExec, signal: AbortSignal) => Promise<void>
 ```

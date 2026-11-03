@@ -1,4 +1,4 @@
-import { test, mock } from 'node:test'
+import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import sql from 'mssql'
 import { MssqlAdapter } from '../src/db/adapters/mssql'
@@ -28,15 +28,15 @@ class FakeRequest {
 	}
 }
 
-test('execStream tears the borrowed connection down hard on abort', async () => {
+test('execStream tears the borrowed connection down hard on abort', async (t) => {
 	let closed = 0
 	let canceled = 0
 	let request!: FakeRequest
 
-	mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
 		return Promise.resolve(this)
 	})
-	mock.method(sql.ConnectionPool.prototype, 'request', function () {
+	t.mock.method(sql.ConnectionPool.prototype, 'request', function () {
 		request = new FakeRequest(() => { closed += 1 }, () => { canceled += 1 })
 		return request as unknown as sql.Request
 	})
@@ -55,15 +55,15 @@ test('execStream tears the borrowed connection down hard on abort', async () => 
 	assert.equal(canceled, 0, 'graceful ATTN cancel must not be used')
 })
 
-test('execStream falls back to cancel() when abort fires before the connection is borrowed', async () => {
+test('execStream falls back to cancel() when abort fires before the connection is borrowed', async (t) => {
 	let closed = 0
 	let canceled = 0
 	let request!: FakeRequest
 
-	mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
 		return Promise.resolve(this)
 	})
-	mock.method(sql.ConnectionPool.prototype, 'request', function () {
+	t.mock.method(sql.ConnectionPool.prototype, 'request', function () {
 		request = new FakeRequest(() => { closed += 1 }, () => { canceled += 1 })
 		// Simulate an abort that lands before the acquire completes: no borrowed
 		// connection, so _currentRequest stays undefined.

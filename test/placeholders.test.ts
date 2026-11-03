@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mapPlaceholders, SQL_ATOM_PG, SQL_ATOM_ORA } from '../src/db/placeholders'
+import { mapPlaceholders, SQL_ATOM_PG, SQL_ATOM_ORA, SQL_ATOM_MSSQL } from '../src/db/placeholders'
 
 const toAt = (name: string): string => `@${name}`
 
@@ -57,7 +57,13 @@ test('does not treat a digit-leading name as a placeholder (array slice)', () =>
 })
 
 test('leaves a bracket-quoted identifier alone (MSSQL)', () => {
-	assert.equal(mapPlaceholders('SELECT [a:b] AS x', toAt), 'SELECT [a:b] AS x')
+	assert.equal(mapPlaceholders('SELECT [a:b] AS x', toAt, undefined, SQL_ATOM_MSSQL), 'SELECT [a:b] AS x')
+})
+
+test('substitutes placeholders inside brackets for the other dialects', () => {
+	// pg arrays/slices keep brackets as code, so :a/:b/:i must still be substituted.
+	assert.equal(mapPlaceholders('SELECT ARRAY[:a, :b]', toAt, undefined, SQL_ATOM_PG), 'SELECT ARRAY[@a, @b]')
+	assert.equal(mapPlaceholders('SELECT arr[:i]', toAt), 'SELECT arr[@i]')
 })
 
 test('leaves a dollar-quoted string alone (pg DO block)', () => {
@@ -96,4 +102,22 @@ test('leaves an Oracle q-quote string alone', () => {
 
 test('replaces placeholders outside an Oracle q-quote', () => {
 	assert.equal(mapPlaceholders("SELECT q'[a :y]', :v FROM dual", toAt, undefined, SQL_ATOM_ORA), "SELECT q'[a :y]', @v FROM dual")
+})
+
+// review3 §2.9: Oracle's q-quote accepts any case (q'/Q') and an optional national
+// prefix (nq'/NQ'/Nq'/...). The atom must recognise all of them, or a :name inside such
+// a literal is wrongly substituted.
+test('leaves uppercase and national Oracle q-quotes alone', () => {
+	assert.equal(mapPlaceholders("SELECT Q'[it's :x]' AS s", toAt, undefined, SQL_ATOM_ORA), "SELECT Q'[it's :x]' AS s")
+	assert.equal(mapPlaceholders("SELECT nq'[it's :x]' AS s", toAt, undefined, SQL_ATOM_ORA), "SELECT nq'[it's :x]' AS s")
+	assert.equal(mapPlaceholders("SELECT NQ'{has :x}' AS s", toAt, undefined, SQL_ATOM_ORA), "SELECT NQ'{has :x}' AS s")
+	assert.equal(mapPlaceholders("SELECT Q'!a :b!' AS s", toAt, undefined, SQL_ATOM_ORA), "SELECT Q'!a :b!' AS s")
+})
+
+// review3 §2.10: date'...' / time'...' are pg typed literals whose leading token ends in
+// 'e' - they must not be parsed as E'' escape strings (backslash would then escape), and
+// a placeholder right after them must still bind.
+test('does not mistake a pg date/time typed literal for an E-string', () => {
+	assert.equal(mapPlaceholders("SELECT date'2020-01-01' AS d, :v", toAt, undefined, SQL_ATOM_PG), "SELECT date'2020-01-01' AS d, @v")
+	assert.equal(mapPlaceholders("SELECT time'12:30:00' AS t, :v", toAt, undefined, SQL_ATOM_PG), "SELECT time'12:30:00' AS t, @v")
 })

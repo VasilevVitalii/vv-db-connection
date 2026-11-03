@@ -1,4 +1,4 @@
-import { test, mock } from 'node:test'
+import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import sql from 'mssql'
 import { MssqlAdapter } from '../src/db/adapters/mssql'
@@ -14,16 +14,16 @@ const conn: TConnMssql = {
 	auth: { kind: 'mssql', user: 'u', password: 'p' },
 }
 
-test('execTxDynamic tears the pool down when the deadline fires during connect', async () => {
+test('execTxDynamic tears the pool down when the deadline fires during connect', async (t) => {
 	let release!: () => void
 	const gate = new Promise<void>((resolve) => { release = resolve })
 	let closed = 0
 
 	// connect() hangs until we release it — well past the 50ms deadline.
-	mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
 		return gate.then(() => this)
 	})
-	mock.method(sql.ConnectionPool.prototype, 'close', () => {
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => {
 		closed += 1
 		return Promise.resolve()
 	})
@@ -46,19 +46,19 @@ test('execTxDynamic tears the pool down when the deadline fires during connect',
 // pool.close() waits for the busy connection, so a stuck statement would hold the slot
 // forever. The teardown must rip the tedious socket instead; pool.close() then frees the
 // dedicated pool at once.
-test('execTxDynamic hard-breaks the socket when the deadline fires mid-transaction', async () => {
+test('execTxDynamic hard-breaks the socket when the deadline fires mid-transaction', async (t) => {
 	let destroyed = 0
 	let closed = 0
 	const never = new Promise<void>(() => {})
 
-	mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
 		return Promise.resolve(this)
 	})
-	mock.method(sql.ConnectionPool.prototype, 'close', () => {
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => {
 		closed += 1
 		return Promise.resolve()
 	})
-	mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
 		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = {
 			socket: { destroy: () => { destroyed += 1 } },
 		}
@@ -77,11 +77,11 @@ test('execTxDynamic hard-breaks the socket when the deadline fires mid-transacti
 
 // review2 §2 "классификация ошибок транзакций": begin/commit failures are 'tx'. The
 // query/user kinds are covered by the integration runDbSuite in helpers.ts.
-test('execTxDynamic reports a begin failure as kind tx', async () => {
-	mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
-	mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
-	mock.method(sql.Transaction.prototype, 'begin', () => Promise.reject(new Error('begin failed')))
-	mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+test('execTxDynamic reports a begin failure as kind tx', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', () => Promise.reject(new Error('begin failed')))
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
 
 	const adapter = new MssqlAdapter(conn)
 	const r = await adapter.execTxDynamic(async () => { throw new Error('body must not run') })
@@ -90,19 +90,67 @@ test('execTxDynamic reports a begin failure as kind tx', async () => {
 	if (!r.ok) assert.equal(r.error.kind, 'tx')
 })
 
-test('execTxDynamic reports a commit failure as kind tx', async () => {
-	mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
-	mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
-	mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+// review3 §2.1: buildMssqlQuery/mssqlInput throw synchronously on a missing/out/unknown
+// param, before the promise is built. exec() must not throw synchronously (so
+// exec(...).catch(...) works) and must classify the failure as 'query', not 'user' — the
+// same query through exec() would be 'query'.
+test('execTxDynamic turns a sync param throw from exec into a query error', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
 		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = { socket: { destroy() {} } }
 		return Promise.resolve()
 	})
-	mock.method(sql.Transaction.prototype, 'commit', () => Promise.reject(new Error('commit failed')))
-	mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+
+	const adapter = new MssqlAdapter(conn)
+	const r = await adapter.execTxDynamic(async (exec) => {
+		// ':missing' is not in params, so buildMssqlQuery throws synchronously.
+		await exec('SELECT :missing AS x', [])
+	})
+
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'query')
+})
+
+test('execTxDynamic reports a commit failure as kind tx', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = { socket: { destroy() {} } }
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.reject(new Error('commit failed')))
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
 
 	const adapter = new MssqlAdapter(conn)
 	const r = await adapter.execTxDynamic(async () => {})
 
 	assert.equal(r.ok, false)
 	if (!r.ok) assert.equal(r.error.kind, 'tx')
+})
+
+// review3 3.1: TDbTxResult carries rowsAffected so a transaction callback can see how
+// many rows its DML changed (mssql res.rowsAffected[0]).
+test('execTxDynamic exec returns rowsAffected for a DML statement', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = { socket: { destroy() {} } }
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+	t.mock.method(sql.Request.prototype, 'query', () => Promise.resolve({ recordset: [], rowsAffected: [5] }))
+
+	const adapter = new MssqlAdapter(conn)
+	let affected: number | undefined
+	const r = await adapter.execTxDynamic(async (exec) => {
+		const res = await exec('UPDATE t SET x = 1', [])
+		affected = res.rowsAffected
+	})
+
+	assert.equal(r.ok, true, r.ok ? '' : r.error.message)
+	assert.equal(affected, 5)
 })

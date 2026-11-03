@@ -11,10 +11,11 @@ const FIRST_DATA_TIMEOUT_MS = 12 * 60 * 60 * 1000
 const NEXT_ROW_TIMEOUT_MS   = 12 * 60 * 60 * 1000
 
 function humanMs(ms: number): string {
+	const round = (n: number): number => Math.round(n * 100) / 100
 	if (ms < 1000) return `${ms} ms`
-	if (ms < 60_000) return `${ms / 1000} s`
-	if (ms < 3_600_000) return `${ms / 60_000} min`
-	return `${ms / 3_600_000} h`
+	if (ms < 60_000) return `${round(ms / 1000)} s`
+	if (ms < 3_600_000) return `${round(ms / 60_000)} min`
+	return `${round(ms / 3_600_000)} h`
 }
 
 export class DbConnection {
@@ -32,7 +33,13 @@ export class DbConnection {
 	// constructor) so that importing the package itself never requires any driver.
 	private async _adapter(): Promise<IDbAdapter> {
 		if (!this._adapterPromise) {
-			this._adapterPromise = this._createAdapter(this._connection)
+			// A failed load (missing driver / unknown kind) must not be cached forever:
+			// clear the promise so the next call retries instead of replaying the same
+			// rejection against a driver that may have been installed in the meantime.
+			this._adapterPromise = this._createAdapter(this._connection).catch((err) => {
+				this._adapterPromise = undefined
+				throw err
+			})
 		}
 		return this._adapterPromise
 	}
@@ -94,15 +101,28 @@ export class DbConnection {
 	// asked to drop its connection, so a driver stuck in its own teardown cannot hold
 	// it either.
 	public async execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, options?: TExecOptions): Promise<void> {
-		const adapter = await this._adapter()
+		const firstTimeout = options?.firstDataTimeoutMs ?? FIRST_DATA_TIMEOUT_MS
+		const idleTimeout  = options?.idleTimeoutMs ?? NEXT_ROW_TIMEOUT_MS
+		// Validate the silence deadlines first, before any driver is loaded: a negative,
+		// NaN or infinite value would otherwise fire at once (or never) instead of failing
+		// as the programming error it is. 0 means "no deadline for this phase".
+		for (const [name, ms] of [['firstDataTimeoutMs', firstTimeout], ['idleTimeoutMs', idleTimeout]] as const) {
+			if (!Number.isFinite(ms) || ms < 0) throw new TypeError(`execStream: ${name} must be a non-negative finite number of milliseconds, got ${ms}`)
+		}
+		let adapter: IDbAdapter
+		try {
+			adapter = await this._adapter()
+		} catch (err) {
+			// The driver is missing (an optional peer dependency) or the kind is unknown:
+			// end with a finish instead of a bare rejection, matching exec()'s contract.
+			callback({ kind: 'finish', error: toDbError(err, 'connect') })
+			return
+		}
 		const abort = new AbortController()
 		let settled = false
 		let timer: ReturnType<typeof setTimeout> | undefined
 		let giveUp!: () => void
 		const gaveUp = new Promise<void>((resolve) => { giveUp = resolve })
-
-		const firstTimeout = options?.firstDataTimeoutMs ?? FIRST_DATA_TIMEOUT_MS
-		const idleTimeout  = options?.idleTimeoutMs ?? NEXT_ROW_TIMEOUT_MS
 
 		const timeoutError = (phase: 'first' | 'idle', ms: number): TDbError => ({
 			message: phase === 'first'
@@ -141,6 +161,13 @@ export class DbConnection {
 		let pendingError: TDbError | undefined
 		const arm = (ms: number, error: TDbError): void => {
 			pendingError = error
+			if (ms === 0) {
+				// 0 means "no deadline for this phase": disarm the timer entirely.
+				clearTimeout(timer)
+				timer = undefined
+				timerMs = ms
+				return
+			}
 			if (timer !== undefined && timerMs === ms) {
 				timer.refresh()
 			} else {
@@ -149,7 +176,12 @@ export class DbConnection {
 				timer = setTimeout(() => finishEarly(pendingError!), ms)
 			}
 		}
-		arm(firstTimeout, timeoutError('first', firstTimeout))
+		// Both the deadline and the error text stay fixed between rows, so build the
+		// two error objects once instead of allocating one per row (timeoutError()
+		// used to run on every idle re-arm); arm() only refreshes the timer.
+		const firstError = timeoutError('first', firstTimeout)
+		const idleError = timeoutError('idle', idleTimeout)
+		arm(firstTimeout, firstError)
 
 		// An external signal the caller owns: forward it to the internal controller, which
 		// is what the adapter listens to, and end the call as aborted.
@@ -169,7 +201,7 @@ export class DbConnection {
 				settled = true
 				clearTimeout(timer)
 			} else {
-				arm(idleTimeout, timeoutError('idle', idleTimeout))
+				arm(idleTimeout, idleError)
 			}
 			// The consumer's callback runs synchronously inside the driver's own event
 			// handlers (mssql request.on('row'), pg q.on('row'), ora stream.on('data'),
@@ -201,7 +233,12 @@ export class DbConnection {
 	}
 
 	public async version(options?: TExecOptions): Promise<TResult<string, TDbError>> {
-		const adapter = await this._adapter()
+		let adapter: IDbAdapter
+		try {
+			adapter = await this._adapter()
+		} catch (err) {
+			return { ok: false, error: toDbError(err, 'connect') }
+		}
 		const res = await this.exec(adapter.versionQuery(), [], options)
 		if (res.ok) {
 			const firstRow = res.result[0]?.rows[0]
@@ -209,8 +246,10 @@ export class DbConnection {
 			return { ok: false, error: { message: 'no version returned', kind: 'query' } }
 		}
 		// Some servers hide the primary version source from unprivileged users (Oracle's
-		// v$version needs SELECT_CATALOG_ROLE). Fall back to a query anyone can run.
-		if (adapter.versionFallbackQuery) {
+		// v$version needs SELECT_CATALOG_ROLE). Fall back to a query anyone can run - but
+		// only when the primary failed as a query: a timeout, abort or connect failure
+		// would just repeat the same failure against the fallback and wait it out again.
+		if (res.error.kind === 'query' && adapter.versionFallbackQuery) {
 			const fb = await this.exec(adapter.versionFallbackQuery(), [], options)
 			if (fb.ok) {
 				const firstRow = fb.result[0]?.rows[0]
@@ -237,7 +276,12 @@ export class DbConnection {
 	// bare timeout is the old call shape, and a signal alone is now expressible via
 	// { signal }.
 	public async execTxDynamic(cb: TDbTxCb, options?: number | TTxOptions): Promise<TResult<void, TDbError>> {
-		const adapter = await this._adapter()
+		let adapter: IDbAdapter
+		try {
+			adapter = await this._adapter()
+		} catch (err) {
+			return { ok: false, error: toDbError(err, 'connect') }
+		}
 		const timeoutMs = typeof options === 'number' ? options : options?.timeoutMs
 		const signal = typeof options === 'number' ? undefined : options?.signal
 		return adapter.execTxDynamic(cb, timeoutMs, signal)
@@ -253,7 +297,12 @@ export class DbConnection {
 	}
 
 	public async ping(options?: TExecOptions): Promise<TResult<null, TDbError>> {
-		const adapter = await this._adapter()
+		let adapter: IDbAdapter
+		try {
+			adapter = await this._adapter()
+		} catch (err) {
+			return { ok: false, error: toDbError(err, 'connect') }
+		}
 		const res = await this.exec(adapter.pingQuery(), [], options)
 		if (!res.ok) return { ok: false, error: res.error }
 		return { ok: true, result: null }

@@ -5,23 +5,38 @@
 // exactly as it is in MSSQL, Oracle, Firebird and in pg's standard (non-E) strings -
 // so 'C:\' is a complete string and \' does not swallow what follows. Only pg's E''
 // strings treat a backslash as an escape, and those are recognized separately in
-// SQL_ATOM_PG. [...] covers MSSQL's bracket-quoted identifiers, and $tag$...$tag$
-// covers pg's dollar-quoted strings (DO blocks, function bodies) - the tag may be empty
-// ($$...$$) and is back-referenced so the closer must match the opener.
+// SQL_ATOM_PG. $tag$...$tag$ covers pg's dollar-quoted strings (DO blocks, function
+// bodies) - the tag may be empty ($$...$$) and is back-referenced so the closer must
+// match the opener.
+//
+// MSSQL's bracket-quoted identifiers ([...]) are deliberately NOT part of this atom:
+// only MSSQL quotes identifiers with brackets, and pg needs the brackets to stay code so
+// that ARRAY[:a, :b] and arr[:i] substitute their placeholders. The bracket form lives in
+// SQL_ATOM_MSSQL, which the mssql adapter passes explicitly.
 export const SQL_ATOM =
-	/'(?:[^']|'')*'|"(?:[^"]|"")*"|\[[^\]]*\]|\$([A-Za-z_]\w*)?\$[\s\S]*?\$\1\$|--[^\n]*|\/\*[\s\S]*?\*\//
+	/'(?:[^']|'')*'|"(?:[^"]|"")*"|\$(?<tag>[A-Za-z_]\w*)?\$[\s\S]*?\$\k<tag>\$|--[^\n]*|\/\*[\s\S]*?\*\//
+
+// SQL_ATOM plus MSSQL's bracket-quoted identifiers, so [a:b] stays a single identifier
+// rather than being split into [a and @b].
+export const SQL_ATOM_MSSQL = new RegExp(`\\[[^\\]]*\\]|${SQL_ATOM.source}`)
 
 // SQL_ATOM plus pg's escape strings (E'' or e''), the one place where a backslash does
 // escape the next character: E'C:\' holds a single backslash, not the end of the string.
-const PG_ESCAPE_STRING = /[Ee]'(?:[^'\\]|\\.|'')*'/
+// The leading E/e must stand alone - a typed literal like date'...' or time'...' ends in
+// 'e' too, so without the lookbehind its leading token would be mistaken for an E-string.
+const PG_ESCAPE_STRING = /(?<![\w$])[Ee]'(?:[^'\\]|\\.|'')*'/
 export const SQL_ATOM_PG = new RegExp(`${PG_ESCAPE_STRING.source}|${SQL_ATOM.source}`)
 
-// Oracle's alternative quoting: q'[text]', q'{text}', q'(text)', q'<text>', or q'XtextX'
-// for any other single-byte delimiter X (the closer is the matching bracket, or X again).
-// The whole thing is one string literal - an apostrophe inside it does not end it, and a
-// :name inside it is plain text, not a placeholder. The bracket forms are listed first so
-// a delimiter like [ never falls through to the generic (.)-with-backreference branch.
-const ORA_Q_QUOTE = /q'(?:\[[^\]]*\]|\{[^}]*\}|\([^)]*\)|<[^>]*>|(.)[\s\S]*?\1)'/
+// Oracle's alternative quoting: q'[text]' for any bracket, or q'XtextX' for any other
+// single-byte delimiter X (the closer is the matching bracket, or X again). The whole
+// thing is one string literal - an apostrophe inside it does not end it, and a :name
+// inside it is plain text, not a placeholder. The leading q/Q is matched without regard
+// to case (Oracle accepts q', Q', nq', NQ', ... - an optional leading n/N marks a
+// national-character literal). The bracket forms are listed first so a delimiter like [
+// never falls through to the generic named-group-with-backreference branch, and the
+// delimiter itself is a named group (?<q>.) so its backreference \k<q> cannot be knocked
+// loose by groups added to the atom this one is spliced into (SQL_ATOM_ORA).
+const ORA_Q_QUOTE = /[nN]?[qQ]'(?:\[[^\]]*\]|\{[^}]*\}|\([^)]*\)|<[^>]*>|(?<q>.)[\s\S]*?\k<q>)'/
 export const SQL_ATOM_ORA = new RegExp(`${ORA_Q_QUOTE.source}|${SQL_ATOM.source}`)
 
 // Calls fn for every :name placeholder that is real code - not inside a string literal, a

@@ -1,4 +1,4 @@
-import { test, mock } from 'node:test'
+import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import oracledb from 'oracledb'
 import { OraAdapter } from '../src/db/adapters/ora'
@@ -24,12 +24,12 @@ const fakeConn = {
 	break: async () => {},
 }
 
-test('concurrent queries share one pool (createPool is called once)', async () => {
+test('concurrent queries share one pool (createPool is called once)', async (t) => {
 	let release!: () => void
 	const gate = new Promise<unknown>((resolve) => { release = () => resolve(undefined) })
 	let createPoolCalls = 0
 	const fakePool = { getConnection: async () => fakeConn, close: async () => {} }
-	mock.method(oracledb, 'createPool', () => {
+	t.mock.method(oracledb, 'createPool', () => {
 		createPoolCalls += 1
 		return gate.then(() => fakePool)
 	})
@@ -43,12 +43,12 @@ test('concurrent queries share one pool (createPool is called once)', async () =
 	assert.equal(createPoolCalls, 1)
 })
 
-test('close() during pool creation closes the eventual pool', async () => {
+test('close() during pool creation closes the eventual pool', async (t) => {
 	let release!: () => void
 	const gate = new Promise<unknown>((resolve) => { release = () => resolve(undefined) })
 	let closed = 0
 	const fakePool = { getConnection: async () => fakeConn, close: async () => { closed += 1 } }
-	mock.method(oracledb, 'createPool', () => gate.then(() => fakePool))
+	t.mock.method(oracledb, 'createPool', () => gate.then(() => fakePool))
 
 	const adapter = new OraAdapter(conn)
 	const p = adapter.execStream('UPDATE t SET x = 1', [], () => {})

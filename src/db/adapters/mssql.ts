@@ -2,18 +2,20 @@ import sql from 'mssql'
 import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
 import type { TConnMssql } from '../connection'
 import type { TResult } from '../../tresult'
-import { mapPlaceholders } from '../placeholders'
+import { mapPlaceholders, SQL_ATOM_MSSQL } from '../placeholders'
 import { toDbError, isDbError, withTxTimeout } from '../helpers'
 
 // Converts :name placeholders to @name for mssql named parameters. A colon inside a
-// string literal, a quoted identifier or a comment is left as it is. A placeholder that
-// has no matching param is rejected here - otherwise mssql would send an undeclared
-// @name and the error would surface only as a server-side "must declare the variable".
+// string literal, a quoted identifier or a comment is left as it is, and a bracket-quoted
+// identifier ([a:b]) is one identifier - SQL_ATOM_MSSQL keeps the brackets an atom. A
+// placeholder that has no matching param is rejected here - otherwise mssql would send an
+// undeclared @name and the error would surface only as a server-side "must declare the
+// variable".
 function buildMssqlQuery(query: string, params: TDbParam[]): string {
 	return mapPlaceholders(query, (name) => {
 		if (!params.some((p) => p.name === name)) throw new Error(`mssql: param not found: ${name}`)
 		return `@${name}`
-	})
+	}, undefined, SQL_ATOM_MSSQL)
 }
 
 // A forced parameter type (TDbParam.type) maps a driver-native type name ('DateTime2',
@@ -27,10 +29,19 @@ export function mssqlType(name: string): any {
 	return t
 }
 
-export function mssqlInput(request: sql.Request, p: TDbParam): void {
+// Validates a param without needing a request, so execStream can reject bad params
+// (out/inout bind, unknown type) before connecting - otherwise the throw inside the
+// request executor would leave the abort listener dangling on a request that was never
+// sent.
+function assertMssqlParam(p: TDbParam): void {
 	// Only Oracle supports out/inout binds; reject them here rather than silently
 	// binding an undefined value and inserting NULL.
 	if (p.direction !== undefined && p.direction !== 'in') throw new Error(`mssql: ${p.direction} parameters are not supported`)
+	if (p.type !== undefined) mssqlType(p.type)
+}
+
+export function mssqlInput(request: sql.Request, p: TDbParam): void {
+	assertMssqlParam(p)
 	if (p.type === undefined) request.input(p.name, p.value)
 	else request.input(p.name, mssqlType(p.type), p.value)
 }
@@ -90,16 +101,18 @@ export class MssqlAdapter implements IDbAdapter {
 		}
 	}
 
-	kind(): 'mssql' { return 'mssql' }
-	title(): string { return `${this.p.server}:${this.p.port ?? 1433} [${this.p.database ?? 'default'}]` }
-	user(): string {
-		if (this.p.auth.kind === 'ntlm') return `${this.p.auth.domain}\\${this.p.auth.user}`
-		return this.p.auth.user
-	}
 	versionQuery(): string { return 'SELECT @@VERSION AS ver' }
 	pingQuery(): string { return 'SELECT 1 AS p' }
 
 	async execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void> {
+		// Validate params and rewrite the query before connecting: buildMssqlQuery and
+		// mssqlInput throw on a missing/out/inout/unknown-type param. Doing it here means
+		// the failure never holds a pool slot, and no abort listener is left dangling on a
+		// request that was never sent. A throw here rejects the call, which DbConnection
+		// turns into a finish event.
+		const q = buildMssqlQuery(query, params)
+		for (const p of params) assertMssqlParam(p)
+
 		let pool: sql.ConnectionPool
 		try {
 			pool = await this.pool()
@@ -117,9 +130,6 @@ export class MssqlAdapter implements IDbAdapter {
 			}
 
 			let done = false
-			// Whether the current statement produced a recordset. DML has none, and
-			// then rowsAffected from `done` is the only thing worth reporting.
-			let sawRecordset = false
 
 			const onAbort = (): void => {
 				if (done) return
@@ -146,11 +156,24 @@ export class MssqlAdapter implements IDbAdapter {
 			}
 			signal?.addEventListener('abort', onAbort)
 
+			// mssql's `done.rowsAffected` has one entry per statement, but it does not say
+			// which entries are DML: a SELECT entry is the number of rows it returned, so it
+			// is numerically indistinguishable from an affected count. The reliable signal is
+			// that a SELECT also emits `recordset` + `row` events while DML emits neither.
+			// Track the row count of each SELECT so `done` can tell a SELECT entry (already
+			// emitted as schema+rows) from a DML entry (emit it as an empty-schema result).
+			let sawRecordset = false
+			let currentRows = 0
+			const rowCounts: number[] = []
+
 			request.on('recordset', (columns: Record<string, unknown>) => {
+				if (sawRecordset) rowCounts.push(currentRows)
 				sawRecordset = true
+				currentRows = 0
 				if (!done) callback({ kind: 'schema', schema: toSchema(columns) })
 			})
 			request.on('row', (row: object) => {
+				currentRows += 1
 				if (!done) callback({ kind: 'row', row: row as Record<string, unknown> })
 			})
 			request.on('error', (err: Error) => {
@@ -160,20 +183,26 @@ export class MssqlAdapter implements IDbAdapter {
 			})
 			request.on('done', (result: { rowsAffected?: number[] }) => {
 				if (done) return
-				// A statement with no recordset is DML: give it an empty schema and the
-				// number of rows it changed, so `exec` returns one result per statement
-				// instead of dropping DML statements silently. The streaming driver
-				// emits 'done' with an object { output, rowsAffected }, not a bare number
-				// (rowsAffected is one entry per statement in the batch).
-				if (!sawRecordset) {
-					callback({ kind: 'schema', schema: [] })
-					const affected = result?.rowsAffected?.[0]
-					if (typeof affected === 'number') callback({ kind: 'rowsAffected', count: affected })
+				if (sawRecordset) rowCounts.push(currentRows)
+				// Match each SELECT's returned-row count against the entries; whatever is
+				// left is a DML statement and becomes its own result. An all-DML batch has no
+				// row counts, so every entry is reported - the old code read only [0] and
+				// dropped every statement after the first.
+				const remaining = [...rowCounts]
+				for (const count of result?.rowsAffected ?? []) {
+					if (typeof count !== 'number') continue
+					const i = remaining.indexOf(count)
+					if (i >= 0) {
+						remaining.splice(i, 1) // SELECT: schema+rows already emitted above
+					} else {
+						callback({ kind: 'schema', schema: [] })
+						callback({ kind: 'rowsAffected', count })
+					}
 				}
 				settle()
 			})
 
-			request.query(buildMssqlQuery(query, params))
+			request.query(q)
 		})
 	}
 
@@ -215,12 +244,25 @@ export class MssqlAdapter implements IDbAdapter {
 				tx = new sql.Transaction(pool)
 				await tx.begin()
 				const transaction = tx
-				const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
+				const exec = async (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
 					const req = new sql.Request(transaction)
-					const q = buildMssqlQuery(query, params)
-					for (const p of params) mssqlInput(req, p)
+					let q: string
+					try {
+						q = buildMssqlQuery(query, params)
+						for (const p of params) mssqlInput(req, p)
+					} catch (err) {
+						// buildMssqlQuery/mssqlInput throw synchronously on a missing/out/
+						// unknown-type param; the async wrapper turns it into a rejection so
+						// exec(...).catch(...) sees it, and tagging it 'query' keeps it from
+						// being misreported as kind 'user' (which the same query via exec()
+						// would never be).
+						throw toDbError(err, 'query')
+					}
 					return req.query(q).then(
-						(res) => ({ rows: (res.recordset ?? []) as Record<string, unknown>[] }),
+						(res) => ({
+							rows:         (res.recordset ?? []) as Record<string, unknown>[],
+							rowsAffected: res.rowsAffected?.[0],
+						}),
 						// Tag the failure as a DB query error so it stays 'query' even when
 						// it bubbles through the user's callback (which may re-throw it).
 						(err) => { throw toDbError(err, 'query') },

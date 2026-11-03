@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import sql from 'mssql'
 import { DbConnection } from '../src/index'
 import { toSchema, mssqlType, mssqlInput, MssqlAdapter } from '../src/db/adapters/mssql'
@@ -111,4 +112,95 @@ test('mssql: pool() keeps one ConnectionPool and reconnects after a failed conne
 	} finally {
 		;(sql as any).ConnectionPool = orig
 	}
+})
+
+// review3 §2.5: rowsAffected is one entry per statement. The old code read only [0] and
+// only when no recordset had been seen, so INSERT; UPDATE reported a single count and
+// SELECT; UPDATE dropped the DML count entirely. Each DML statement must be its own result.
+test('mssql: a multi-statement DML batch reports one result per statement', async () => {
+	class FakeRequest extends EventEmitter {
+		stream = false
+		input(): void {}
+		query(): void {
+			setImmediate(() => this.emit('done', { rowsAffected: [5, 7] }))
+		}
+	}
+	const req = new FakeRequest()
+	const pool = { request: () => req }
+	const adapter = new MssqlAdapter({ kind: 'mssql', server: 'x', auth: { kind: 'mssql', user: 'u', password: 'p' } })
+	;(adapter as unknown as { _pool: unknown })._pool = { connect: async () => pool }
+	const events: { kind: string; count?: number }[] = []
+	await adapter.execStream('INSERT INTO a VALUES (1); UPDATE b SET x = 2', [], (e) => events.push(e))
+	const affected = events.filter((e) => e.kind === 'rowsAffected').map((e) => e.count)
+	assert.deepEqual(affected, [5, 7])
+	assert.equal(events.filter((e) => e.kind === 'schema').length, 2)
+})
+
+// review3 §2.5 (mixed batch): a SELECT entry in rowsAffected is its returned-row count
+// (number), not undefined; the row events already emitted it, so only the trailing UPDATE
+// count becomes a separate DML result.
+test('mssql: a mixed SELECT; UPDATE batch keeps the DML result', async () => {
+	class FakeRequest extends EventEmitter {
+		stream = false
+		input(): void {}
+		query(): void {
+			setImmediate(() => {
+				this.emit('recordset', { v: { name: 'v', type: sql.Int, length: 4, scale: undefined, precision: 10 } })
+				this.emit('row', { v: 1 })
+				this.emit('done', { rowsAffected: [1, 3] })
+			})
+		}
+	}
+	const req = new FakeRequest()
+	const pool = { request: () => req }
+	const adapter = new MssqlAdapter({ kind: 'mssql', server: 'x', auth: { kind: 'mssql', user: 'u', password: 'p' } })
+	;(adapter as unknown as { _pool: unknown })._pool = { connect: async () => pool }
+	const events: { kind: string; count?: number }[] = []
+	await adapter.execStream('SELECT v FROM t; UPDATE b SET x = 2', [], (e) => events.push(e))
+	const affected = events.filter((e) => e.kind === 'rowsAffected').map((e) => e.count)
+	assert.deepEqual(affected, [3])
+})
+
+// review3 §2.5: a lone SELECT must not emit a spurious empty-schema DML result - its
+// rowsAffected entry is the returned-row count and the rows already went out as 'row'.
+test('mssql: a lone SELECT emits no DML result', async () => {
+	class FakeRequest extends EventEmitter {
+		stream = false
+		input(): void {}
+		query(): void {
+			setImmediate(() => {
+				this.emit('recordset', { v: { name: 'v', type: sql.Int, length: 4, scale: undefined, precision: 10 } })
+				this.emit('row', { v: 1 })
+				this.emit('done', { rowsAffected: [1] })
+			})
+		}
+	}
+	const req = new FakeRequest()
+	const pool = { request: () => req }
+	const adapter = new MssqlAdapter({ kind: 'mssql', server: 'x', auth: { kind: 'mssql', user: 'u', password: 'p' } })
+	;(adapter as unknown as { _pool: unknown })._pool = { connect: async () => pool }
+	const events: { kind: string; count?: number }[] = []
+	await adapter.execStream('SELECT v FROM t', [], (e) => events.push(e))
+	assert.deepEqual(events.map((e) => e.kind), ['schema', 'row', 'finish'])
+})
+
+// review3 §2.12: a bad param (missing, out, unknown type) must fail before connecting, so
+// it never holds a pool slot nor leaves an abort listener dangling on an unsent request.
+test('mssql: param not found fails before connecting', async () => {
+	let connected = 0
+	const adapter = new MssqlAdapter({ kind: 'mssql', server: 'x', auth: { kind: 'mssql', user: 'u', password: 'p' } })
+	;(adapter as unknown as { _pool: unknown })._pool = { connect: async () => { connected += 1; throw new Error('unreachable') } }
+	await assert.rejects(adapter.execStream('SELECT :missing AS x', [], () => {}), /param not found: missing/)
+	assert.equal(connected, 0)
+})
+
+test('mssql: an out param fails before connecting', async () => {
+	let connected = 0
+	const adapter = new MssqlAdapter({ kind: 'mssql', server: 'x', auth: { kind: 'mssql', user: 'u', password: 'p' } })
+	;(adapter as unknown as { _pool: unknown })._pool = { connect: async () => { connected += 1; throw new Error('unreachable') } }
+	await assert.rejects(
+		adapter.execStream('SELECT 1 AS x', [{ name: 'x', value: 1, type: 'Int', direction: 'out' }], () => {}),
+		/mssql: out parameters are not supported/,
+	)
+	assert.equal(connected, 0)
 })
