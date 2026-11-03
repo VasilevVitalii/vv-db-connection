@@ -2,7 +2,7 @@ import oracledb from 'oracledb'
 import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
 import type { TConnOra } from '../connection'
 import type { TResult } from '../../tresult'
-import { mapPlaceholders } from '../placeholders'
+import { mapPlaceholders, SQL_ATOM_ORA } from '../placeholders'
 import { toDbError, isDbError, withTxTimeout } from '../helpers'
 
 type OraMetadata = { name: string; dbTypeName: string; byteSize?: number; scale?: number; precision?: number }
@@ -57,7 +57,14 @@ function toSchema(meta: OraMetadata[]): TDbCol[] {
 // instead of a clear client-side "param not found" like pg and fb give.
 function buildQuery(query: string, params: TDbParam[]): { sql: string; binds: Record<string, OraBindValue> } {
 	const used = new Set<string>()
-	const sql = mapPlaceholders(query, (name) => { used.add(name); return `:${name}` })
+	// SQL_ATOM_ORA additionally treats q'[...]' alternative quoting as one string, so a
+	// :name inside it is plain text. :new and :old are trigger correlation names
+	// (CREATE TRIGGER ... FOR EACH ROW), never bind parameters - leave them for the server.
+	const sql = mapPlaceholders(query, (name) => {
+		if (name === 'new' || name === 'old') return `:${name}`
+		used.add(name)
+		return `:${name}`
+	}, undefined, SQL_ATOM_ORA)
 	for (const name of used) {
 		if (!params.some((p) => p.name === name)) throw new Error(`ora: param not found: ${name}`)
 	}
@@ -125,7 +132,15 @@ export class OraAdapter implements IDbAdapter {
 	private _pool?: Promise<oracledb.Pool>
 	private pool(): Promise<oracledb.Pool> {
 		if (!this._pool) {
-			this._pool = oracledb.createPool({ ...this._connParams(), poolMin: 0, poolMax: 4, poolIncrement: 1 })
+			this._pool = (async () => {
+				// Privileged connections (SYSDBA & co) are only supported by the pool in
+				// Thin mode; a Thick-mode pool silently drops the privilege. Fail loudly
+				// instead of handing back a connection that is not actually privileged.
+				if (this.p.privilege && !oracledb.thin) {
+					throw new Error('ora: privileged connections need Thin mode; a Thick-mode pool cannot be privileged')
+				}
+				return oracledb.createPool({ ...this._connParams(), poolMin: 0, poolMax: 4, poolIncrement: 1 })
+			})()
 		}
 		return this._pool
 	}

@@ -96,3 +96,25 @@ test('ora: an INOUT parameter keeps its input and returns the updated value', { 
 		await db.close()
 	}
 })
+
+// review2 §4 (group C): :new/:old are trigger correlation names, not bind placeholders.
+// A CREATE TRIGGER using them must run without a "param not found: new" error, and the
+// trigger must actually fire.
+test('ora: CREATE TRIGGER with :new/:old correlation names runs', { skip }, async () => {
+	const db = new DbConnection(conn!)
+	try {
+		const created = await db.exec('CREATE TABLE vv_ra_trg (id NUMBER, name VARCHAR2(20))', [])
+		assert.equal(created.ok, true, created.ok ? '' : created.error.message)
+		const trig = await db.exec('CREATE OR REPLACE TRIGGER vv_ra_trg BEFORE INSERT ON vv_ra_trg FOR EACH ROW BEGIN :new.name := UPPER(:new.name); END;', [])
+		assert.equal(trig.ok, true, trig.ok ? '' : trig.error.message)
+		const ins = await db.exec('INSERT INTO vv_ra_trg (id, name) VALUES (1, :name)', [{ name: 'name', value: 'lower' }])
+		assert.equal(ins.ok, true, ins.ok ? '' : ins.error.message)
+		const sel = await db.exec('SELECT name FROM vv_ra_trg WHERE id = 1', [])
+		assert.equal(sel.ok, true, sel.ok ? '' : sel.error.message)
+		if (sel.ok) assert.equal(Object.values(sel.result[0]!.rows[0] as Record<string, unknown>)[0], 'LOWER')
+	} finally {
+		await db.exec('DROP TABLE vv_ra_trg', [])
+		await db.exec('DROP TRIGGER vv_ra_trg', [])
+		await db.close()
+	}
+})

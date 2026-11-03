@@ -51,15 +51,15 @@ The connection is opened lazily — `new DbConnection(...)` only holds the confi
 | `mssql` | `TConnMssql` | `server`, `port?`, `database?`, `auth`, `trustServerCertificate?`, `encrypt?`, `ca?`, `connectTimeout?` |
 | `pg`    | `TConnPg`    | `host`, `port?`, `database`, `user`, `password`, `ssl?: boolean \| { ca?, trustServerCertificate? }`, `connectTimeout?` |
 | `ora`   | `TConnOra`   | `host`, `port?`, `service`, `user`, `password`, `privilege?`, `connectTimeout?` |
-| `fb`    | `TConnFb`    | `host`, `port?`, `database`, `user`, `password`, `charset?`, `numericMode?`  |
+| `fb`    | `TConnFb`    | `host`, `port?`, `database`, `user`, `password`, `charset?`, `numericMode?`, `connectTimeout?`  |
 
 MSSQL `auth` is a union: `{ kind: 'mssql', user, password }` or `{ kind: 'ntlm', domain, user, password }`.
 
-Oracle `privilege` is one of `SYSDBA | SYSOPER | SYSASM | SYSBACKUP | SYSDG | SYSKM | SYSRAC`; the connection string is assembled internally as `host:port/service`.
+Oracle `privilege` is one of `SYSDBA | SYSOPER | SYSASM | SYSBACKUP | SYSDG | SYSKM | SYSRAC`; the connection string is assembled internally as `host:port/service`. Privileged connections are only supported by the pool in **Thin mode** (the default — no Oracle Client installed). In Thick mode (after `oracledb.initOracleClient()`) a pool cannot be privileged, so the adapter fails loudly instead of handing back a connection that is not actually privileged.
 
 Firebird `charset` is `'UTF8'` (default) or `'WIN1251'`; `numericMode` is `'lossy'` (default) | `'safe'` | `'string'` and controls how `BIGINT`/`INT128` and fixed-point `NUMERIC`/`DECIMAL` results are decoded (see Data types).
 
-`connectTimeout` (mssql/pg/ora, milliseconds) bounds how long establishing a connection may take; without it a driver can hang for minutes against an unreachable host. Firebird has no such option in the driver.
+`connectTimeout` (mssql/pg/ora/fb, milliseconds) bounds how long establishing a connection may take; without it a driver can hang for minutes against an unreachable host. Firebird's is implemented by the adapter — node-firebird itself has no attach timeout, so the adapter rips the socket of a stuck TCP connect / handshake after the deadline.
 
 TLS defaults are deliberately permissive for backward compatibility: MSSQL connects without encryption (`encrypt` defaults to `false`), and PostgreSQL `ssl: true` skips certificate verification. To verify it, pass `ssl: { trustServerCertificate: false, ca: '...' }` for PostgreSQL, or `encrypt: true` plus `ca` for MSSQL. `trustServerCertificate: true` means «accept the server certificate without verifying it» — the same flag both adapters use.
 

@@ -55,6 +55,10 @@ export type TConnFb = {
 	// 2^53; 'safe' returns a number when exact and a string otherwise; 'string'
 	// always returns an exact scaled string. JS bigint inputs are sent as INT128.
 	numericMode?: 'lossy' | 'safe' | 'string'
+	// ms; rips the socket of a TCP connect / handshake / attach that is still stuck.
+	// node-firebird has no attach timeout of its own, so a firewalled host (SYN dropped
+	// rather than refused) would otherwise hang the attach for the OS's TCP timeout.
+	connectTimeout?: number
 }
 
 // The discriminated union over all supported connections; its "kind" is the single

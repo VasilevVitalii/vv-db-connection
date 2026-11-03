@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module'
 import * as Firebird from 'node-firebird'
 import Connection from 'node-firebird/lib/wire/connection'
 import Const from 'node-firebird/lib/wire/const'
@@ -51,6 +52,11 @@ if (!fbAttachProto.attach.__vvPatched) {
 	patched.__vvPatched = true
 	fbAttachProto.attach = patched
 }
+
+// node-firebird assigns the in-flight Connection to `exports.connection` inside
+// attach(); an `import * as` namespace is a snapshot of the CJS exports and does
+// not see that late assignment, so reach it through a live require instead.
+const fbLive = createRequire(import.meta.url)('node-firebird') as { connection?: FbConnInternal }
 
 
 // Firebird reports each column's type as a numeric SQL code; map it back to the
@@ -185,6 +191,45 @@ export class FbAdapter implements IDbAdapter {
 		}
 	}
 
+	// Attaches with an optional timeout. node-firebird keeps the in-flight connection on
+	// Firebird.connection (its exports.connection) and ripping that socket is the only way
+	// to abort a TCP connect / handshake that is still stuck; without it a firewalled host
+	// (SYN dropped rather than refused) hangs the attach for the OS's TCP timeout. The
+	// global handle means two concurrent attaches would race on the same socket - the
+	// adapter issues one attach per call, so this is acceptable.
+	private attach(options: Firebird.Options, timeoutMs?: number): Promise<Firebird.Database> {
+		return new Promise((resolve, reject) => {
+			let settled = false
+			let timer: ReturnType<typeof setTimeout> | undefined
+			const done = <T>(fn: (v: T) => void) => (v: T): void => {
+				if (settled) return
+				settled = true
+				if (timer) clearTimeout(timer)
+				fn(v)
+			}
+			if (timeoutMs) {
+				timer = setTimeout(() => {
+					done(reject)(new Error(`fb: connect timeout after ${timeoutMs}ms`))
+					// Tear the in-flight Connection down the same way a failed attach
+					// does (_isDetach skips the driver's self-reconnect; the socket is not
+					// yet opened while a TCP connect is stuck, so 'close' exits cleanly).
+					const conn = fbLive.connection
+					if (conn) {
+						try {
+							conn._isDetach = true
+							clearTimeout(conn._retry_connection_id)
+							conn._socket?.destroy?.()
+						} catch { /* best effort */ }
+					}
+				}, timeoutMs)
+			}
+			Firebird.attach(options, (err, db) => {
+				if (err) done(reject)(err)
+				else done(resolve)(db)
+			})
+		})
+	}
+
 	async execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void> {
 		let sql: string
 		let values: unknown[]
@@ -214,24 +259,26 @@ export class FbAdapter implements IDbAdapter {
 			if (signal?.aborted) { finish({ message: String(signal.reason ?? 'aborted'), kind: 'aborted' }); return }
 			signal?.addEventListener('abort', onAbort)
 
-			Firebird.attach(options, (attachErr, attached) => {
-				if (attachErr) { finish(toDbError(attachErr, 'connect')); return }
-				// Given up while the attach was on its way - nobody is waiting for this one.
-				if (done) { dropConnection(attached); return }
-				db = attached
-				watchConnection(db, (error) => {
-					dropConnection(attached)
-					finish(error)
-				})
-				// One prepared statement serves the schema, the streamed rows and the
-				// affected-row count. The high-level sequentially() re-prepares the
-				// statement internally, so this drives the low-level Transaction/Statement
-				// API directly (see sql-driver-adapters / node-firebird-internals).
-				void this._execStream(attached, sql, values, callback).then(
-					() => { dropConnection(attached); finish() },
-					(err) => { dropConnection(attached); finish(err) },
-				)
-			})
+			this.attach(options, this.p.connectTimeout).then(
+				(attached) => {
+					// Given up while the attach was on its way - nobody is waiting for this one.
+					if (done) { dropConnection(attached); return }
+					db = attached
+					watchConnection(db, (error) => {
+						dropConnection(attached)
+						finish(error)
+					})
+					// One prepared statement serves the schema, the streamed rows and the
+					// affected-row count. The high-level sequentially() re-prepares the
+					// statement internally, so this drives the low-level Transaction/Statement
+					// API directly (see sql-driver-adapters / node-firebird-internals).
+					void this._execStream(attached, sql, values, callback).then(
+						() => { dropConnection(attached); finish() },
+						(err) => { dropConnection(attached); finish(err) },
+					)
+				},
+				(attachErr) => finish(toDbError(attachErr, 'connect')),
+			)
 		})
 	}
 
@@ -310,9 +357,7 @@ export class FbAdapter implements IDbAdapter {
 		return withTxTimeout(timeoutMs, async (signal) => {
 			let db: Firebird.Database
 			try {
-				db = await new Promise<Firebird.Database>((resolve, reject) => {
-					Firebird.attach(options, (err, d) => { if (err) reject(err); else resolve(d) })
-				})
+				db = await this.attach(options, this.p.connectTimeout)
 			} catch (err) {
 				return { ok: false, error: toDbError(err, 'connect') }
 			}

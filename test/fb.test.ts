@@ -67,3 +67,19 @@ test('fb: bigint round-trips exactly with numericMode string', { skip }, async (
 		await db.close()
 	}
 })
+
+// review2 §4 (group C): node-firebird has no attach timeout, so a firewalled host (SYN
+// dropped rather than refused) used to hang the attach for the OS's TCP timeout. With
+// connectTimeout the socket is ripped and the call fails as kind 'connect' promptly.
+// 192.0.2.1 (TEST-NET-1) never answers: either the SYN is dropped and the timeout fires,
+// or the route is unreachable and the connect fails fast - both must end quickly.
+test('fb: a stuck attach to an unreachable host is cut off by connectTimeout', async () => {
+	const t0 = Date.now()
+	const db = new DbConnection({ kind: 'fb', host: '192.0.2.1', port: 3050, database: '/tmp/x.fdb', user: 'u', password: 'p', connectTimeout: 500 } as TConnFb)
+	const r = await db.exec('SELECT 1 FROM rdb$database', [])
+	const elapsed = Date.now() - t0
+	await db.close()
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'connect')
+	assert.ok(elapsed < 10000, `attach should be cut off, took ${elapsed}ms`)
+})

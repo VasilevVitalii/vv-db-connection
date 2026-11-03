@@ -16,6 +16,14 @@ export const SQL_ATOM =
 const PG_ESCAPE_STRING = /[Ee]'(?:[^'\\]|\\.|'')*'/
 export const SQL_ATOM_PG = new RegExp(`${PG_ESCAPE_STRING.source}|${SQL_ATOM.source}`)
 
+// Oracle's alternative quoting: q'[text]', q'{text}', q'(text)', q'<text>', or q'XtextX'
+// for any other single-byte delimiter X (the closer is the matching bracket, or X again).
+// The whole thing is one string literal - an apostrophe inside it does not end it, and a
+// :name inside it is plain text, not a placeholder. The bracket forms are listed first so
+// a delimiter like [ never falls through to the generic (.)-with-backreference branch.
+const ORA_Q_QUOTE = /q'(?:\[[^\]]*\]|\{[^}]*\}|\([^)]*\)|<[^>]*>|(.)[\s\S]*?\1)'/
+export const SQL_ATOM_ORA = new RegExp(`${ORA_Q_QUOTE.source}|${SQL_ATOM.source}`)
+
 // Calls fn for every :name placeholder that is real code - not inside a string literal, a
 // quoted identifier or a comment - and replaces it with whatever fn returns. A colon that
 // follows another colon is a cast/scope operator (::), never a placeholder. A name starts

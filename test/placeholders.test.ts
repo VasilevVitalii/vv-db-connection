@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mapPlaceholders, SQL_ATOM_PG } from '../src/db/placeholders'
+import { mapPlaceholders, SQL_ATOM_PG, SQL_ATOM_ORA } from '../src/db/placeholders'
 
 const toAt = (name: string): string => `@${name}`
 
@@ -82,4 +82,18 @@ test('pg: a backslash is ordinary in a standard string, an escape only in an E s
 
 test('does not treat a backslash-quote as an escape in a quoted identifier', () => {
 	assert.equal(mapPlaceholders('SELECT "C:\\" AS p, :v', toAt), 'SELECT "C:\\" AS p, @v')
+})
+
+// review2 §4 (group C): Oracle alternative quoting q'[...]' is one string literal, so a
+// :name inside it is plain text, not a placeholder - for every delimiter form.
+test('leaves an Oracle q-quote string alone', () => {
+	assert.equal(mapPlaceholders("SELECT q'[it's a :name]' AS s", toAt, undefined, SQL_ATOM_ORA), "SELECT q'[it's a :name]' AS s")
+	assert.equal(mapPlaceholders("SELECT q'!it's a :name!' AS s", toAt, undefined, SQL_ATOM_ORA), "SELECT q'!it's a :name!' AS s")
+	assert.equal(mapPlaceholders("SELECT q'{has :x inside}' AS s", toAt, undefined, SQL_ATOM_ORA), "SELECT q'{has :x inside}' AS s")
+	assert.equal(mapPlaceholders("SELECT q'(a:b)' AS s", toAt, undefined, SQL_ATOM_ORA), "SELECT q'(a:b)' AS s")
+	assert.equal(mapPlaceholders("SELECT q'<a:b>' AS s", toAt, undefined, SQL_ATOM_ORA), "SELECT q'<a:b>' AS s")
+})
+
+test('replaces placeholders outside an Oracle q-quote', () => {
+	assert.equal(mapPlaceholders("SELECT q'[a :y]', :v FROM dual", toAt, undefined, SQL_ATOM_ORA), "SELECT q'[a :y]', @v FROM dual")
 })
