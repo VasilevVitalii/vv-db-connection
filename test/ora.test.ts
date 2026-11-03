@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import oracledb from 'oracledb'
 import { DbConnection } from '../src/index'
+import type { TDbTxResult } from '../src/index'
 import { OraAdapter, oraBind, buildQuery, isRowQuery } from '../src/db/adapters/ora'
 import type { TConnOra } from '../src/db/connection'
 import { loadConnections, reachable, runDbSuite, connHost, connPort } from './helpers'
@@ -242,4 +243,149 @@ test('ora: param not found fails before acquiring a connection', async (t) => {
 		m.mock.restore()
 	}
 	assert.equal(acquired, 0)
+})
+
+// review3 §2.8: a PL/SQL block with DBMS_SQL.RETURN_RESULT returns its result sets in
+// res.implicitResults; with resultSet:true each is a ResultSet carrying its own metadata.
+// The adapter must emit each as its own schema+rows and close every ResultSet (an open
+// ResultSet keeps its cursor alive and the connection never returns to the pool).
+test('ora: implicit results are emitted as their own result sets and closed', async (t) => {
+	let executeOpts: { resultSet?: boolean } = {}
+	let closed = 0
+	const fakeConn = {
+		break: () => Promise.resolve(),
+		close: () => Promise.resolve(),
+		queryStream: () => { throw new Error('not a row query') },
+		execute: async (_sql: string, _binds: unknown, opts: { resultSet?: boolean }) => {
+			executeOpts = opts
+			return {
+				rowsAffected: undefined,
+				implicitResults: [
+					{ metaData: [{ name: 'A', dbTypeName: 'NUMBER' }], getRows: async () => [{ A: 1 }], close: async () => { closed += 1 } },
+					{ metaData: [{ name: 'B', dbTypeName: 'VARCHAR2' }], getRows: async () => [{ B: 'x' }, { B: 'y' }], close: async () => { closed += 1 } },
+				],
+			}
+		},
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: '127.0.0.1', port: 1521, service: 'x', user: 'u', password: 'p' } as TConnOra)
+	const events: any[] = []
+	await adapter.execStream('BEGIN NULL; END;', [], (e) => events.push(e))
+
+	assert.equal(executeOpts.resultSet, true, 'resultSet:true is what carries each set\'s metadata')
+	const schemas = events.filter((e) => e.kind === 'schema')
+	const rows = events.filter((e) => e.kind === 'row')
+	assert.equal(schemas.length, 2)
+	assert.equal(schemas[0].schema[0].name, 'A')
+	assert.equal(schemas[1].schema[0].name, 'B')
+	assert.equal(rows.length, 3)
+	assert.deepEqual(rows[0].row, { A: 1 })
+	assert.deepEqual(rows[2].row, { B: 'y' })
+	assert.equal(events[events.length - 1].kind, 'finish')
+	assert.equal(closed, 2, 'every implicit ResultSet must be closed')
+})
+
+// review3 §2.8: live - a PL/SQL block that returns several implicit result sets must
+// surface each as its own result, with its own schema, instead of silently dropping them.
+test('ora: DBMS_SQL.RETURN_RESULT surfaces every implicit result set', { skip }, async (t) => {
+	const db = new DbConnection(conn!)
+	try {
+		const r = await db.exec(
+			"DECLARE c1 SYS_REFCURSOR; c2 SYS_REFCURSOR; BEGIN OPEN c1 FOR SELECT 1 AS a, 'x' AS b FROM dual; DBMS_SQL.RETURN_RESULT(c1); OPEN c2 FOR SELECT 2 AS c FROM dual; DBMS_SQL.RETURN_RESULT(c2); END;",
+			[],
+		)
+		assert.equal(r.ok, true, r.ok ? '' : r.error.message)
+		if (!r.ok) return
+		assert.equal(r.result.length, 2)
+		assert.equal(r.result[0]!.rows.length, 1)
+		assert.equal(r.result[1]!.rows.length, 1)
+		assert.deepEqual(Object.values(r.result[0]!.rows[0] as Record<string, unknown>), [1, 'x'])
+		assert.deepEqual(Object.values(r.result[1]!.rows[0] as Record<string, unknown>), [2])
+		assert.equal(r.result[0]!.schema.length, 2)
+		assert.equal(r.result[1]!.schema.length, 1)
+	} finally {
+		await db.close()
+	}
+})
+
+// review3 2.8 + TDbTxResult: the transaction exec surfaces Oracle implicit results as
+// TDbTxResult.implicitResults, and closes every ResultSet it reads.
+test('ora: execTxDynamic exec returns implicit results and closes ResultSets', async (t) => {
+	let closed = 0
+	const fakeConn = {
+		break: () => Promise.resolve(),
+		close: () => Promise.resolve(),
+		rollback: () => Promise.resolve(),
+		commit: () => Promise.resolve(),
+		execute: async () => ({
+			resultSet: undefined,
+			rowsAffected: undefined,
+			implicitResults: [
+				{ metaData: [{ name: 'A', dbTypeName: 'NUMBER' }], getRows: async () => [{ A: 7 }], close: async () => { closed += 1 } },
+			],
+		}),
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: 'h', port: 1521, service: 's', user: 'u', password: 'p' } as TConnOra)
+	let got: TDbTxResult | undefined
+	await adapter.execTxDynamic(async (exec) => {
+		got = await exec('BEGIN NULL; END;', [])
+	})
+
+	assert.ok(got)
+	assert.equal(got!.implicitResults!.length, 1)
+	assert.equal(got!.implicitResults![0]!.schema[0]!.name, 'A')
+	assert.deepEqual(got!.implicitResults![0]!.rows, [{ A: 7 }])
+	assert.equal(closed, 1, 'the implicit ResultSet must be closed')
+})
+
+// resultSet:true (needed for implicit results) moves a SELECT's rows onto res.resultSet;
+// the transaction exec must still return them in `rows` and close the ResultSet.
+test('ora: execTxDynamic exec reads a SELECT from res.resultSet', async (t) => {
+	let closed = 0
+	const fakeConn = {
+		break: () => Promise.resolve(),
+		close: () => Promise.resolve(),
+		rollback: () => Promise.resolve(),
+		commit: () => Promise.resolve(),
+		execute: async () => ({
+			resultSet: { metaData: [{ name: 'V', dbTypeName: 'VARCHAR2' }], getRows: async () => [{ V: 'world' }], close: async () => { closed += 1 } },
+			rowsAffected: undefined,
+			implicitResults: undefined,
+		}),
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: 'h', port: 1521, service: 's', user: 'u', password: 'p' } as TConnOra)
+	let got: TDbTxResult | undefined
+	await adapter.execTxDynamic(async (exec) => {
+		got = await exec('SELECT :v AS v FROM dual', [{ name: 'v', value: 'world' }])
+	})
+
+	assert.ok(got)
+	assert.deepEqual(got!.rows, [{ V: 'world' }])
+	assert.equal(got!.implicitResults, undefined)
+	assert.equal(closed, 1, 'the SELECT ResultSet must be closed')
+})
+
+// review3 2.8 + TDbTxResult: live - a PL/SQL block inside a transaction returns its
+// implicit result sets on TDbTxResult.implicitResults.
+test('ora: execTxDynamic surfaces PL/SQL implicit results', { skip }, async (t) => {
+	const db = new DbConnection(conn!)
+	try {
+		const r = await db.execTxDynamic(async (exec) => {
+			const res = await exec(
+				"DECLARE c1 SYS_REFCURSOR; c2 SYS_REFCURSOR; BEGIN OPEN c1 FOR SELECT 1 AS a, 'x' AS b FROM dual; DBMS_SQL.RETURN_RESULT(c1); OPEN c2 FOR SELECT 2 AS c FROM dual; DBMS_SQL.RETURN_RESULT(c2); END;",
+				[],
+			)
+			assert.equal(res.implicitResults!.length, 2)
+			assert.deepEqual(Object.values(res.implicitResults![0]!.rows[0] as Record<string, unknown>), [1, 'x'])
+			assert.deepEqual(Object.values(res.implicitResults![1]!.rows[0] as Record<string, unknown>), [2])
+		})
+		assert.equal(r.ok, true, r.ok ? '' : r.error.message)
+	} finally {
+		await db.close()
+	}
 })

@@ -74,7 +74,15 @@ export type TDbStreamEvent =
 	| { kind: 'outParams'; params: Record<string, unknown> }
 	| { kind: 'finish'; error?: TDbError }
 
-export type TDbTxResult = { rows: Record<string, unknown>[]; rowsAffected?: number; outParams?: Record<string, unknown> }
+export type TDbTxResult = {
+	rows: Record<string, unknown>[]
+	rowsAffected?: number
+	outParams?: Record<string, unknown>
+	// Oracle PL/SQL with DBMS_SQL.RETURN_RESULT returns extra result sets in
+	// res.implicitResults; each surfaces as its own schema+rows. The statement's main
+	// result stays in `rows`/`rowsAffected` (both empty/undefined for such a block).
+	implicitResults?: TDbRes[]
+}
 export type TDbTxExec   = (query: string, params: TDbParam[]) => Promise<TDbTxResult>
 export type TDbTxCb     = (exec: TDbTxExec, signal: AbortSignal) => Promise<void>
 

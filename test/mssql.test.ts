@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events'
 import sql from 'mssql'
 import { DbConnection } from '../src/index'
 import { toSchema, mssqlType, mssqlInput, MssqlAdapter } from '../src/db/adapters/mssql'
+import type { TConnMssql } from '../src/db/connection'
 import { loadConnections, reachable, runDbSuite, connHost, connPort } from './helpers'
 
 const conns = await loadConnections()
@@ -203,4 +204,54 @@ test('mssql: an out param fails before connecting', async () => {
 		/mssql: out parameters are not supported/,
 	)
 	assert.equal(connected, 0)
+})
+
+// review3 §4 (MSSQL): onAbort hard-closes the borrowed tedious connection via
+// request._currentRequest.connection.close(). The review left open whether that dead
+// connection comes back into tarn or is discarded. tarn validates on acquire and destroys a
+// closed connection, so the pool must keep serving. Prove it live: hard-close more than the
+// default pool.max (10) connections mid-flight and confirm every slot is released (borrowed
+// drops back to 0) and a plain query still works afterwards.
+test('mssql: pool survives repeated hard-closes (dead slots are discarded)', { skip }, async (t) => {
+	const adapter = new MssqlAdapter(conn as TConnMssql)
+	t.after(async () => { await adapter.close() })
+
+	// Streams rows for a while, so aborting on the first 'row' is guaranteed to tear a
+	// borrowed connection down mid-flight: by then the request has borrowed a connection and
+	// _currentRequest is set, so onAbort takes the hard-close path instead of cancel().
+	const q = 'WITH n AS (SELECT 1 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 100000) SELECT i FROM n OPTION (MAXRECURSION 0)'
+
+	const borrowed = () => (adapter as unknown as { _pool?: { borrowed?: number } })._pool?.borrowed
+
+	for (let round = 0; round < 12; round++) {
+		const controller = new AbortController()
+		let torn = false
+		const run = adapter.execStream(q, [], (e) => {
+			if (e.kind === 'row' && !torn) {
+				torn = true
+				controller.abort()
+			}
+		}, controller.signal)
+		await run
+
+		// The borrowed slot must be released back (then destroyed by validation) rather than
+		// held forever. Poll so the rounds do not pile up and deadlock each other.
+		const start = Date.now()
+		while (borrowed() !== 0) {
+			if (Date.now() - start > 10_000) {
+				throw new Error(`round ${round}: the hard-closed slot was never released`)
+			}
+			await new Promise((r) => setTimeout(r, 20))
+		}
+	}
+
+	// After 12 hard-closes (more than pool.max = 10) the pool must still hand out a live
+	// connection - proof the dead connections were discarded, not recycled into tarn.
+	const out: { row?: unknown; error?: string } = {}
+	await adapter.execStream('SELECT 1 AS p', [], (e) => {
+		if (e.kind === 'row') out.row = e.row
+		if (e.kind === 'finish' && e.error) out.error = e.error.message
+	})
+	assert.equal(out.error, undefined, `query after hard-closes failed: ${out.error}`)
+	assert.deepEqual(out.row, { p: 1 })
 })

@@ -1,5 +1,5 @@
 import oracledb from 'oracledb'
-import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
+import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbRes, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
 import type { TConnOra } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM_ORA } from '../placeholders'
@@ -48,6 +48,27 @@ function toSchema(meta: OraMetadata[]): TDbCol[] {
 		scale:     m.scale,
 		precision: m.precision,
 	}))
+}
+
+// res.implicitResults, with resultSet:true, is an array of ResultSets - one per
+// DBMS_SQL.RETURN_RESULT in a PL/SQL block - each carrying its own metadata. Read and
+// close every one (an unclosed ResultSet keeps its cursor open and the connection busy,
+// and oracledb does not auto-close the resultSet:true form) and return one { schema, rows }
+// per result set, so the caller can emit them as their own results instead of dropping
+// the rows silently.
+async function readImplicitResults(res: oracledb.Result<Record<string, unknown>>): Promise<TDbRes[]> {
+	const out: TDbRes[] = []
+	for (const item of res.implicitResults ?? []) {
+		// With resultSet:false each element would be a plain row array (no metadata);
+		// the adapter always executes with resultSet:true, so skip that shape defensively.
+		if (Array.isArray(item)) continue
+		try {
+			out.push({ schema: toSchema(item.metaData as unknown as OraMetadata[]), rows: await item.getRows() })
+		} finally {
+			await item.close()
+		}
+	}
+	return out
 }
 
 // :name stays :name for the driver, but only the bindings the SQL actually mentions are
@@ -217,17 +238,31 @@ export class OraAdapter implements IDbAdapter {
 				// queryStream only runs a query that returns rows; DML and PL/SQL have to go
 				// through execute(), which commits right away - execStream is not a transaction.
 				if (!rowQuery) {
-					conn.execute(sql, binds, { autoCommit: true, outFormat: oracledb.OUT_FORMAT_OBJECT }).then(
-						(res) => {
-							// DML returns no rows: give it an empty schema and the affected
-							// row count, so `exec` reports one result per statement.
-							callback({ kind: 'schema', schema: [] })
-							if (typeof res.rowsAffected === 'number') callback({ kind: 'rowsAffected', count: res.rowsAffected })
+					// resultSet:true makes res.implicitResults an array of ResultSets - one per
+					// DBMS_SQL.RETURN_RESULT - each carrying its own metadata; a plain DML is
+					// unaffected and still reports rowsAffected.
+					conn.execute<Record<string, unknown>>(sql, binds, { autoCommit: true, outFormat: oracledb.OUT_FORMAT_OBJECT, resultSet: true })
+						.then(async (res) => {
+							// A PL/SQL block with DBMS_SQL.RETURN_RESULT returns its result
+							// sets here; emit each as its own schema+rows so exec() reports
+							// one result per result set instead of dropping the rows.
+							const implicit = await readImplicitResults(res)
+							if (done) return // aborted while the implicit rows were fetched
+							if (implicit.length > 0) {
+								for (const r of implicit) {
+									callback({ kind: 'schema', schema: r.schema })
+									for (const row of r.rows) callback({ kind: 'row', row })
+								}
+							} else {
+								// DML or a plain block: no direct rows - one empty-schema
+								// result carrying the affected count.
+								callback({ kind: 'schema', schema: [] })
+								if (typeof res.rowsAffected === 'number') callback({ kind: 'rowsAffected', count: res.rowsAffected })
+							}
 							if (res.outBinds) callback({ kind: 'outParams', params: res.outBinds as Record<string, unknown> })
 							finish()
-						},
-						(err) => finish(toDbError(err, 'query')),
-					)
+						})
+						.catch((err) => finish(toDbError(err, 'query')))
 					return
 				}
 				try {
@@ -298,17 +333,33 @@ export class OraAdapter implements IDbAdapter {
 						// and tagging it 'query' keeps it from being misreported as 'user'.
 						throw toDbError(err, 'query')
 					}
-					return conn.execute<Record<string, unknown>>(q.sql, q.binds, { autoCommit: false, outFormat: oracledb.OUT_FORMAT_OBJECT })
-						.then(
-							(res) => ({
-								rows:         (res.rows ?? []) as Record<string, unknown>[],
+					return conn.execute<Record<string, unknown>>(q.sql, q.binds, { autoCommit: false, outFormat: oracledb.OUT_FORMAT_OBJECT, resultSet: true })
+						.then(async (res) => {
+							// resultSet:true moves a SELECT's rows to res.resultSet (res.rows
+							// stays undefined); read and close that ResultSet so the connection
+							// stays clean. DML and PL/SQL blocks leave res.resultSet undefined.
+							let rows: Record<string, unknown>[] = []
+							if (res.resultSet) {
+								try {
+									rows = await res.resultSet.getRows()
+								} finally {
+									await res.resultSet.close()
+								}
+							} else {
+								rows = (res.rows ?? []) as Record<string, unknown>[]
+							}
+							// A PL/SQL block with DBMS_SQL.RETURN_RESULT returns its result
+							// sets in res.implicitResults; surface each as its own schema+rows.
+							const implicit = await readImplicitResults(res)
+							const out: TDbTxResult = {
+								rows,
 								rowsAffected: res.rowsAffected,
 								outParams:    res.outBinds as Record<string, unknown> | undefined,
-							}),
-							// Tag the failure as a DB query error so it stays 'query' even
-							// when it bubbles through the user's callback.
-							(err) => { throw toDbError(err, 'query') },
-						)
+							}
+							if (implicit.length > 0) out.implicitResults = implicit
+							return out
+						})
+						.catch((err) => { throw toDbError(err, 'query') })
 				}
 				try {
 					await cb(exec, signal)

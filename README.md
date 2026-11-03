@@ -86,7 +86,7 @@ if (!result.ok) {
 }
 ```
 
-Collects all rows into memory and returns `TResult<TDbRes[], TDbError>`. Each element of the array is one result set — a multi-statement query on MSSQL or PostgreSQL returns one element per statement. A DML statement (INSERT/UPDATE/DELETE) produces one result set with an empty `schema`, no rows, and `rowsAffected` set to how many rows the database actually changed; a `SELECT` leaves `rowsAffected` unset.
+Collects all rows into memory and returns `TResult<TDbRes[], TDbError>`. Each element of the array is one result set — a multi-statement query on MSSQL or PostgreSQL returns one element per statement. A DML statement (INSERT/UPDATE/DELETE) produces one result set with an empty `schema`, no rows, and `rowsAffected` set to how many rows the database actually changed; a `SELECT` leaves `rowsAffected` unset. On Oracle, a PL/SQL block that calls `DBMS_SQL.RETURN_RESULT` returns one result set per implicit result, each with its own `schema` and rows.
 
 ### `execStream` — streaming query
 
@@ -128,7 +128,7 @@ const result = await db.execTxDynamic(async (exec, signal) => {
 // result: TResult<void, TDbError>
 ```
 
-Opens a transaction, hands the callback an `exec` bound to it and an `AbortSignal`, and commits once the callback resolves. The signal aborts when the timeout expires or the external `signal` is aborted — check it between long-running steps to stop your own work early. Anything thrown inside rolls back and comes out as `{ ok: false, error }`, where `error` is a `TDbError`. Statements use the same `:name` parameters, and every call returns `{ rows }`, so a value generated inside the transaction can be read back before commit.
+Opens a transaction, hands the callback an `exec` bound to it and an `AbortSignal`, and commits once the callback resolves. The signal aborts when the timeout expires or the external `signal` is aborted — check it between long-running steps to stop your own work early. Anything thrown inside rolls back and comes out as `{ ok: false, error }`, where `error` is a `TDbError`. Statements use the same `:name` parameters, and every call returns `{ rows }`, so a value generated inside the transaction can be read back before commit. On Oracle, a PL/SQL block that calls `DBMS_SQL.RETURN_RESULT` additionally returns `implicitResults` — one `{ schema, rows }` per implicit result set, while the statement's own `rows`/`rowsAffected` stay empty/undefined.
 
 A failed transaction reports which side failed via `error.kind`: `connect` (getting the connection), `tx` (`BEGIN`/commit), `query` (a statement — even one whose error bubbles through the callback), or `user` (the callback threw its own error). Telling `user` from `query` matters for retry logic: retry a deadlock, not a bug in your code.
 
