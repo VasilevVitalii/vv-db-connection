@@ -268,7 +268,7 @@ type TDbTxCb<T = void> = (exec: TDbTxExec, signal: AbortSignal) => Promise<T>
 
 Every failure is a `TDbError`: `kind` says what happened (`connect` — could not open the connection, `query` — the query failed, `tx` — `BEGIN`/commit failed, `user` — the callback threw its own error, `timeout` — no data in time, `aborted` — an external `signal` fired), `code` carries the driver's own error code, and `message` the human text. Failures are told apart by `code`/`kind`, not by parsing `message`.
 
-Unlike `exec`, a statement inside a transaction returns a single set of rows — no schema and no multi-result-set handling, apart from Oracle `implicitResults`, which arrive as separate `{ schema, rows }` sets (see `execTxDynamic`). A DML statement reports `rowsAffected` even when 0 rows matched (`0`, not unset); a mixed batch (a DML followed by a `SELECT`) reports only the DML's count, since the `SELECT`'s returned rows are not a "rows affected" count.
+Unlike `exec`, a statement inside a transaction returns a single set of rows — no schema and no multi-result-set handling, apart from Oracle `implicitResults`, which arrive as separate `{ schema, rows }` sets (see `execTxDynamic`). A DML statement reports `rowsAffected` even when 0 rows matched (`0`, not unset); a mixed batch (a DML followed by a `SELECT`) reports only the DML's count, since the `SELECT`'s returned rows are not a "rows affected" count. On MSSQL, `SET NOCOUNT ON` also suppresses the per-statement count for `SELECT`s, so a NOCOUNT-suppressed `SELECT` followed by a DML that changes exactly as many rows as the `SELECT` returned is indistinguishable and resolves to the `SELECT` — a documented edge case.
 
 ## Adapter notes
 

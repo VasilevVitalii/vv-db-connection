@@ -304,7 +304,7 @@ export class FbAdapter implements IDbAdapter {
 					// affected-row count. The high-level sequentially() re-prepares the
 					// statement internally, so this drives the low-level Transaction/Statement
 					// API directly.
-					void this._execStream(attached, sql, values, callback).then(
+					void this._execStream(attached, sql, values, (event) => { if (!done) callback(event) }).then(
 						() => { dropConnection(attached); finish() },
 						(err) => { dropConnection(attached); finish(err) },
 					)

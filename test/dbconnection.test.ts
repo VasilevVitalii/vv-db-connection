@@ -42,6 +42,18 @@ test('execStream rejects with a TypeError on a negative, NaN or infinite silence
 	}
 })
 
+// review6 1.1: exec() is a TResult-returning convenience over execStream, so a bad
+// silence deadline must reject from it too, not fold into a { ok: false, query } result.
+test('exec rejects with a TypeError on a negative, NaN or infinite silence timeout', async () => {
+	const db = new DbConnection({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
+	for (const options of [{ firstDataTimeoutMs: -1 }, { idleTimeoutMs: NaN }, { idleTimeoutMs: Infinity }]) {
+		await assert.rejects(
+			db.exec('SELECT 1', [], options),
+			/must be a non-negative finite number of milliseconds/,
+		)
+	}
+})
+
 // review3 §2.4: the Oracle version fallback (v$version -> PRODUCT_COMPONENT_VERSION) must
 // only run when the primary query failed as a query. A timeout or abort would just repeat
 // the same failure against the fallback, so it must return the original error untouched.

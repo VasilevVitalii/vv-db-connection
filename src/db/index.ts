@@ -81,6 +81,11 @@ export class DbConnection {
 			}
 			return current
 		}
+		// Validate the silence deadlines before running: a bad value is a programming
+		// error and must reject from exec() too. execStream would fold the TypeError into
+		// a 'query' result, so exec re-checks up front and lets the TypeError surface.
+		assertTimeoutMs('exec: firstDataTimeoutMs', options?.firstDataTimeoutMs ?? FIRST_DATA_TIMEOUT_MS)
+		assertTimeoutMs('exec: idleTimeoutMs', options?.idleTimeoutMs ?? NEXT_ROW_TIMEOUT_MS)
 		try {
 			await this.execStream(query, params, (event) => {
 				if (event.kind === 'schema') {
@@ -233,6 +238,13 @@ export class DbConnection {
 
 		try {
 			await Promise.race([run, gaveUp])
+			// A well-behaved adapter ends with a finish event (which set `settled` above).
+			// If the adapter resolved without one (an adapter bug), the consumer would never
+			// see a finish; deliver it here so the one-finish stream contract always holds.
+			if (!settled) {
+				settled = true
+				try { callback({ kind: 'finish' }) } catch { /* consumer's finish handler threw */ }
+			}
 		} catch (err) {
 			// A synchronous throw from the adapter (e.g. queryStream on Oracle) rejects run
 			// without emitting a finish. exec() catches this above, but a direct execStream
@@ -288,9 +300,9 @@ export class DbConnection {
 	// bare timeout is the old call shape, and a signal alone is now expressible via
 	// { signal }. The callback's resolved value is returned as the result, so a value
 	// computed inside the transaction does not need a closure to escape.
+	public async execTxDynamic<T = void>(cb: TDbTxCb<T>, options?: TTxOptions): Promise<TResult<T, TDbError>>
 	/** @deprecated Pass { timeoutMs } instead of a bare number of milliseconds. */
 	public async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number): Promise<TResult<T, TDbError>>
-	public async execTxDynamic<T = void>(cb: TDbTxCb<T>, options?: TTxOptions): Promise<TResult<T, TDbError>>
 	public async execTxDynamic<T = void>(cb: TDbTxCb<T>, options?: number | TTxOptions): Promise<TResult<T, TDbError>> {
 		const timeoutMs = typeof options === 'number' ? options : options?.timeoutMs
 		const signal = typeof options === 'number' ? undefined : options?.signal

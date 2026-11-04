@@ -155,6 +155,48 @@ test('execTxDynamic exec returns rowsAffected for a DML statement', async (t) =>
 	assert.equal(affected, 5)
 })
 
+// review6 1.2: tx rowsAffected must count every SELECT's rows, not just the first
+// recordset, so a SELECT-only batch reports no DML count (unset) instead of a phantom one.
+test('execTxDynamic tx rowsAffected stays unset for a SELECT-only batch', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = { socket: { destroy() {} } }
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+	t.mock.method(sql.Request.prototype, 'query', () => Promise.resolve({ recordset: [{ v: 1 }], recordsets: [[{ v: 1 }], [{ v: 2 }]], rowsAffected: [1, 1] }))
+
+	const adapter = new MssqlAdapter(conn)
+	let affected: number | undefined
+	await adapter.execTxDynamic(async (exec) => {
+		affected = (await exec('SELECT 1; SELECT 2', [])).rowsAffected
+	})
+	assert.equal(affected, undefined)
+})
+
+// review6 1.2 (companion): a batch that also ran DML reports total minus the SELECT rows,
+// so a DML touching zero rows yields 0, not unset (the README rowsAffected contract).
+test('execTxDynamic tx rowsAffected reports 0 for a DML that touched no rows', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = { socket: { destroy() {} } }
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+	t.mock.method(sql.Request.prototype, 'query', () => Promise.resolve({ recordset: [{ v: 1 }, { v: 2 }], recordsets: [[{ v: 1 }, { v: 2 }]], rowsAffected: [0, 2] }))
+
+	const adapter = new MssqlAdapter(conn)
+	let affected: number | undefined
+	await adapter.execTxDynamic(async (exec) => {
+		affected = (await exec('UPDATE t SET x = 1; SELECT 1', [])).rowsAffected
+	})
+	assert.equal(affected, 0)
+})
+
 // review4 §3.2: execTxDynamic<T> returns the callback's resolved value as the result, so
 // a value computed inside the transaction no longer needs a closure to escape.
 test('execTxDynamic returns the callback value as result', async (t) => {

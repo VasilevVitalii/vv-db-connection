@@ -104,6 +104,10 @@ export interface IDbAdapter {
 	pingQuery(): string
 	// signal: the caller has given up on the query - tear the connection down without
 	// waiting for the server. Events that still come after it are not looked at.
+	// Validation errors (unknown placeholders, malformed params) are reported through
+	// the callback as a finish with kind 'query'/'user', BEFORE the connection is taken.
+	// The stream contract is: resolve() only after the callback received exactly one
+	// finish; reject() is reserved for adapter/driver crashes the caller did not cause.
 	execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void>
 	execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, signal?: AbortSignal): Promise<TResult<T, TDbError>>
 	close(): Promise<void>

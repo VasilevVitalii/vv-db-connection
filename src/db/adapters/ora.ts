@@ -104,11 +104,15 @@ export function buildQuery(query: string, params: TDbParam[]): { sql: string; bi
 		return `:${name}`
 	}, undefined, SQL_ATOM_ORA)
 	for (const name of used) {
-		if (!params.some((p) => p.name === name)) throw new Error(`ora: param not found: ${name}`)
+		if (!params.some((p) => p.name.toLowerCase() === name.toLowerCase())) throw new Error(`ora: param not found: ${name}`)
 	}
 	const binds: Record<string, OraBindValue> = {}
 	for (const p of params) {
-		if (used.has(p.name)) binds[p.name] = oraBind(p)
+		// Oracle bind names are case-insensitive: match a param to its placeholder by
+		// lowercased name and bind under the placeholder's spelling, so `:V` in the
+		// query resolves a param declared as `v`.
+		const usedName = [...used].find((n) => n.toLowerCase() === p.name.toLowerCase())
+		if (usedName !== undefined) binds[usedName] = oraBind(p)
 	}
 	return { sql, binds }
 }
@@ -318,9 +322,11 @@ export class OraAdapter implements IDbAdapter {
 					return
 				}
 				stream.on('metadata', (meta: OraMetadata[]) => {
+					if (done) return
 					callback({ kind: 'schema', schema: toSchema(meta) })
 				})
 				stream.on('data', (row: object) => {
+					if (done) return
 					callback({ kind: 'row', row: row as Record<string, unknown> })
 				})
 				stream.on('error', (err: Error) => finish(toDbError(err, 'query')))

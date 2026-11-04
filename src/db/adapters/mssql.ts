@@ -286,15 +286,18 @@ export class MssqlAdapter implements IDbAdapter {
 					return req.query(q).then(
 						(res) => {
 							const total = res.rowsAffected?.reduce((sum, n) => sum + n, 0) ?? 0
-							const selectRows = (res.recordset ?? []).length
-							// DML only (TDbRes.rowsAffected contract). mssql's rowsAffected
-							// array reports one count per statement, and a SELECT's entry
-							// doubles as its returned-row count. A lone SELECT therefore leaves
-							// the count unset; a batch that mixes DML with SELECT reports the
-							// sum of the DML counts (total minus returned rows).
-							const rowsAffected = res.recordset === undefined
-								? (res.rowsAffected && res.rowsAffected.length > 0 ? total : undefined)
-								: (total > selectRows ? total - selectRows : undefined)
+							// mssql fills `recordsets` only for SELECT statements: a DML leaves
+							// no columns, so request.js returns before pushing (see its
+							// `filter empty recordsets` guard). Each SELECT entry holds its
+							// returned rows, and `rowsAffected` holds one count per statement
+							// that reported one (every statement under default NOCOUNT OFF).
+							// So a SELECT-only batch has as many recordsets as counts and must
+							// report no DML count, while a batch that also ran DML reports
+							// total minus the SELECT rows — 0 when a DML touched no rows.
+							const recordsets = (res.recordsets as unknown as Array<unknown[] | undefined> | undefined) ?? []
+							const selectRows = recordsets.reduce((sum, rs) => sum + (rs?.length ?? 0), 0)
+							const dmlStatements = Math.max(0, (res.rowsAffected?.length ?? 0) - recordsets.length)
+							const rowsAffected = dmlStatements > 0 ? total - selectRows : undefined
 							return {
 								rows:         (res.recordset ?? []) as Record<string, unknown>[],
 								rowsAffected,
