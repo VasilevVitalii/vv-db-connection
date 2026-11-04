@@ -249,7 +249,10 @@ export class FbAdapter implements IDbAdapter {
 			}
 			const onAbort = (): void => {
 				if (settled) return
-				done(reject)(new Error(abortError(signal?.reason).message))
+				// Reject with the full TDbError, not a bare Error: kind 'aborted' and code
+				// 'ABORTED' must survive so a future reuse of this attach does not misreport
+				// the abort as a generic connect failure.
+				done(reject)(abortError(signal?.reason))
 				tear()
 			}
 			fbLive.attach(options, (err, db) => {

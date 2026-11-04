@@ -88,6 +88,42 @@ export function buildPoolConfig(p: TConnMssql): sql.config {
 	return { ...base, user: p.auth.user, password: p.auth.password }
 }
 
+// Distinguishes a SELECT from a DML across a request's `recordset`/`row`/`rowsaffected`
+// events, shared by execStream and the transaction path. mssql streams one `rowsaffected`
+// per statement, in execution order: a SELECT reports the rows it returned, a DML the rows
+// it changed - numerically indistinguishable. The reliable marker is the `recordset` event,
+// which only a SELECT emits before its rows. The `rowsaffected` that follows a SELECT
+// equals the rows it emitted (under default NOCOUNT OFF) and is dropped; one without a
+// pending `recordset` is a DML. Under SET NOCOUNT ON a SELECT emits no `rowsaffected`, so
+// the next DML's count arrives while the recordset is still open - comparing it against
+// the emitted row count recovers the DML. A SELECT's count always equals its row count,
+// so the only ambiguous case is a NOCOUNT-suppressed SELECT followed by a DML affecting
+// exactly as many rows: that resolves to the SELECT (accepted edge).
+class MssqlStatementTracker {
+	private inSelect = false
+	private selectRows = 0
+
+	recordset(): void {
+		this.inSelect = true
+		this.selectRows = 0
+	}
+
+	row(): void {
+		if (this.inSelect) this.selectRows += 1
+	}
+
+	// Returns the DML count, or null when the event is the just-emitted SELECT's own row
+	// count (dropped). Closing the pending recordset is the tracker's job either way.
+	rowsAffected(count: number): number | null {
+		if (this.inSelect) {
+			this.inSelect = false
+			if (count === this.selectRows) return null
+			return count
+		}
+		return count
+	}
+}
+
 export class MssqlAdapter implements IDbAdapter {
 	constructor(private readonly p: TConnMssql) {
 		assertTimeoutMs('mssql: connectTimeout', p.connectTimeout)
@@ -180,41 +216,23 @@ export class MssqlAdapter implements IDbAdapter {
 			}
 			signal?.addEventListener('abort', onAbort)
 
-			// mssql streams a `rowsaffected` event once per statement, in execution order:
-			// a SELECT reports the number of rows it returned, a DML the rows it changed -
-			// numerically indistinguishable. The reliable way to tell them apart is the
-			// `recordset` event, which only a SELECT emits before its rows. So a
-			// A SELECT is delimited by its `recordset`/`row` pair; the `rowsaffected` that
-			// follows belongs to that SELECT and equals the rows it emitted, so it is
-			// dropped (those rows were already delivered). A `rowsaffected` without a
-			// pending `recordset` is a DML and becomes its own empty-schema result.
-			// Under SET NOCOUNT ON a SELECT emits no rowsaffected at all (the count is
-			// suppressed together with DML counts), so the next DML's count arrives while
-			// `inSelect` is still set; comparing it against the emitted row count recovers
-			// the DML. A SELECT's count always equals its row count, so the only ambiguous
-			// case is a NOCOUNT-suppressed SELECT followed by a DML affecting exactly as
-			// many rows — that resolves to the SELECT and drops the DML (accepted edge).
-			let inSelect = false
-			let selectRows = 0
+			// The SELECT/DML boundary is tracked by MssqlStatementTracker (shared with the
+			// transaction path): see the class comment for why the
+			// recordset/row/rowsaffected triple is the reliable discriminator and what the
+			// NOCOUNT edge case is.
+			const tracker = new MssqlStatementTracker()
 
 			request.on('recordset', (columns: Record<string, unknown>) => {
-				inSelect = true
-				selectRows = 0
+				tracker.recordset()
 				if (!done) callback({ kind: 'schema', schema: toSchema(columns) })
 			})
 			request.on('row', (row: object) => {
-				if (inSelect) selectRows += 1
+				tracker.row()
 				if (!done) callback({ kind: 'row', row: row as Record<string, unknown> })
 			})
 			request.on('rowsaffected', (count: number) => {
 				if (done) return
-				if (inSelect) {
-					inSelect = false
-					if (typeof count === 'number' && count !== selectRows) {
-						callback({ kind: 'schema', schema: [] })
-						callback({ kind: 'rowsAffected', count })
-					}
-				} else if (typeof count === 'number') {
+				if (typeof count === 'number' && tracker.rowsAffected(count) !== null) {
 					callback({ kind: 'schema', schema: [] })
 					callback({ kind: 'rowsAffected', count })
 				}
@@ -277,6 +295,7 @@ export class MssqlAdapter implements IDbAdapter {
 					// a statement on it (deterministic, not just via the socket teardown).
 					if (signal.aborted) throw abortError(signal.reason)
 					const req = new sql.Request(transaction)
+					req.stream = true
 					let q: string
 					try {
 						q = buildMssqlQuery(query, params)
@@ -289,30 +308,48 @@ export class MssqlAdapter implements IDbAdapter {
 						// would never be).
 						throw toDbError(err, 'query')
 					}
-					return req.query(q).then(
-						(res) => {
-							const total = res.rowsAffected?.reduce((sum, n) => sum + n, 0) ?? 0
-							// mssql fills `recordsets` only for SELECT statements: a DML leaves
-							// no columns, so request.js returns before pushing (see its
-							// `filter empty recordsets` guard). Each SELECT entry holds its
-							// returned rows, and `rowsAffected` holds one count per statement
-							// that reported one (every statement under default NOCOUNT OFF).
-							// So a SELECT-only batch has as many recordsets as counts and must
-							// report no DML count, while a batch that also ran DML reports
-							// total minus the SELECT rows — 0 when a DML touched no rows.
-							const recordsets = (res.recordsets as unknown as Array<unknown[] | undefined> | undefined) ?? []
-							const selectRows = recordsets.reduce((sum, rs) => sum + (rs?.length ?? 0), 0)
-							const dmlStatements = Math.max(0, (res.rowsAffected?.length ?? 0) - recordsets.length)
-							const rowsAffected = dmlStatements > 0 ? total - selectRows : undefined
-							return {
-								rows:         (res.recordset ?? []) as Record<string, unknown>[],
-								rowsAffected,
-							}
-						},
-						// Tag the failure as a DB query error so it stays 'query' even when
-						// it bubbles through the user's callback (which may re-throw it).
-						(err) => { throw toDbError(err, 'query') },
-					)
+					// Stream the statement (like execStream) so rowsAffected counts DML
+					// correctly even under SET NOCOUNT ON: the non-streaming
+					// res.rowsAffected/res.recordsets bookkeeping lost a NOCOUNT-suppressed
+					// SELECT's slot and misread the following DML as a SELECT (see
+					// MssqlStatementTracker). In streaming mode res.recordset stays empty, so
+					// rows are collected from the row events and only the first recordset is
+					// returned — the res.recordset equivalent.
+					const tracker = new MssqlStatementTracker()
+					let recordsetIndex = -1
+					let rows: Record<string, unknown>[] = []
+					let dmlTotal = 0
+					let hasDml = false
+					req.on('recordset', () => {
+						tracker.recordset()
+						recordsetIndex += 1
+						if (recordsetIndex === 0) rows = []
+					})
+					req.on('row', (row: object) => {
+						tracker.row()
+						if (recordsetIndex === 0) rows.push(row as Record<string, unknown>)
+					})
+					req.on('rowsaffected', (count: number) => {
+						const dml = typeof count === 'number' ? tracker.rowsAffected(count) : null
+						if (dml !== null) { hasDml = true; dmlTotal += dml }
+					})
+					// stream: true routes success to the 'done' event and failures to the
+					// 'error' event (the query() promise alone does not carry a stream
+					// error). But the 'error' event fires while the connection is still
+					// borrowed, and 'done' only after mssql releases it back to the
+					// transaction — so reject on 'done' (once the connection is free), not
+					// on 'error', or the rollback in the catch below would deadlock on a
+					// connection the failed request still holds. The 'error' listener just
+					// captures the failure (and stops it being an unhandled event).
+					return await new Promise<TDbTxResult>((resolve, reject) => {
+						const error: { err: Error | null } = { err: null }
+						req.on('error', (err: Error) => { error.err = err })
+						req.on('done', () => {
+							if (error.err) reject(toDbError(error.err, 'query'))
+							else resolve({ rows, rowsAffected: hasDml ? dmlTotal : undefined })
+						})
+						req.query(q).catch((err) => reject(toDbError(err, 'query')))
+					})
 				}
 				// The callback's resolved value is the transaction's result: it is only
 				// assigned on success (the catch below always returns), so the `!` is the

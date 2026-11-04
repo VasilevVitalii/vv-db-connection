@@ -142,7 +142,15 @@ test('execTxDynamic exec returns rowsAffected for a DML statement', async (t) =>
 	})
 	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
 	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
-	t.mock.method(sql.Request.prototype, 'query', () => Promise.resolve({ recordset: undefined, rowsAffected: [5] }))
+	t.mock.method(sql.Request.prototype, 'query', function (this: sql.Request) {
+		return new Promise((resolve) => {
+			setImmediate(() => {
+				this.emit('rowsaffected', 5)
+				this.emit('done', { rowsAffected: [5] })
+				resolve({ recordset: undefined, rowsAffected: [5] })
+			})
+		})
+	})
 
 	const adapter = new MssqlAdapter(conn)
 	let affected: number | undefined
@@ -166,7 +174,21 @@ test('execTxDynamic tx rowsAffected stays unset for a SELECT-only batch', async 
 	})
 	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
 	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
-	t.mock.method(sql.Request.prototype, 'query', () => Promise.resolve({ recordset: [{ v: 1 }], recordsets: [[{ v: 1 }], [{ v: 2 }]], rowsAffected: [1, 1] }))
+	t.mock.method(sql.Request.prototype, 'query', function (this: sql.Request) {
+		const col = { v: { name: 'v', type: sql.Int, length: 4, scale: undefined, precision: 10 } }
+		return new Promise((resolve) => {
+			setImmediate(() => {
+				this.emit('recordset', col)
+				this.emit('row', { v: 1 })
+				this.emit('rowsaffected', 1)
+				this.emit('recordset', col)
+				this.emit('row', { v: 2 })
+				this.emit('rowsaffected', 1)
+				this.emit('done', { rowsAffected: [1, 1] })
+				resolve({ recordset: [{ v: 1 }], recordsets: [[{ v: 1 }], [{ v: 2 }]], rowsAffected: [1, 1] })
+			})
+		})
+	})
 
 	const adapter = new MssqlAdapter(conn)
 	let affected: number | undefined
@@ -187,7 +209,20 @@ test('execTxDynamic tx rowsAffected reports 0 for a DML that touched no rows', a
 	})
 	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
 	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
-	t.mock.method(sql.Request.prototype, 'query', () => Promise.resolve({ recordset: [{ v: 1 }, { v: 2 }], recordsets: [[{ v: 1 }, { v: 2 }]], rowsAffected: [0, 2] }))
+	t.mock.method(sql.Request.prototype, 'query', function (this: sql.Request) {
+		const col = { v: { name: 'v', type: sql.Int, length: 4, scale: undefined, precision: 10 } }
+		return new Promise((resolve) => {
+			setImmediate(() => {
+				this.emit('rowsaffected', 0)
+				this.emit('recordset', col)
+				this.emit('row', { v: 1 })
+				this.emit('row', { v: 2 })
+				this.emit('rowsaffected', 2)
+				this.emit('done', { rowsAffected: [0, 2] })
+				resolve({ recordset: [{ v: 1 }, { v: 2 }], recordsets: [[{ v: 1 }, { v: 2 }]], rowsAffected: [0, 2] })
+			})
+		})
+	})
 
 	const adapter = new MssqlAdapter(conn)
 	let affected: number | undefined
@@ -195,6 +230,43 @@ test('execTxDynamic tx rowsAffected reports 0 for a DML that touched no rows', a
 		affected = (await exec('UPDATE t SET x = 1; SELECT 1', [])).rowsAffected
 	})
 	assert.equal(affected, 0)
+})
+
+// review13 2.2: under SET NOCOUNT ON a SELECT emits no rowsaffected, so the following
+// DML's count arrives while the SELECT's recordset is still open. The non-streaming
+// res.rowsAffected/res.recordsets bookkeeping lost the NOCOUNT-suppressed SELECT's slot
+// and misread the DML as a SELECT (rowsAffected unset). The transaction path now streams
+// and tells SELECT from DML per statement, so the DML count survives.
+test('execTxDynamic tx rowsAffected survives a NOCOUNT-suppressed SELECT', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = { socket: { destroy() {} } }
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+	t.mock.method(sql.Request.prototype, 'query', function (this: sql.Request) {
+		const col = { v: { name: 'v', type: sql.Int, length: 4, scale: undefined, precision: 10 } }
+		return new Promise((resolve) => {
+			setImmediate(() => {
+				this.emit('recordset', col)
+				this.emit('row', { v: 1 })
+				// The SELECT's rowsaffected is suppressed by SET NOCOUNT ON — only the
+				// UPDATE emits one.
+				this.emit('rowsaffected', 3)
+				this.emit('done', { rowsAffected: [3] })
+				resolve({ recordset: [{ v: 1 }], recordsets: [[{ v: 1 }]], rowsAffected: [3] })
+			})
+		})
+	})
+
+	const adapter = new MssqlAdapter(conn)
+	let affected: number | undefined
+	await adapter.execTxDynamic(async (exec) => {
+		affected = (await exec('SET NOCOUNT ON; SELECT v FROM t; SET NOCOUNT OFF; UPDATE b SET x = 2', [])).rowsAffected
+	})
+	assert.equal(affected, 3)
 })
 
 // review4 §3.2: execTxDynamic<T> returns the callback's resolved value as the result, so

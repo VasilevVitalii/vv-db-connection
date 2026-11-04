@@ -112,11 +112,13 @@ export type TDbTxCb<T = void> = (exec: TDbTxExec, signal: AbortSignal) => Promis
 
 // The adapter contract behind DbConnection. Consumers are expected to go through
 // DbConnection, which picks the adapter from connection.kind, loads the driver lazily and
-// wraps the stream contract (one finish per call, consumer-callback throws contained).
-// An adapter may be built directly only for tests/mocks or by code that re-implements
-// those guarantees itself. Validation (connectTimeout, Oracle pool sizing) is
-// deliberately duplicated in each adapter's constructor so a directly-constructed adapter
-// rejects bad config before its driver is loaded, exactly as DbConnection does.
+// wraps the stream contract (one finish per call, and it contains a throw from ANY
+// consumer event handler). The adapter itself contains only the finish handler's throw -
+// row/schema/data handlers are not contained, see execStream below. An adapter may be
+// built directly only for tests/mocks or by code that re-implements those guarantees
+// itself. Validation (connectTimeout, Oracle pool sizing) is deliberately duplicated in
+// each adapter's constructor so a directly-constructed adapter rejects bad config before
+// its driver is loaded, exactly as DbConnection does.
 export interface IDbAdapter {
 	versionQuery(): string
 	// A second query to try when versionQuery() is not reachable (Oracle: v$version is
@@ -129,9 +131,11 @@ export interface IDbAdapter {
 	// the callback as a finish with kind 'query', BEFORE the connection is taken.
 	// The stream contract is: resolve() only after the callback received exactly one
 	// finish; reject() is reserved for adapter/driver crashes the caller did not cause.
-	// A throw from the callback - including the finish handler - is swallowed by the
-	// adapter and never reaches the driver's EventEmitter nor rejects the call, so a
-	// directly-built adapter is as safe as one behind DbConnection.
+	// A throw from the finish handler is swallowed by the adapter and never rejects the
+	// call nor reaches the driver's EventEmitter. Throws from the row/schema/data events
+	// are NOT contained here: a directly-built adapter lets them escape into the driver's
+	// event emitter (an uncaught exception), the same as the driver would on its own.
+	// Containing every event is DbConnection's job - it wraps each one - not the adapter's.
 	execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void>
 	// Runs cb inside a transaction. The body's exec() rejects once signal is aborted
 	// (deadline or external abort), and a body result arriving after abort is ignored.
