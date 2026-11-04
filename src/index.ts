@@ -24,4 +24,5 @@ export type {
 	TDbTxResult,
 	TDbTxExec,
 	TDbTxCb,
+	IDbAdapter,
 } from './db/types'

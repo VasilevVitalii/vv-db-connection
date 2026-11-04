@@ -55,12 +55,13 @@ export function withTxTimeout<T>(
 	const hasDeadline = timeoutMs !== undefined && timeoutMs !== 0
 
 	// Neither a deadline nor an external signal: run the body directly, but keep the
-	// rejection symmetric with the deadline path - a throwing body must settle as
-	// { ok: false, kind: 'query' }, never reject the caller.
+	// rejection symmetric with the deadline path. A rejecting body is an adapter bug
+	// (the body contract is to resolve TResult), so report it as 'tx' - never a 'query'
+	// the caller might retry, and never a bare rejection.
 	if (!hasDeadline && !external) {
 		return body(controller.signal, () => {}).then(
 			(r) => r,
-			(err) => ({ ok: false, error: toDbError(err, 'query') }),
+			(err) => ({ ok: false, error: toDbError(err, 'tx') }),
 		)
 	}
 
@@ -115,9 +116,10 @@ export function withTxTimeout<T>(
 		external?.addEventListener('abort', onExternalAbort, { once: true })
 		body(controller.signal, armCommitDeadline).then(
 			(r) => settle(r),
-			// The body itself rejected - a real failure of the transaction work, not a
-			// deadline. Labelling it TIMEOUT would hide the actual error from the caller.
-			(err) => settle({ ok: false, error: toDbError(err, 'query') }),
+			// The body itself rejected - an adapter bug (the body contract is to resolve
+			// TResult), not a deadline and not a query to retry. Report 'tx' so it is not
+			// mistaken for a retryable query error and the underlying cause stays visible.
+			(err) => settle({ ok: false, error: toDbError(err, 'tx') }),
 		)
 	})
 }
@@ -126,6 +128,10 @@ function abortedError(reason: unknown): TDbError {
 	return {
 		message: reason instanceof Error ? reason.message : String(reason ?? 'aborted'),
 		kind: 'aborted',
+		// A synthetic abort carries an identifier even when the reason was not an Error
+		// (no stack to fall back on), so isDbError() still recognizes it as a structured
+		// error instead of re-labelling it 'user'.
+		code: 'ABORTED',
 		...(reason instanceof Error ? { stack: reason.stack } : {}),
 	}
 }
@@ -152,7 +158,7 @@ class CommitTimeout extends Error {
 // mislabelled 'timeout' and an Error reason is never stringified into "Error: <message>".
 export function abortError(reason: unknown): TDbError {
 	if (reason instanceof TxTimeout) {
-		return { message: 'TIMEOUT', kind: 'timeout' }
+		return { message: 'TIMEOUT', kind: 'timeout', code: 'TIMEOUT' }
 	}
 	if (reason instanceof CommitTimeout) {
 		return { message: 'COMMIT outcome unknown', kind: 'tx', code: 'COMMIT_TIMEOUT' }

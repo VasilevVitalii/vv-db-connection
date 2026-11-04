@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import sql from 'mssql'
 import { DbConnection } from '../src/index'
-import { toSchema, mssqlType, mssqlInput, MssqlAdapter } from '../src/db/adapters/mssql'
+import { toSchema, mssqlType, mssqlInput, MssqlAdapter, buildPoolConfig } from '../src/db/adapters/mssql'
 import type { TConnMssql } from '../src/db/connection'
 import { loadConnections, reachable, runDbSuite, connHost, connPort } from './helpers'
 
@@ -369,4 +369,24 @@ test('mssql: pool survives repeated hard-closes (dead slots are discarded)', { s
 	})
 	assert.equal(out.error, undefined, `query after hard-closes failed: ${out.error}`)
 	assert.deepEqual(out.row, { p: 1 })
+})
+
+// review9 §4: mssql teardown relies on the private Transaction._acquiredConnection.socket
+// to hard-break a stuck statement (pool.close() alone is graceful - it waits for the busy
+// connection). If a future mssql upgrade renames/removes it, an abort silently degrades
+// into a commit after the deadline (review9 §1.1). Pin the shape against the installed
+// driver so an upgrade breaks this test loudly instead of silently.
+test('mssql: a begun transaction exposes _acquiredConnection.socket for teardown', { skip }, async (t) => {
+	const pool = await new sql.ConnectionPool(buildPoolConfig(conn as TConnMssql)).connect()
+	t.after(async () => { await pool.close() })
+	const tx = new sql.Transaction(pool)
+	await tx.begin()
+	try {
+		const acquired = (tx as unknown as { _acquiredConnection?: { socket?: { destroy(): void } } })._acquiredConnection
+		assert.ok(acquired, 'mssql Transaction must expose _acquiredConnection (teardown depends on it)')
+		assert.ok(acquired?.socket, '_acquiredConnection must expose a socket to destroy')
+		assert.equal(typeof acquired?.socket?.destroy, 'function')
+	} finally {
+		await tx.rollback()
+	}
 })

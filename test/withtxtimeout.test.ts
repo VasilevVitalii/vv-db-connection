@@ -34,13 +34,13 @@ test('withTxTimeout rejects NaN and Infinity deadlines', () => {
 	)
 })
 
-test('a rejected body is reported as a query error, not as TIMEOUT', async () => {
+test('a rejected body is reported as a tx error, not as TIMEOUT or a retryable query', async () => {
 	const r = await withTxTimeout(5000, async () => {
 		throw new Error('boom')
 	})
 	assert.equal(r.ok, false)
 	if (!r.ok) {
-		assert.equal(r.error.kind, 'query')
+		assert.equal(r.error.kind, 'tx')
 		assert.equal(r.error.message, 'boom')
 	}
 })
@@ -64,12 +64,12 @@ test('an external signal aborts the transaction with kind aborted', async () => 
 })
 
 // review8 §2.15: without a deadline or an external signal the body must still settle as a
-// TResult - a throwing body reports kind 'query', never rejects the caller (symmetric with
-// the deadline path).
-test('withTxTimeout without a deadline reports a throwing body as query', async () => {
+// TResult - a throwing body reports kind 'tx' (an adapter bug, not a query to retry),
+// never rejects the caller (symmetric with the deadline path).
+test('withTxTimeout without a deadline reports a throwing body as tx', async () => {
 	const r = await withTxTimeout(undefined, async () => { throw new Error('boom') })
 	assert.equal(r.ok, false)
-	if (!r.ok) assert.equal(r.error.kind, 'query')
+	if (!r.ok) assert.equal(r.error.kind, 'tx')
 })
 
 // review8 §1.1 (variant A): a commit that hangs longer than the deadline is bounded by a
@@ -117,4 +117,22 @@ test('withTxTimeout: armCommitDeadline after the deadline is a no-op', async () 
 	})
 	assert.equal(r.ok, false)
 	if (!r.ok) assert.equal(r.error.kind, 'timeout')
+})
+
+// review9 §3: an external abort whose reason is not an Error (a plain string, an object)
+// used to build a synthetic TDbError with no code/stack, so isDbError() would re-label it
+// 'user'. The synthetic abort now carries code 'ABORTED' so it stays structured.
+test('an abort with a non-Error reason still carries an error code', async () => {
+	const controller = new AbortController()
+	const rPromise = withTxTimeout(undefined, async (signal) => {
+		await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }))
+		return { ok: true as const, result: 1 }
+	}, controller.signal)
+	controller.abort('plain-string reason')
+	const r = await rPromise
+	assert.equal(r.ok, false)
+	if (!r.ok) {
+		assert.equal(r.error.kind, 'aborted')
+		assert.equal(r.error.code, 'ABORTED')
+	}
 })

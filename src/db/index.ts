@@ -162,6 +162,9 @@ export class DbConnection {
 				? `timeout: no data from the database within ${humanMs(ms)} after the query was sent`
 				: `timeout: no new data from the database within ${humanMs(ms)}`,
 			kind: 'timeout',
+			// An identifier keeps this synthetic error recognizable to isDbError() (the
+			// message is dynamic and there is no stack to fall back on).
+			code: 'TIMEOUT',
 		})
 		// Ends the call from here: tells the adapter to tear its connection down, hands
 		// the error to the callback and releases the race, all at once.

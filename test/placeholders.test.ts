@@ -152,3 +152,19 @@ test('pg: a /* inside a string literal is not a comment', () => {
 test('pg: a placeholder after a comment still binds', () => {
 	assert.equal(pgRewrite('SELECT /* c */ :a'), 'SELECT /* c */ @a')
 })
+
+// review9 §2.3: maskPgBlockComments must not mistake a /* inside an E'' escape string
+// or a $tag$...$tag$ dollar-quote for a block comment - the masked scan would stop at a
+// phantom */ and expose a :name inside what is actually one string literal.
+test('pg: a /* inside an E string is not a comment', () => {
+	assert.equal(pgRewrite("SELECT E'a/*b*/c' , :a"), "SELECT E'a/*b*/c' , @a")
+})
+
+test('pg: an escaped quote in an E string does not end it early', () => {
+	assert.equal(pgRewrite("SELECT E'it\\'s /* not a comment */' , :a"), "SELECT E'it\\'s /* not a comment */' , @a")
+})
+
+test('pg: a /* inside a dollar-quoted string is not a comment', () => {
+	assert.equal(pgRewrite('SELECT $$ a/*b*/ :x $$ , :a'), 'SELECT $$ a/*b*/ :x $$ , @a')
+	assert.equal(pgRewrite('SELECT $body$ a/*b*/ :x $body$ , :a'), 'SELECT $body$ a/*b*/ :x $body$ , @a')
+})

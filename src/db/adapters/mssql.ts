@@ -69,7 +69,7 @@ export function toSchema(columns: Record<string, unknown>): TDbCol[] {
 	})
 }
 
-function buildPoolConfig(p: TConnMssql): sql.config {
+export function buildPoolConfig(p: TConnMssql): sql.config {
 	const base: sql.config = {
 		server:   p.server,
 		port:     p.port ?? 1433,

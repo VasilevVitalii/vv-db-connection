@@ -81,6 +81,21 @@ export function maskPgBlockComments(sql: string): { masked: string; restore: (s:
 	let i = 0
 	while (i < sql.length) {
 		const c = sql[i]
+		if ((c === 'E' || c === 'e') && sql[i + 1] === "'" && !/[\w$]/.test(sql[i - 1] ?? '')) {
+			// pg escape string (E''): a backslash escapes the next character, so \' is
+			// not the end of the string. Skipped verbatim so a /* inside it stays text.
+			out += c + "'"; i += 2
+			while (i < sql.length) {
+				out += sql[i]
+				if (sql[i] === '\\') { out += sql[i + 1] ?? ''; i += 2; continue }
+				if (sql[i] === "'") {
+					if (sql[i + 1] === "'") { out += "'"; i += 2; continue }
+					i++; break
+				}
+				i++
+			}
+			continue
+		}
 		if (c === "'") {
 			// String literal: '' doubles the quote, a backslash is an ordinary character
 			// in a standard string.
@@ -107,6 +122,21 @@ export function maskPgBlockComments(sql: string): { masked: string; restore: (s:
 				i++
 			}
 			continue
+		}
+		if (c === '$' && !/[\w$]/.test(sql[i - 1] ?? '')) {
+			// pg dollar-quoted string: $tag$...$tag$ or the empty $$...$$. The closer
+			// must repeat the tag, so a /* inside it is plain text, not a comment.
+			const dq = /^\$(?<tag>[A-Za-z_]\w*)?\$/.exec(sql.slice(i))
+			if (dq) {
+				const close = `$${dq.groups!.tag ?? ''}$`
+				const end = sql.indexOf(close, i + dq[0].length)
+				if (end >= 0) {
+					out += sql.slice(i, end + close.length)
+					i = end + close.length
+					continue
+				}
+				// unterminated: fall through and copy the $ literally.
+			}
 		}
 		if (c === '-' && sql[i + 1] === '-') {
 			// Line comment runs to the end of the line.

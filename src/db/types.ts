@@ -94,10 +94,15 @@ export type TDbTxResult = {
 	// result stays in `rows`/`rowsAffected` (both empty/undefined for such a block).
 	implicitResults?: TDbRes[]
 }
+// Runs one statement inside the transaction. After the transaction's signal is
+// aborted the connection is being torn down hard, so exec() rejects with the abort
+// error instead of running on a dead socket - the body can `.catch()` it and bail.
 export type TDbTxExec   = (query: string, params: TDbParam[]) => Promise<TDbTxResult>
 // The transaction body. Its resolved value is carried out of execTxDynamic as the
 // result's `result`, so a value computed inside the transaction (a new id, a computed
-// total) does not need a closure to escape.
+// total) does not need a closure to escape. After `signal` is aborted (deadline or
+// external) the body MUST stop calling `exec()` - it rejects - and any value it
+// resolves is ignored (the race is already settled).
 export type TDbTxCb<T = void> = (exec: TDbTxExec, signal: AbortSignal) => Promise<T>
 
 export interface IDbAdapter {
@@ -113,6 +118,8 @@ export interface IDbAdapter {
 	// The stream contract is: resolve() only after the callback received exactly one
 	// finish; reject() is reserved for adapter/driver crashes the caller did not cause.
 	execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void>
+	// Runs cb inside a transaction. The body's exec() rejects once signal is aborted
+	// (deadline or external abort), and a body result arriving after abort is ignored.
 	execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, signal?: AbortSignal): Promise<TResult<T, TDbError>>
 	close(): Promise<void>
 }
