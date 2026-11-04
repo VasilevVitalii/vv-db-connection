@@ -332,18 +332,26 @@ export class OraAdapter implements IDbAdapter {
 							// one result per result set instead of dropping the rows.
 							const implicit = await readImplicitResults(res)
 							if (done) return // aborted while the implicit rows were fetched
+							// The block's own result (affected count and out-parameters)
+							// comes BEFORE the implicit sets: exec() attaches outParams to
+							// the current result, and if they fired after the sets they would
+							// stick to the last implicit one instead of the block itself.
+							const emitOwn = (): void => {
+								callback({ kind: 'schema', schema: [] })
+								if (typeof res.rowsAffected === 'number') callback({ kind: 'rowsAffected', count: res.rowsAffected })
+								if (res.outBinds) callback({ kind: 'outParams', params: res.outBinds as Record<string, unknown> })
+							}
 							if (implicit.length > 0) {
+								if (typeof res.rowsAffected === 'number' || res.outBinds !== undefined) emitOwn()
 								for (const r of implicit) {
 									callback({ kind: 'schema', schema: r.schema })
 									for (const row of r.rows) callback({ kind: 'row', row })
 								}
 							} else {
 								// DML or a plain block: no direct rows - one empty-schema
-								// result carrying the affected count.
-								callback({ kind: 'schema', schema: [] })
-								if (typeof res.rowsAffected === 'number') callback({ kind: 'rowsAffected', count: res.rowsAffected })
+								// result carrying the affected count and out-parameters.
+								emitOwn()
 							}
-							if (res.outBinds) callback({ kind: 'outParams', params: res.outBinds as Record<string, unknown> })
 							finish()
 						})
 						.catch((err) => finish(toDbError(err, 'query')))

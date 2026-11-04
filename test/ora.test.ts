@@ -481,6 +481,37 @@ test('ora: implicit results are emitted as their own result sets and closed', as
 	assert.equal(closed, 2, 'every implicit ResultSet must be closed')
 })
 
+// review8 §3: outParams fired after the implicit result sets, so exec() attached them to
+// the last implicit set instead of the block's own result, and the block's rowsAffected
+// was dropped. The block's own result must be emitted before the sets.
+test('ora: outParams come before implicit result sets and keep the block rowsAffected', async (t) => {
+	const fakeConn = {
+		break: () => Promise.resolve(),
+		close: () => Promise.resolve(),
+		queryStream: () => { throw new Error('not a row query') },
+		execute: async () => ({
+			rowsAffected: 2,
+			implicitResults: [
+				{ metaData: [{ name: 'A', dbTypeName: 'NUMBER' }], getRows: async () => [{ A: 1 }], close: async () => {} },
+			],
+			outBinds: { n: 42 },
+		}),
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: '127.0.0.1', port: 1521, service: 'x', user: 'u', password: 'p' } as TConnOra)
+	const events: any[] = []
+	await adapter.execStream('BEGIN UPDATE t SET x = 1; :n := 42; RETURN_RESULT; END;', [{ name: 'n', direction: 'out', type: 'NUMBER' }], (e) => events.push(e))
+
+	const outParamsIdx = events.findIndex((e) => e.kind === 'outParams')
+	const implicitSchemaIdx = events.findIndex((e) => e.kind === 'schema' && e.schema.length > 0)
+	assert.ok(outParamsIdx >= 0, 'outParams must be emitted')
+	assert.ok(implicitSchemaIdx >= 0, 'the implicit schema must be emitted')
+	assert.ok(implicitSchemaIdx > outParamsIdx, 'outParams must precede the implicit set')
+	assert.equal(events.filter((e) => e.kind === 'rowsAffected').length, 1, 'the block rowsAffected is kept, not dropped')
+	assert.equal(events.filter((e) => e.kind === 'schema' && e.schema.length === 0).length, 1, 'one empty-schema block result')
+})
+
 // review3 §2.8: live - a PL/SQL block that returns several implicit result sets must
 // surface each as its own result, with its own schema, instead of silently dropping them.
 test('ora: DBMS_SQL.RETURN_RESULT surfaces every implicit result set', { skip }, async (t) => {
