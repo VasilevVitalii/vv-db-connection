@@ -707,3 +707,84 @@ test('ora: execStream clears its close-wait fallback timer after the stream clos
 	assert.equal(cleared.length, 1, 'the fallback timer must be cleared once the race settles')
 	assert.equal(cleared[0], armed, 'the cleared handle must be the armed fallback timer')
 })
+
+// review15 2.2: an abort that lands between statements (or while the callback does
+// non-DB work) has nothing in flight to interrupt. break() on an idle connection
+// leaves the session cancelled so its next statement answers ORA-01013; the teardown
+// must skip break() and just release the connection.
+test('ora: an abort between statements releases without break() on an idle connection', async (t) => {
+	let broken = 0
+	let closed = 0
+	const fakeConn = {
+		break: () => { broken += 1; return Promise.resolve() },
+		close: () => { closed += 1; return Promise.resolve() },
+		rollback: () => Promise.resolve(),
+		commit: () => Promise.resolve(),
+		execute: async () => ({ resultSet: undefined, rowsAffected: 0, implicitResults: undefined, outBinds: undefined }),
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: '127.0.0.1', port: 1521, service: 'x', user: 'u', password: 'p' } as TConnOra)
+	const controller = new AbortController()
+	const r = await adapter.execTxDynamic(async (exec) => {
+		await exec('SELECT 1 FROM dual', [])  // completes; the connection is now idle
+		controller.abort(new Error('cancel')) // abort while idle, between statements
+		await exec('SELECT 2 FROM dual', [])  // rejects: the signal is already aborted
+	}, undefined, controller.signal)
+
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'aborted')
+	assert.equal(broken, 0, 'break() must not poison an idle connection')
+	assert.equal(closed, 1)
+})
+
+// review15 2.3: on the DML/PL-SQL path an abort during readImplicitResults (getRows in
+// flight) used to close() the connection before the fetch settled, answering NJS-032 and
+// dropping it out of the pool. The finally must wait for the fetch (bounded) so the
+// connection returns to the pool instead of being dropped.
+test('ora: an abort while fetching implicit rows waits for the fetch before close()', async (t) => {
+	let getRowsSettled = false
+	let resolveRows!: (rows: unknown[]) => void
+	let closed = 0
+	let dropped = 0
+	const fakeConn = {
+		break: () => Promise.resolve(),
+		close: (opts?: { drop?: boolean }) => {
+			if (opts?.drop) { dropped += 1; return Promise.resolve() }
+			if (!getRowsSettled) return Promise.reject(Object.assign(new Error('NJS-032: connection cannot be released'), { code: 'NJS-032' }))
+			closed += 1
+			return Promise.resolve()
+		},
+		queryStream: () => { throw new Error('not a row query') },
+		execute: async () => ({
+			resultSet: undefined,
+			rowsAffected: 0,
+			implicitResults: [
+				{ metaData: [{ name: 'A', dbTypeName: 'NUMBER' }], getRows: () => new Promise<unknown[]>((resolve) => { resolveRows = () => { getRowsSettled = true; resolve([]) } }), close: async () => {} },
+			],
+			outBinds: undefined,
+		}),
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: 'h', port: 1521, service: 's', user: 'u', password: 'p' } as TConnOra)
+	const controller = new AbortController()
+	const events: string[] = []
+	const run = adapter.execStream('UPDATE t SET x = 1', [], (e) => events.push(e.kind), controller.signal)
+
+	await new Promise((resolve) => setImmediate(resolve)) // execute() ran, readImplicitResults blocked on getRows
+	controller.abort(new Error('cancelled'))              // done = true, finish(aborted)
+	await new Promise((resolve) => setImmediate(resolve)) // finally reached the dmlDone wait
+
+	// Before the fetch settles, close() must not have run (it would NJS-032 and drop).
+	assert.equal(closed, 0)
+	assert.equal(dropped, 0)
+
+	resolveRows([])                                       // the fetch settles; close() may now run
+	await run
+	await new Promise((resolve) => setImmediate(resolve)) // flush
+
+	assert.equal(closed, 1, 'close must return the connection to the pool, not drop it')
+	assert.equal(dropped, 0)
+	assert.equal(events[events.length - 1], 'finish')
+})

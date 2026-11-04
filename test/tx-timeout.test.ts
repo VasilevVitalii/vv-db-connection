@@ -333,3 +333,56 @@ test('execTxDynamic defers exec rejection to the done event, not the query() pro
 	assert.equal(r.ok, false)
 	if (!r.ok) assert.equal(r.error.kind, 'user')
 })
+
+// review15 2.1: if the driver emits 'error' (or rejects query()) but never emits
+// 'done', exec() must not hang forever. A short fallback rips the socket and rejects
+// with 'query', so the transaction ends instead of stranding the connection.
+test('execTxDynamic rejects via fallback when done never follows the stream error', async (t) => {
+	let destroyed = 0
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = {
+			socket: { destroy: () => { destroyed += 1 } },
+		}
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+
+	// Arm the fallback manually so the test does not wait the real 1s: capture the
+	// callback and fire it once the error has been emitted and the fallback armed.
+	let fallbackFn!: () => void
+	let handle: unknown
+	const setT = t.mock.method(globalThis, 'setTimeout', (fn: () => void) => {
+		fallbackFn = fn
+		handle = { fn }
+		return handle
+	})
+
+	t.mock.method(sql.Request.prototype, 'query', function (this: sql.Request) {
+		// The statement fails and the driver never emits 'done' (it never releases the
+		// connection), leaving the transaction borrowed forever without the fallback.
+		setImmediate(() => { this.emit('error', new Error('boom')) })
+		return new Promise(() => {}) // never settles
+	})
+
+	const adapter = new MssqlAdapter(conn)
+	const p = adapter.execTxDynamic(async (exec) => {
+		await exec('SELECT 1', [])
+	})
+	// The error is emitted on a setImmediate from inside the mocked query(), so wait
+	// (bounded) until the fallback timer has been armed.
+	for (let i = 0; i < 100 && !fallbackFn; i++) {
+		await new Promise((resolve) => setImmediate(resolve))
+	}
+	assert.ok(fallbackFn, 'the fallback timer must be armed after the error event')
+	fallbackFn() // fire the fallback
+	const r = await p
+
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'query')
+	assert.equal(destroyed, 1, 'the fallback must rip the socket so pool.close() can free it')
+
+	setT.mock.restore()
+})

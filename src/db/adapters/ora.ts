@@ -273,6 +273,7 @@ export class OraAdapter implements IDbAdapter {
 		let interrupt: Promise<void> | undefined
 		let stream: oracledb.QueryStream<Record<string, unknown>> | undefined
 		let streamClosed: Promise<void> | undefined
+		let dmlDone: Promise<void> | undefined
 		try {
 			await new Promise<void>((resolve) => {
 				let done = false
@@ -312,8 +313,10 @@ export class OraAdapter implements IDbAdapter {
 				if (!rowQuery) {
 					// resultSet:true makes res.implicitResults an array of ResultSets - one per
 					// DBMS_SQL.RETURN_RESULT - each carrying its own metadata; a plain DML is
-					// unaffected and still reports rowsAffected.
-					conn.execute<Record<string, unknown>>(sql, binds, { autoCommit: true, outFormat: oracledb.OUT_FORMAT_OBJECT, resultSet: true })
+					// unaffected and still reports rowsAffected. The handler is remembered as
+					// dmlDone so the finally below can wait for its in-flight fetch before
+					// close() (see the finally comment).
+					dmlDone = conn.execute<Record<string, unknown>>(sql, binds, { autoCommit: true, outFormat: oracledb.OUT_FORMAT_OBJECT, resultSet: true })
 						.then(async (res) => {
 							// A PL/SQL block with DBMS_SQL.RETURN_RESULT returns its result
 							// sets here; emit each as its own schema+rows so exec() reports
@@ -401,6 +404,18 @@ export class OraAdapter implements IDbAdapter {
 			// the fallback itself already fired.
 			if (timer !== undefined) clearTimeout(timer)
 		}
+		// The DML/PL-SQL path keeps fetching implicit rows (readImplicitResults) after
+		// execute() settles. An abort tears the connection down while that fetch is
+		// still in flight; close() before the fetch settles answers NJS-032 and drops
+		// the connection out of the pool instead of returning it - the same race the
+		// row path guards against via streamClosed. Wait for the DML handler, bounded
+		// like streamClosed so a truly stuck fetch cannot hang release.
+		if (dmlDone) {
+			let timer: ReturnType<typeof setTimeout> | undefined
+			const fallback = new Promise<void>((res) => { timer = setTimeout(res, 1000) })
+			await Promise.race([dmlDone, fallback])
+			if (timer !== undefined) clearTimeout(timer)
+		}
 		// close() can itself throw (connection in use after a stream failure); drop it
 		// rather than leak the pool slot silently. A drop discards the session and any
 		// uncommitted work without surfacing it - an accepted trade-off (a lost session is
@@ -424,6 +439,15 @@ export class OraAdapter implements IDbAdapter {
 			// to exhaust). The interrupt promise is remembered for both the abort handler and
 			// the early-abort branch, and a close() that still fails drops the connection.
 			let interrupt: Promise<void> | undefined
+			// An operation (execute() or commit()) is in flight on this connection while
+			// its promise is pending (the statement plus any result-set reads and closes).
+			// break() only interrupts a statement that is actually running: issuing it on
+			// an idle connection leaves the session cancelled and its next statement
+			// answering ORA-01013 (the same rule the early-abort branch below follows).
+			// The abort teardown consults this flag so an abort that lands between
+			// statements (or while the callback does non-DB work) releases the connection
+			// without poisoning it.
+			let operationInFlight = false
 			const release = async (): Promise<void> => {
 				if (interrupt) { try { await interrupt } catch {} }
 				// close() blocks until the server-side cancel of the interrupted statement
@@ -435,7 +459,10 @@ export class OraAdapter implements IDbAdapter {
 				}
 			}
 			const teardown = (): void => {
-				interrupt = conn.break().catch(() => {})
+				// Only interrupt a statement that is actually running; break() on an idle
+				// connection would leave the session cancelled and its next statement
+				// answering ORA-01013.
+				if (operationInFlight) interrupt = conn.break().catch(() => {})
 				void release()
 			}
 			signal.addEventListener('abort', teardown, { once: true })
@@ -465,7 +492,12 @@ export class OraAdapter implements IDbAdapter {
 						// and tagging it 'query' keeps it from being misreported as 'user'.
 						return Promise.reject(toDbError(err, 'query'))
 					}
-					return conn.execute<Record<string, unknown>>(q.sql, q.binds, { autoCommit: false, outFormat: oracledb.OUT_FORMAT_OBJECT, resultSet: true })
+					// A statement is in flight from execute() until the whole exec settles
+					// (row reads + implicit-result reads + result-set closes), so the abort
+					// teardown knows there is something to break().
+					operationInFlight = true
+					const clearInFlight = (): void => { operationInFlight = false }
+					const p = conn.execute<Record<string, unknown>>(q.sql, q.binds, { autoCommit: false, outFormat: oracledb.OUT_FORMAT_OBJECT, resultSet: true })
 						.then(async (res) => {
 							// resultSet:true moves a SELECT's rows to res.resultSet (res.rows
 							// stays undefined); read and close that ResultSet so the connection
@@ -495,6 +527,8 @@ export class OraAdapter implements IDbAdapter {
 							return out
 						})
 						.catch((err) => { throw toDbError(err, 'query') })
+					p.then(clearInFlight, clearInFlight)
+					return p
 				}
 				let result!: T
 				try {
@@ -517,7 +551,15 @@ export class OraAdapter implements IDbAdapter {
 					// server may already have committed, so a plain timeout would make a
 					// retry double-apply. The external abort still applies.
 					armCommitDeadline()
-					await conn.commit()
+					// COMMIT is a statement on the connection too: mark it in flight so an
+					// abort that lands during commit() is interrupted with break() rather than
+					// leaving the session cancelled for its next statement.
+					operationInFlight = true
+					try {
+						await conn.commit()
+					} finally {
+						operationInFlight = false
+					}
 				} catch (err) {
 					// Same race as the cb path above: on an abort the teardown already owns
 					// the connection (break + close in flight), so rolling back here would

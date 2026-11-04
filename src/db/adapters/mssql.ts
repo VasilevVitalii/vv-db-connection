@@ -343,16 +343,38 @@ export class MssqlAdapter implements IDbAdapter {
 					// captures the failure (and stops it being an unhandled event).
 					return await new Promise<TDbTxResult>((resolve, reject) => {
 						const error: { err: Error | null } = { err: null }
-						req.on('error', (err: Error) => { error.err = err })
-						req.on('done', () => {
+						let settled = false
+						let fallback: ReturnType<typeof setTimeout> | undefined
+						const settleDone = (): void => {
+							if (settled) return
+							settled = true
+							if (fallback !== undefined) { clearTimeout(fallback); fallback = undefined }
 							if (error.err) reject(toDbError(error.err, 'query'))
 							else resolve({ rows, rowsAffected: hasDml ? dmlTotal : undefined })
-						})
+						}
+						// 'done' is not guaranteed to follow every failure in every mssql
+						// release: if it never arrives, waiting for it would strand the
+						// transaction forever. Arm a short fallback — if 'done' does not free
+						// the connection in time, rip the socket (the same teardown an abort
+						// performs, so the finally's pool.close() does not wait on a connection
+						// the driver never releases) and reject as 'query'.
+						const armFallback = (): void => {
+							if (settled || fallback !== undefined) return
+							fallback = setTimeout(() => {
+								fallback = undefined
+								if (settled) return
+								settled = true
+								teardown()
+								reject(toDbError(error.err ?? new Error('mssql: statement failed and the driver never emitted done'), 'query'))
+							}, 1000)
+						}
+						req.on('error', (err: Error) => { error.err = err; armFallback() })
+						req.on('done', () => settleDone())
 						// Some mssql releases reject the query() promise on a stream error
 						// (before 'done' frees the connection); rejecting here would run the
 						// rollback below on a connection the failed request still holds. Record
 						// it and let the 'done' listener reject once the connection is free.
-						req.query(q).catch((err) => { error.err = err })
+						req.query(q).catch((err) => { error.err = err; armFallback() })
 					})
 				}
 				// The callback's resolved value is the transaction's result: it is only
