@@ -8,13 +8,5 @@ distjs/
 .connect.json
 
 # проверки opus
-review1.md
-review2.md
-review3.md
-review4.md
-review5.md
-review6.md
-review7.md
-review8.md
-review9.md
+review*.md
 DECISIONS.md

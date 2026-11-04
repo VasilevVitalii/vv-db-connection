@@ -149,13 +149,16 @@ function watchConnection(db: Firebird.Database, onLost: (error: TDbError) => voi
 	// The typings leave out that Database is an EventEmitter.
 	const events: any = db
 	const conn: any   = events.connection
-	events.on('error', (err: unknown) => onLost({ message: `fb: connection lost: ${String(err)}`, kind: 'query' }))
-	events.on('reconnect', () => onLost({ message: 'fb: connection lost, the driver reattached on its own', kind: 'query' }))
+	// A `code` tags these as real database errors: a bare {message, kind} literal would
+	// fail isDbError() (no code/stack) and be re-labelled 'user', which breaks the retry
+	// contract (query errors are retried, user errors are not).
+	events.on('error', (err: unknown) => onLost({ message: `fb: connection lost: ${String(err)}`, kind: 'query', code: 'FB_CONN_LOST' }))
+	events.on('reconnect', () => onLost({ message: 'fb: connection lost, the driver reattached on its own', kind: 'query', code: 'FB_CONN_LOST' }))
 	conn?._socket?.on('close', () => {
 		// Set by our own detach at the end of the query - a close that was asked for.
 		if (conn._isDetach) return
 		clearTimeout(conn._retry_connection_id)
-		onLost({ message: 'fb: connection lost', kind: 'query' })
+		onLost({ message: 'fb: connection lost', kind: 'query', code: 'FB_CONN_LOST' })
 	})
 }
 
@@ -460,6 +463,11 @@ export class FbAdapter implements IDbAdapter {
 					return { ok: false, error: connLost }
 				}
 				try {
+					// The deadline may already have fired while cb was still running: if
+					// the signal is aborted, do NOT commit - the caller already holds
+					// 'timeout'/'aborted' and a commit now would double-apply on retry.
+					// This is the deterministic backstop (teardown is best-effort).
+					if (signal.aborted) return { ok: false, error: abortError(signal.reason) }
 					// The COMMIT phase is bounded by a hard timer (armCommitDeadline) that
 					// reports an ambiguous outcome (COMMIT_TIMEOUT) rather than 'timeout': the
 					// server may already have committed, so a plain timeout would make a

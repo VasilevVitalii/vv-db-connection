@@ -101,3 +101,20 @@ test('an already-aborted external signal settles at once without running the bod
 	if (!r.ok) assert.equal(r.error.kind, 'aborted')
 	assert.equal(ran, false)
 })
+
+// review9 §2.2: armCommitDeadline() called after the race already settled (the deadline
+// fired while the body ignored the signal) must not arm a fresh timer - cleanup() has
+// already run, so a new timer would outlive the call and keep the event loop alive.
+test('withTxTimeout: armCommitDeadline after the deadline is a no-op', async () => {
+	const r = await withTxTimeout<unknown>(20, async (_signal, armCommitDeadline) => {
+		// Run past the deadline (20ms) without reacting to the abort, like an adapter
+		// whose cb ignores the signal and still reaches the commit phase.
+		await new Promise<void>((resolve) => { setTimeout(resolve, 40) })
+		// The adapter would call this before commit. It must neither throw nor arm a
+		// timer now that the race is settled.
+		armCommitDeadline()
+		return { ok: true as const, result: undefined }
+	})
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'timeout')
+})

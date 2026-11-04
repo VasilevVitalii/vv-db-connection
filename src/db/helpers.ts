@@ -80,6 +80,11 @@ export function withTxTimeout<T>(
 		// ambiguous outcome (kind 'tx', code 'COMMIT_TIMEOUT') instead. The external abort
 		// signal is NOT cleared - the caller can still abort the transaction.
 		const armCommitDeadline = (): void => {
+			// The race is already settled (the deadline or an external abort fired while cb
+			// was still running): do not arm a fresh timer - cleanup() has run, so it would
+			// outlive the call, keep the event loop alive for timeoutMs and re-abort a dead
+			// controller.
+			if (settled) return
 			if (timer) clearTimeout(timer)
 			if (!hasDeadline) { timer = undefined; return }
 			timer = setTimeout(() => {

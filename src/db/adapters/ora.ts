@@ -463,7 +463,10 @@ export class OraAdapter implements IDbAdapter {
 								try {
 									rows = await res.resultSet.getRows()
 								} finally {
-									await res.resultSet.close()
+									// A close() failure must not mask a getRows() error (the row
+									// read is the real failure); best-effort close, as in
+									// readImplicitResults.
+									try { await res.resultSet.close() } catch { }
 								}
 							} else {
 								rows = (res.rows ?? []) as Record<string, unknown>[]
@@ -492,6 +495,11 @@ export class OraAdapter implements IDbAdapter {
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
 				}
 				try {
+					// The deadline may already have fired while cb was still running: if
+					// the signal is aborted, do NOT commit - the caller already holds
+					// 'timeout'/'aborted' and a commit now would double-apply on retry.
+					// This is the deterministic backstop (teardown is best-effort).
+					if (signal.aborted) return { ok: false, error: abortError(signal.reason) }
 					// The COMMIT phase is bounded by a hard timer (armCommitDeadline) that
 					// reports an ambiguous outcome (COMMIT_TIMEOUT) rather than 'timeout': the
 					// server may already have committed, so a plain timeout would make a

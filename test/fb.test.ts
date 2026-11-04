@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { createRequire } from 'node:module'
 import { loadConnections, reachable, runDbSuite, connHost, connPort } from './helpers'
 import { DbConnection } from '../src/index'
@@ -176,4 +177,39 @@ test('fb: aborting execStream during a stuck attach tears the socket down', asyn
 
 	assert.equal(destroyed, 1, 'the in-flight attach socket must be ripped on abort')
 	assert.equal(events[events.length - 1]?.kind, 'finish')
+})
+
+// review9 §1.2: a lost connection inside a transaction used to be re-labelled 'user'
+// (the {message, kind} literal carried no code/stack, so isDbError() said false). The
+// loss now carries code 'FB_CONN_LOST' and stays kind 'query', so retry logic sees it.
+test('fb: a connection lost in a transaction is classified as query, not user', async (t) => {
+	const fakeDb = new EventEmitter() as EventEmitter & Record<string, unknown>
+	const fakeSocket = Object.assign(new EventEmitter(), { destroy: (): void => {} })
+	const fakeDbConn = { _isDetach: false, _retry_connection_id: undefined, _socket: fakeSocket }
+	fakeDb.connection = fakeDbConn
+	const fakeTx = {
+		queryAsync: async (): Promise<unknown> => ({ rows: [], recordCounts: undefined }),
+		commit: (cb: (e: unknown) => void): void => cb(null),
+		rollback: (cb: () => void): void => cb(),
+	}
+	fakeDb.transaction = (_iso: unknown, cb: (e: unknown, t: unknown) => void): void => cb(null, fakeTx)
+
+	t.mock.method(fbLive, 'attach', (_options: unknown, cb: (err: unknown, db: unknown) => void) => {
+		fbLive.connection = fakeDbConn
+		cb(null, fakeDb)
+	})
+
+	const adapter = new FbAdapter({ kind: 'fb', host: '127.0.0.1', database: '/tmp/x.fdb', user: 'u', password: 'p' } as TConnFb)
+	const r = await adapter.execTxDynamic(async (exec) => {
+		// Lose the connection mid-transaction, then run a statement on it.
+		fakeDb.emit('error', new Error('socket hang up'))
+		await exec('SELECT 1 FROM rdb$database', [])
+		return undefined
+	})
+
+	assert.equal(r.ok, false)
+	if (!r.ok) {
+		assert.equal(r.error.kind, 'query')
+		assert.equal(r.error.code, 'FB_CONN_LOST')
+	}
 })

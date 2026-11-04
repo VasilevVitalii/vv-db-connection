@@ -119,6 +119,39 @@ test('pg: execTxDynamic releases the pool client when the deadline fires during 
 	assert.equal(destroyed, 1)
 })
 
+// review9 §1.1: a cb that ignores the abort and still resolves must not reach COMMIT -
+// the caller already holds 'timeout' and a commit would double-apply on retry. The guard
+// is the deterministic backstop (mssql's teardown is best-effort, so it cannot be the only
+// line of defence).
+test('pg: a cb that resolves after the deadline does not commit', async (t) => {
+	let commits = 0
+	let rollbacks = 0
+	const fakeClient = {
+		on(): void {},
+		removeListener(): void {},
+		release(): void {},
+		connection: { stream: { destroy(): void {} } },
+		query: async (arg: unknown): Promise<unknown> => {
+			const text = typeof arg === 'string' ? arg : (arg as { text?: string }).text
+			if (text === 'COMMIT') commits += 1
+			if (text === 'ROLLBACK') rollbacks += 1
+			return { rows: [], rowCount: null, command: text }
+		},
+	}
+	t.mock.method(Pool.prototype, 'connect', async () => fakeClient as unknown as PoolClient)
+
+	const adapter = new PgAdapter({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
+	const r = await adapter.execTxDynamic(async (_exec, signal) => {
+		await new Promise<void>((resolve) => { signal.addEventListener('abort', () => resolve(), { once: true }) })
+		return undefined
+	}, 30)
+
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'timeout')
+	assert.equal(commits, 0, 'COMMIT must not be sent after the deadline fired')
+	assert.equal(rollbacks, 0, 'no ROLLBACK either: teardown owns the connection on abort')
+})
+
 // review3 follow-up (MaxListenersExceededWarning): the pool reuses the same PoolClient,
 // so the error listener added by execStream must be removed before release(), or it
 // accumulates one per query and trips the default 10-listener cap. Exercise more
