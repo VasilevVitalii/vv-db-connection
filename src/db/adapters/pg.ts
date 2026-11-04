@@ -297,6 +297,7 @@ export class PgAdapter implements IDbAdapter {
 			try {
 				await client.query('BEGIN')
 				const exec = async (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
+					if (signal.aborted) throw abortError(signal.reason)
 					let q: ReturnType<typeof buildQuery>
 					try {
 						q = buildQuery(query, params)

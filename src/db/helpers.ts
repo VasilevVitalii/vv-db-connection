@@ -110,7 +110,7 @@ export function withTxTimeout<T>(
 		if (hasDeadline) {
 			timer = setTimeout(() => {
 				controller.abort(new TxTimeout())
-				settle({ ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } })
+				settle({ ok: false, error: { message: 'TIMEOUT', kind: 'timeout', code: 'TIMEOUT' } })
 			}, timeoutMs)
 		}
 		external?.addEventListener('abort', onExternalAbort, { once: true })

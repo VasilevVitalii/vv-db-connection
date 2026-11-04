@@ -270,6 +270,10 @@ export class MssqlAdapter implements IDbAdapter {
 				await tx.begin()
 				const transaction = tx
 				const exec = async (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
+					// Contract (types.ts TDbTxExec): once the signal is aborted the
+					// connection is being torn down, so exec() rejects rather than run
+					// a statement on it (deterministic, not just via the socket teardown).
+					if (signal.aborted) throw abortError(signal.reason)
 					const req = new sql.Request(transaction)
 					let q: string
 					try {

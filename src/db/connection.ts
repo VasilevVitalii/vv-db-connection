@@ -82,6 +82,10 @@ export function dbTitle(c: TConnectionParam): string {
 		case 'pg':    return `${c.host}:${c.port ?? 5432} [${c.database}]`
 		case 'ora':   return `${c.host}:${c.port ?? 1521} [${c.service}]`
 		case 'fb':    return `${c.host}:${c.port ?? 3050} [${c.database}]`
+		// An unknown kind (DbConnection accepts one - see dbconnection.test.ts) must still
+		// yield a string, not undefined: the declared return type is string. At the type
+		// level the switch is exhaustive (c narrows to never), so cast for the runtime path.
+		default: return (c as { kind: string }).kind
 	}
 }
 
@@ -91,5 +95,6 @@ export function dbUser(c: TConnectionParam): string {
 		case 'pg':    return c.user
 		case 'ora':   return c.user
 		case 'fb':    return c.user
+		default: return ''
 	}
 }

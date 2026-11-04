@@ -39,9 +39,14 @@ export type TDbRes = {
 // A structured error: `kind` tells what happened, `code` keeps the driver's own code
 // (SQLSTATE for pg, ORA-xxxxx / NJS-xxxx for oracle, SQL Server number for mssql,
 // gdscode for firebird), and `message` is the human text. Two failures are told apart by
-// `code`/`kind`, not by parsing `message`. In a transaction: 'tx' is the begin/commit
-// itself failing, 'query' is a statement failing, 'user' is the transaction callback's
-// own code throwing - so a retry loop can tell "my bug" from "the database said no".
+// `code`/`kind`, not by parsing `message`. The library itself also emits a small fixed
+// set of synthetic codes (never a driver code): 'TIMEOUT' (deadline/idle expiry),
+// 'ABORTED' (an external abort), 'COMMIT_TIMEOUT' (the commit deadline fired and the
+// outcome is unknown), 'FB_CONN_LOST' (a firebird connection died mid-work) and
+// 'NO_VERSION' (version()/ping() got no row back). In a transaction: 'tx' is the
+// begin/commit itself failing, 'query' is a statement failing, 'user' is the transaction
+// callback's own code throwing - so a retry loop can tell "my bug" from "the database
+// said no".
 export type TDbErrorKind = 'connect' | 'query' | 'tx' | 'user' | 'timeout' | 'aborted'
 export type TDbError = {
 	message: string

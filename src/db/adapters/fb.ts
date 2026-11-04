@@ -421,6 +421,7 @@ export class FbAdapter implements IDbAdapter {
 				})
 				const transaction = tx
 				const exec = async (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
+					if (signal.aborted) throw abortError(signal.reason)
 					// A connection already lost has no valid statement handle: fail now
 					// rather than let queryAsync reattach in the background.
 					if (connLost) throw connLost

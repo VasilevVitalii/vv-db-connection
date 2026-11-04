@@ -104,6 +104,8 @@ Fires the callback incrementally as data arrives — for large result sets where
 
 A query that goes silent is cut off on every database: no data within `firstDataTimeoutMs` after the query was sent, or no new data within `idleTimeoutMs` after the previous portion, ends it with `finish` carrying a `{ kind: 'timeout', ... }` error, and the call returns at once. The adapter is told to drop its connection (an `AbortSignal`) and is not waited for, so a driver stuck in its own teardown cannot hold the caller. `exec` goes through the same path and has the same limits. Both timeouts default to 12 hours.
 
+A throw from the consumer's callback is not allowed to reach the driver's event loop: it is caught and delivered as the final `finish`'s error with `kind: 'query'` (a bug in the handler reads as a retryable query failure rather than `user` — a documented choice, see `TDbErrorKind`).
+
 `exec` and `execStream` take an optional fourth argument:
 
 ```ts
@@ -132,7 +134,7 @@ Opens a transaction, hands the callback an `exec` bound to it and an `AbortSigna
 
 A failed transaction reports which side failed via `error.kind`: `connect` (getting the connection), `tx` (`BEGIN`/commit), `query` (a statement — even one whose error bubbles through the callback), or `user` (the callback threw its own error). Telling `user` from `query` matters for retry logic: retry a deadlock, not a bug in your code.
 
-`execTxDynamic` takes either a legacy positional `timeoutMs` number or a `TTxOptions` object `{ timeoutMs?, signal? }` (`0` or omitted — no deadline). A negative, `NaN` or infinite `timeoutMs` is a programming error and throws a `TypeError` (the promise rejects) rather than timing out instantly or running without a deadline. On expiry the signal aborts, the connection is torn down, and the call resolves as `{ ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } }`; an external `signal` cancels the transaction from outside and ends it as `{ ok: false, error: { ..., kind: 'aborted' } }`, mirroring `exec`.
+`execTxDynamic` takes either a legacy positional `timeoutMs` number or a `TTxOptions` object `{ timeoutMs?, signal? }` (`0` or omitted — no deadline). A negative, `NaN` or infinite `timeoutMs` is a programming error and throws a `TypeError` (the promise rejects) rather than timing out instantly or running without a deadline. On expiry the signal aborts, the connection is torn down (best-effort where the driver exposes no hard cancel — the transaction's commit is additionally blocked by a guard, so no statement runs after the deadline), and the call resolves as `{ ok: false, error: { message: 'TIMEOUT', kind: 'timeout', code: 'TIMEOUT' } }`; an external `signal` cancels the transaction from outside and ends it as `{ ok: false, error: { ..., kind: 'aborted' } }`, mirroring `exec`.
 
 The timeout deadline covers the body and its statements; the final `COMMIT` is bounded by a separate **hard timer** of the same duration. If the commit does not settle before that timer, the call resolves as `{ ok: false, error: { message: 'COMMIT outcome unknown', kind: 'tx', code: 'COMMIT_TIMEOUT' } }` — an **ambiguous outcome**: the server may already have committed, so a retry after it must be idempotent. An external `signal` aborts the transaction at any point, including mid-commit, and ends it as `{ kind: 'aborted' }`; there too the commit may already have landed. The same applies to `execStream`: a DML runs `autoCommit`, so an abort after the statement was sent does not guarantee a rollback.
 
@@ -217,6 +219,7 @@ type TDbErrorKind = 'connect' | 'query' | 'tx' | 'user' | 'timeout' | 'aborted'
 type TDbError = {
   message: string
   code?: string   // driver code: SQLSTATE (pg), ORA-xxxxx / NJS-xxxx (ora), SQL Server number (mssql), gdscode (fb)
+                  // — or a synthetic code the library emits: 'TIMEOUT', 'ABORTED', 'COMMIT_TIMEOUT', 'FB_CONN_LOST', 'NO_VERSION'
   kind: TDbErrorKind
   stack?: string  // the underlying Error's stack, when the failure came from a real Error (a driver throw)
 }
@@ -268,7 +271,7 @@ type TDbTxExec   = (query: string, params: TDbParam[]) => Promise<TDbTxResult>
 type TDbTxCb<T = void> = (exec: TDbTxExec, signal: AbortSignal) => Promise<T>
 ```
 
-Every failure is a `TDbError`: `kind` says what happened (`connect` — could not open the connection, `query` — the query failed, `tx` — `BEGIN`/commit failed, `user` — the callback threw its own error, `timeout` — no data in time, `aborted` — an external `signal` fired), `code` carries the driver's own error code, and `message` the human text. Failures are told apart by `code`/`kind`, not by parsing `message`.
+Every failure is a `TDbError`: `kind` says what happened (`connect` — could not open the connection, `query` — the query failed, `tx` — `BEGIN`/commit failed, `user` — the callback threw its own error, `timeout` — no data in time, `aborted` — an external `signal` fired), `code` carries the driver's own error code — or a synthetic one the library emits (`TIMEOUT`, `ABORTED`, `COMMIT_TIMEOUT`, `FB_CONN_LOST`, `NO_VERSION`) — and `message` the human text. Failures are told apart by `code`/`kind`, not by parsing `message`.
 
 Unlike `exec`, a statement inside a transaction returns a single set of rows — no schema and no multi-result-set handling, apart from Oracle `implicitResults`, which arrive as separate `{ schema, rows }` sets (see `execTxDynamic`). A DML statement reports `rowsAffected` even when 0 rows matched (`0`, not unset); a mixed batch (a DML followed by a `SELECT`) reports only the DML's count, since the `SELECT`'s returned rows are not a "rows affected" count. On MSSQL, `SET NOCOUNT ON` also suppresses the per-statement count for `SELECT`s, so a NOCOUNT-suppressed `SELECT` followed by a DML that changes exactly as many rows as the `SELECT` returned is indistinguishable and resolves to the `SELECT` — a documented edge case.
 

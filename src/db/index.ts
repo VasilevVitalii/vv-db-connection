@@ -286,7 +286,7 @@ export class DbConnection {
 		if (res.ok) {
 			const firstRow = res.result[0]?.rows[0]
 			if (firstRow) return { ok: true, result: String(Object.values(firstRow)[0]) }
-			return { ok: false, error: { message: 'no version returned', kind: 'query' } }
+			return { ok: false, error: { message: 'no version returned', kind: 'query', code: 'NO_VERSION' } }
 		}
 		// Some servers hide the primary version source from unprivileged users (Oracle's
 		// v$version needs SELECT_CATALOG_ROLE). Fall back to a query anyone can run - but
@@ -300,7 +300,7 @@ export class DbConnection {
 				// The fallback ran (so the primary failure is not the whole story) but also
 				// returned no rows: report that instead of the primary error, which would
 				// hide the fact that the fallback actually succeeded and came back empty.
-				return { ok: false, error: { message: 'no version returned (fallback returned no rows)', kind: 'query' } }
+				return { ok: false, error: { message: 'no version returned (fallback returned no rows)', kind: 'query', code: 'NO_VERSION' } }
 			} else {
 				// Both the primary and the fallback failed: report the primary error and
 				// keep the fallback's own reason too, instead of hiding it.

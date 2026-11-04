@@ -352,6 +352,11 @@ export class OraAdapter implements IDbAdapter {
 								// result carrying the affected count and out-parameters.
 								emitOwn()
 							}
+							// If isRowQuery misjudged (a SELECT behind an unrecognized prefix)
+							// res.resultSet holds an unread cursor. Close it best-effort so rows
+							// are not silently dropped and the server cursor does not leak
+							// (mirrors the tx path, which always closes its result set).
+							try { await res.resultSet?.close() } catch { /* best-effort */ }
 							finish()
 						})
 						.catch((err) => finish(toDbError(err, 'query')))
@@ -444,6 +449,8 @@ export class OraAdapter implements IDbAdapter {
 			}
 			try {
 				const exec = (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
+					// ora's exec is not async, so the abort rejection is explicit.
+					if (signal.aborted) return Promise.reject(abortError(signal.reason))
 					let q: ReturnType<typeof buildQuery>
 					try {
 						q = buildQuery(query, params)

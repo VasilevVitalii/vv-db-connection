@@ -152,6 +152,34 @@ test('pg: a cb that resolves after the deadline does not commit', async (t) => {
 	assert.equal(rollbacks, 0, 'no ROLLBACK either: teardown owns the connection on abort')
 })
 
+// review10 §2.1: exec() after the deadline must reject deterministically, not rely on the
+// socket teardown. A cb that ignores the abort and calls exec again after the deadline must
+// see a rejection (kind 'timeout'), not a statement run on the torn-down transaction.
+test('pg: exec inside a transaction rejects after the deadline', async (t) => {
+	const fakeClient = {
+		on(): void {},
+		removeListener(): void {},
+		release(): void {},
+		connection: { stream: { destroy(): void {} } },
+		query: async (arg: unknown): Promise<unknown> => {
+			const text = typeof arg === 'string' ? arg : (arg as { text?: string }).text
+			return { rows: [], rowCount: null, command: text }
+		},
+	}
+	t.mock.method(Pool.prototype, 'connect', async () => fakeClient as unknown as PoolClient)
+
+	const adapter = new PgAdapter({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
+	const r = await adapter.execTxDynamic(async (exec, signal) => {
+		await new Promise<void>((resolve) => { signal.addEventListener('abort', () => resolve(), { once: true }) })
+		// After the deadline the transaction is torn down; exec must reject, not run.
+		await assert.rejects(() => exec('SELECT 1', []), (err: unknown) => (err as { kind?: string }).kind === 'timeout')
+		return undefined
+	}, 30)
+
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'timeout')
+})
+
 // review3 follow-up (MaxListenersExceededWarning): the pool reuses the same PoolClient,
 // so the error listener added by execStream must be removed before release(), or it
 // accumulates one per query and trips the default 10-listener cap. Exercise more
