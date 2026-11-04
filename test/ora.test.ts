@@ -324,6 +324,32 @@ test('ora: pool stays healthy after repeated mid-transaction aborts', { skip }, 
 	if (r2.ok) assert.equal(Object.values(r2.result[0]!.rows[0] as Record<string, unknown>)[0], 1)
 })
 
+// review15 2.2 (live): an abort that lands between statements has nothing in flight, so
+// the teardown must release the connection without break() - break() on an idle session
+// leaves it cancelled, and the next statement it serves answers ORA-01013. poolMax 1 makes
+// the leak impossible to hide: the same (only) session must come back clean.
+test('ora: an abort between statements leaves the pool clean (idle break would poison it)', { skip }, async (t) => {
+	const oraConn = { ...(conn as TConnOra), poolMax: 1 } as TConnOra
+	const db = new DbConnection(oraConn)
+	t.after(async () => { await db.close() })
+
+	const controller = new AbortController()
+	const r = await db.execTxDynamic(async (exec) => {
+		await exec('SELECT 1 AS p FROM dual', [])  // completes; the connection is now idle
+		controller.abort(new Error('cancel'))      // abort while idle, between statements
+		await exec('SELECT 2 AS p FROM dual', [])  // rejects: the signal is already aborted
+	}, { signal: controller.signal })
+
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'aborted')
+
+	// The torn-down connection is back in the pool. On the old code break() fired on
+	// the idle session, leaving it cancelled so this next statement answers ORA-01013.
+	const r2 = await db.exec('SELECT 1 AS p FROM dual', [])
+	assert.equal(r2.ok, true, r2.ok ? '' : r2.error.message)
+	if (r2.ok) assert.equal(Object.values(r2.result[0]!.rows[0] as Record<string, unknown>)[0], 1)
+})
+
 // review3 §2.6: :new/:old are trigger correlation names only inside a CREATE [OR REPLACE]
 // TRIGGER, in any case. Outside a trigger they are ordinary bind names, so :old/:new must
 // still bind instead of being silently skipped (the server would answer ORA-01008).
