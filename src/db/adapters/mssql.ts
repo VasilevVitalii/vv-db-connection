@@ -4,7 +4,7 @@ import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, T
 import type { TConnMssql } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM_MSSQL } from '../placeholders'
-import { toDbError, isDbError, withTxTimeout, abortError } from '../helpers'
+import { toDbError, isDbError, withTxTimeout, abortError, assertTimeoutMs } from '../helpers'
 
 // Converts :name placeholders to @name for mssql named parameters. A colon inside a
 // string literal, a quoted identifier or a comment is left as it is, and a bracket-quoted
@@ -47,17 +47,26 @@ export function mssqlInput(request: sql.Request, p: TDbParam): void {
 	else request.input(p.name, mssqlType(p.type), p.value)
 }
 
-export function toSchema(columns: Record<string, any>): TDbCol[] {
-	return Object.values(columns).map((c: any) => ({
-		name:      c.name,
-		// c.type is the type constructor (sql.Int, sql.VarChar, ...): its .name is the
-		// type name. Calling it, c.type(), builds a declaration object ({ type, length })
-		// that has no .name - the old code did that and reported 'unknown' for every column.
-		kind:      (typeof c.type === 'function' ? c.type.name : c.type?.name) ?? 'unknown',
-		len:       c.length,
-		scale:     c.scale,
-		precision: c.precision,
-	}))
+export function toSchema(columns: Record<string, unknown>): TDbCol[] {
+	return Object.values(columns).map((raw) => {
+		const c = raw as {
+			name?: string
+			type?: { name?: string } | (() => { name?: string })
+			length?: number
+			scale?: number
+			precision?: number
+		}
+		return {
+			name:      c.name ?? '',
+			// c.type is the type constructor (sql.Int, sql.VarChar, ...): its .name is the
+			// type name. Calling it, c.type(), builds a declaration object ({ type, length })
+			// that has no .name - the old code did that and reported 'unknown' for every column.
+			kind:      (typeof c.type === 'function' ? c.type.name : c.type?.name) ?? 'unknown',
+			len:       c.length,
+			scale:     c.scale,
+			precision: c.precision,
+		}
+	})
 }
 
 function buildPoolConfig(p: TConnMssql): sql.config {
@@ -80,7 +89,9 @@ function buildPoolConfig(p: TConnMssql): sql.config {
 }
 
 export class MssqlAdapter implements IDbAdapter {
-	constructor(private readonly p: TConnMssql) {}
+	constructor(private readonly p: TConnMssql) {
+		assertTimeoutMs('mssql: connectTimeout', p.connectTimeout)
+	}
 
 	// One pool per adapter, created lazily and reused across execStream calls. Building
 	// a fresh ConnectionPool per query renegotiated TCP/TLS + login every time; connect()
@@ -109,10 +120,16 @@ export class MssqlAdapter implements IDbAdapter {
 		// Validate params and rewrite the query before connecting: buildMssqlQuery and
 		// mssqlInput throw on a missing/out/inout/unknown-type param. Doing it here means
 		// the failure never holds a pool slot, and no abort listener is left dangling on a
-		// request that was never sent. A throw here rejects the call, which DbConnection
-		// turns into a finish event.
-		const q = buildMssqlQuery(query, params)
-		for (const p of params) assertMssqlParam(p)
+		// request that was never sent. Like pg and fb, a build failure ends the call with a
+		// finish event rather than a rejection.
+		let q: string
+		try {
+			q = buildMssqlQuery(query, params)
+			for (const p of params) assertMssqlParam(p)
+		} catch (err) {
+			callback({ kind: 'finish', error: toDbError(err, 'query') })
+			return
+		}
 
 		let pool: sql.ConnectionPool
 		try {
@@ -137,7 +154,6 @@ export class MssqlAdapter implements IDbAdapter {
 
 			const onAbort = (): void => {
 				if (done) return
-				done = true
 				// Tear the borrowed connection down hard. cancel() only sends an ATTN and
 				// waits for a server response that may never come, which strands the tarn
 				// slot forever (contract: "tear down without waiting"). Destroying the socket
@@ -147,7 +163,9 @@ export class MssqlAdapter implements IDbAdapter {
 					if (conn) conn.close()
 					else request.cancel()
 				} catch {}
-				resolve()
+				// A mid-query abort must still end the call with a finish, exactly as the
+				// early-abort branch does - the contract is one finish per call.
+				settle(abortError(signal?.reason))
 			}
 			// Ends the request: hands the error (if any) to the callback and resolves the
 			// stream. The abort handler and the done/error events all funnel through here.
@@ -164,23 +182,36 @@ export class MssqlAdapter implements IDbAdapter {
 			// a SELECT reports the number of rows it returned, a DML the rows it changed -
 			// numerically indistinguishable. The reliable way to tell them apart is the
 			// `recordset` event, which only a SELECT emits before its rows. So a
-			// `rowsaffected` that follows an unclosed `recordset` belongs to that SELECT
-			// (its rows are already emitted); one without a pending `recordset` is a DML and
-			// becomes its own empty-schema result. This keeps DML results in statement order
-			// and cannot be confused by equal counts (the old `done`-side value matching
-			// dropped a DML whose count collided with a SELECT's row count, e.g. UPDATE; SELECT).
+			// A SELECT is delimited by its `recordset`/`row` pair; the `rowsaffected` that
+			// follows belongs to that SELECT and equals the rows it emitted, so it is
+			// dropped (those rows were already delivered). A `rowsaffected` without a
+			// pending `recordset` is a DML and becomes its own empty-schema result.
+			// Under SET NOCOUNT ON a SELECT emits no rowsaffected at all (the count is
+			// suppressed together with DML counts), so the next DML's count arrives while
+			// `inSelect` is still set; comparing it against the emitted row count recovers
+			// the DML. A SELECT's count always equals its row count, so the only ambiguous
+			// case is a NOCOUNT-suppressed SELECT followed by a DML affecting exactly as
+			// many rows — that resolves to the SELECT and drops the DML (accepted edge).
 			let inSelect = false
+			let selectRows = 0
 
 			request.on('recordset', (columns: Record<string, unknown>) => {
 				inSelect = true
+				selectRows = 0
 				if (!done) callback({ kind: 'schema', schema: toSchema(columns) })
 			})
 			request.on('row', (row: object) => {
+				if (inSelect) selectRows += 1
 				if (!done) callback({ kind: 'row', row: row as Record<string, unknown> })
 			})
 			request.on('rowsaffected', (count: number) => {
+				if (done) return
 				if (inSelect) {
-					inSelect = false // SELECT: its schema+rows were already emitted above
+					inSelect = false
+					if (typeof count === 'number' && count !== selectRows) {
+						callback({ kind: 'schema', schema: [] })
+						callback({ kind: 'rowsAffected', count })
+					}
 				} else if (typeof count === 'number') {
 					callback({ kind: 'schema', schema: [] })
 					callback({ kind: 'rowsAffected', count })
@@ -253,18 +284,22 @@ export class MssqlAdapter implements IDbAdapter {
 						throw toDbError(err, 'query')
 					}
 					return req.query(q).then(
-						(res) => ({
-							rows:         (res.recordset ?? []) as Record<string, unknown>[],
-							// DML only (TDbRes.rowsAffected contract): a SELECT's recordset
-							// carries the rows and mssql's rowsAffected array doubles as its
-							// row count, so leave rowsAffected unset for a result set. A batch
-							// of several DML statements reports one count each; sum them so
-							// INSERT; UPDATE; DELETE inside one call totals the real row change
-							// instead of dropping everything after the first statement.
-							rowsAffected: res.recordset === undefined
-								? res.rowsAffected?.reduce((sum, n) => sum + n, 0) || undefined
-								: undefined,
-						}),
+						(res) => {
+							const total = res.rowsAffected?.reduce((sum, n) => sum + n, 0) ?? 0
+							const selectRows = (res.recordset ?? []).length
+							// DML only (TDbRes.rowsAffected contract). mssql's rowsAffected
+							// array reports one count per statement, and a SELECT's entry
+							// doubles as its returned-row count. A lone SELECT therefore leaves
+							// the count unset; a batch that mixes DML with SELECT reports the
+							// sum of the DML counts (total minus returned rows).
+							const rowsAffected = res.recordset === undefined
+								? (res.rowsAffected && res.rowsAffected.length > 0 ? total : undefined)
+								: (total > selectRows ? total - selectRows : undefined)
+							return {
+								rows:         (res.recordset ?? []) as Record<string, unknown>[],
+								rowsAffected,
+							}
+						},
 						// Tag the failure as a DB query error so it stays 'query' even when
 						// it bubbles through the user's callback (which may re-throw it).
 						(err) => { throw toDbError(err, 'query') },
@@ -277,19 +312,19 @@ export class MssqlAdapter implements IDbAdapter {
 				try {
 					result = await cb(exec, signal)
 				} catch (err) {
-					try { await transaction.rollback() } catch {}
+					if (!signal.aborted) { try { await transaction.rollback() } catch {} }
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
 				}
 				try {
 					await transaction.commit()
 				} catch (err) {
-					try { await transaction.rollback() } catch {}
+					if (!signal.aborted) { try { await transaction.rollback() } catch {} }
 					return { ok: false, error: toDbError(err, 'tx') }
 				}
 				return { ok: true, result }
 			} catch (err) {
 				// begin() failing is the only thing that reaches here now.
-				if (tx) { try { await tx.rollback() } catch {} }
+				if (tx && !signal.aborted) { try { await tx.rollback() } catch {} }
 				return { ok: false, error: toDbError(err, 'tx') }
 			} finally {
 				signal.removeEventListener('abort', teardown)

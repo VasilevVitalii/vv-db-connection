@@ -3,7 +3,7 @@ import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbRes, TDbStreamEvent, TD
 import type { TConnOra } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM_ORA } from '../placeholders'
-import { toDbError, isDbError, withTxTimeout, abortError } from '../helpers'
+import { toDbError, isDbError, withTxTimeout, abortError, assertTimeoutMs } from '../helpers'
 
 type OraMetadata = { name: string; dbTypeName: string; byteSize?: number; scale?: number; precision?: number }
 type OraBindValue = oracledb.BindParameter | string | number | bigint | Date | Buffer | null | undefined
@@ -148,7 +148,9 @@ export function isRowQuery(sql: string): boolean {
 }
 
 export class OraAdapter implements IDbAdapter {
-	constructor(private readonly p: TConnOra) {}
+	constructor(private readonly p: TConnOra) {
+		assertTimeoutMs('ora: connectTimeout', p.connectTimeout)
+	}
 
 	versionQuery(): string { return 'SELECT banner AS ver FROM v$version WHERE rownum = 1' }
 	// v$version is hidden from users without SELECT_CATALOG_ROLE; this view is public.
@@ -177,7 +179,7 @@ export class OraAdapter implements IDbAdapter {
 	private _pool?: Promise<oracledb.Pool>
 	private pool(): Promise<oracledb.Pool> {
 		if (!this._pool) {
-			this._pool = (async () => {
+			const creating = (async () => {
 				// Privileged connections (SYSDBA & co) are only supported by the pool in
 				// Thin mode; a Thick-mode pool silently drops the privilege. Fail loudly
 				// instead of handing back a connection that is not actually privileged.
@@ -191,14 +193,21 @@ export class OraAdapter implements IDbAdapter {
 					poolIncrement: this.p.poolIncrement ?? 1,
 					...(this.p.queueTimeout !== undefined ? { queueTimeout: this.p.queueTimeout } : {}),
 				})
-			})().catch((err) => {
-				// A transient createPool failure (network down, misconfiguration, the
-				// Thick-mode check above) must not be cached forever: clear the promise so
-				// the next call retries instead of replaying the same stale rejection until
-				// close(). Mirrors DbConnection._adapter's non-caching failure.
-				this._pool = undefined
-				throw err
-			})
+			})()
+			this._pool = creating
+			// A transient createPool failure (network down, misconfiguration, the
+			// Thick-mode check above) must not be cached forever: clear the promise so
+			// the next call retries instead of replaying the same stale rejection until
+			// close(). Mirrors DbConnection._adapter's non-caching failure. Only clear it
+			// while the field still points at this attempt: a close() during the
+			// createPool's flight resets the field and a new pool may be created since, so
+			// clearing then would drop the new pool's reference and leak it.
+			creating.then(
+				() => {},
+				() => {
+					if (this._pool === creating) this._pool = undefined
+				},
+			)
 		}
 		return this._pool
 	}
@@ -217,9 +226,16 @@ export class OraAdapter implements IDbAdapter {
 	async execStream(query: string, params: TDbParam[], callback: (event: TDbStreamEvent) => void, signal?: AbortSignal): Promise<void> {
 		// Rewrite and validate the query before touching the pool: a "param not found" (or
 		// any other build error) must never hold a pool slot, matching fb validating before
-		// its attach. A throw here rejects the call, which DbConnection turns into a finish
-		// event without a connection ever being acquired.
-		const { sql, binds } = buildQuery(query, params)
+		// its attach. Like pg and fb, a build failure ends the call with a finish event
+		// rather than a rejection.
+		let sql: string
+		let binds: Record<string, OraBindValue>
+		try {
+			({ sql, binds } = buildQuery(query, params))
+		} catch (err) {
+			callback({ kind: 'finish', error: toDbError(err, 'query') })
+			return
+		}
 		const rowQuery = isRowQuery(sql)
 		let conn: oracledb.Connection
 		try {

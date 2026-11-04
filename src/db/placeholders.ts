@@ -29,7 +29,7 @@ const PG_ESCAPE_STRING = /(?<![\w$])[Ee]'(?:[^'\\]|\\.|'')*'/
 // back-referenced so the closer must match the opener. This is pg-only - in mssql,
 // oracle and firebird a $ is an ordinary character, so $tag$...$tag$ is code and a
 // :name inside it is still a placeholder.
-const PG_DOLLAR_QUOTE = /\$(?<tag>[A-Za-z_]\w*)?\$[\s\S]*?\$\k<tag>\$/
+const PG_DOLLAR_QUOTE = /(?<![\w$])\$(?<tag>[A-Za-z_]\w*)?\$[\s\S]*?\$\k<tag>\$/
 export const SQL_ATOM_PG = new RegExp(`${PG_ESCAPE_STRING.source}|${PG_DOLLAR_QUOTE.source}|${SQL_ATOM.source}`)
 
 // Oracle's alternative quoting: q'[text]' for any bracket, or q'XtextX' for any other
@@ -41,7 +41,7 @@ export const SQL_ATOM_PG = new RegExp(`${PG_ESCAPE_STRING.source}|${PG_DOLLAR_QU
 // never falls through to the generic named-group-with-backreference branch, and the
 // delimiter itself is a named group (?<q>.) so its backreference \k<q> cannot be knocked
 // loose by groups added to the atom this one is spliced into (SQL_ATOM_ORA).
-const ORA_Q_QUOTE = /[nN]?[qQ]'(?:\[[^\]]*\]|\{[^}]*\}|\([^)]*\)|<[^>]*>|(?<q>.)[\s\S]*?\k<q>)'/
+const ORA_Q_QUOTE = /(?<![\w$])[nN]?[qQ]'(?:\[[^\]]*\]|\{[^}]*\}|\([^)]*\)|<[^>]*>|(?<q>.)[\s\S]*?\k<q>)'/
 export const SQL_ATOM_ORA = new RegExp(`${ORA_Q_QUOTE.source}|${SQL_ATOM.source}`)
 
 // Calls fn for every :name placeholder that is real code - not inside a string literal, a

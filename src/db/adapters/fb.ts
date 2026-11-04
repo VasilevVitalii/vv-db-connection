@@ -8,7 +8,7 @@ import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, T
 import type { TConnFb } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM } from '../placeholders'
-import { toDbError, isDbError, withTxTimeout, abortError } from '../helpers'
+import { toDbError, isDbError, withTxTimeout, abortError, assertTimeoutMs } from '../helpers'
 
 // ---- monkey-patch: node-firebird@2 leaks the TCP socket on a failed attach ----
 // Connection.attach() answers an attach error with doError(err, cb) and never
@@ -173,7 +173,9 @@ function dropConnection(db: Firebird.Database): void {
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
 export class FbAdapter implements IDbAdapter {
-	constructor(private readonly p: TConnFb) {}
+	constructor(private readonly p: TConnFb) {
+		assertTimeoutMs('fb: connectTimeout', p.connectTimeout)
+	}
 
 	// node-firebird has no connection pool; each attach is closed by its own query, so
 	// nothing is held between calls to release.
@@ -438,7 +440,7 @@ export class FbAdapter implements IDbAdapter {
 				try {
 					result = await cb(exec, signal)
 				} catch (err) {
-					try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {}
+					if (!signal.aborted) { try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {} }
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
 				}
 				try {
@@ -446,13 +448,13 @@ export class FbAdapter implements IDbAdapter {
 						transaction.commit((err: Error | null) => { if (err) reject(err); else resolve() })
 					})
 				} catch (err) {
-					try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {}
+					if (!signal.aborted) { try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {} }
 					return { ok: false, error: toDbError(err, 'tx') }
 				}
 				return { ok: true, result }
 			} catch (err) {
 				// db.transaction() failing is the only thing that reaches here now.
-				if (tx) {
+				if (tx && !signal.aborted) {
 					try { await new Promise<void>((resolve) => { tx!.rollback(() => resolve()) }) } catch {}
 				}
 				return { ok: false, error: toDbError(err, 'tx') }

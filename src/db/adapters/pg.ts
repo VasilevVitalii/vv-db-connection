@@ -3,7 +3,7 @@ import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, T
 import type { TConnPg } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM_PG } from '../placeholders'
-import { toDbError, isDbError, withTxTimeout, abortError } from '../helpers'
+import { toDbError, isDbError, withTxTimeout, abortError, assertTimeoutMs } from '../helpers'
 
 // PostgreSQL RowDescription carries only the type OID, not its name. Map the built-in
 // scalar and array types to their canonical names so `kind` is readable instead of a
@@ -71,7 +71,9 @@ function buildQuery(query: string, params: TDbParam[]): { text: string; values: 
 }
 
 export class PgAdapter implements IDbAdapter {
-	constructor(private readonly p: TConnPg) {}
+	constructor(private readonly p: TConnPg) {
+		assertTimeoutMs('pg: connectTimeout', p.connectTimeout)
+	}
 
 	versionQuery(): string { return 'SELECT version() AS ver' }
 	pingQuery(): string { return 'SELECT 1 AS p' }
@@ -230,9 +232,11 @@ export class PgAdapter implements IDbAdapter {
 					client.query(q)
 				})
 			}
-			callback({ kind: 'finish' })
+			try {
+				callback({ kind: 'finish' })
+			} catch { /* the consumer's finish handler threw - nothing left to report */ }
 		} catch (err) {
-			callback({ kind: 'finish', error: toDbError(err, 'query') })
+			callback({ kind: 'finish', error: signal?.aborted ? abortError(signal.reason) : toDbError(err, 'query') })
 		} finally {
 			signal?.removeEventListener('abort', onAbort)
 			// Remove the error listener before handing the client back: the pool reuses the
@@ -307,19 +311,19 @@ export class PgAdapter implements IDbAdapter {
 				try {
 					result = await cb(exec, signal)
 				} catch (err) {
-					try { await client.query('ROLLBACK') } catch {}
+					if (!signal.aborted) { try { await client.query('ROLLBACK') } catch {} }
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
 				}
 				try {
 					await client.query('COMMIT')
 				} catch (err) {
-					try { await client.query('ROLLBACK') } catch {}
+					if (!signal.aborted) { try { await client.query('ROLLBACK') } catch {} }
 					return { ok: false, error: toDbError(err, 'tx') }
 				}
 				return { ok: true, result }
 			} catch (err) {
 				// BEGIN failing is the only thing that reaches here now.
-				try { await client.query('ROLLBACK') } catch {}
+				if (!signal.aborted) { try { await client.query('ROLLBACK') } catch {} }
 				return { ok: false, error: toDbError(err, 'tx') }
 			} finally {
 				signal.removeEventListener('abort', teardown)

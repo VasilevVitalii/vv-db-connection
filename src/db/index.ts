@@ -2,7 +2,7 @@ import type { TResult } from '../tresult'
 import type { TConnectionParam, TDbKind } from './connection'
 import { dbTitle, dbUser } from './connection'
 import type { IDbAdapter, TDbError, TDbParam, TDbRes, TDbStreamEvent, TDbTxCb, TExecOptions, TTxOptions } from './types'
-import { toDbError, assertTimeoutMs } from './helpers'
+import { toDbError, assertTimeoutMs, abortError } from './helpers'
 
 // How long a streaming query may stay silent by default: until the first data after it
 // was sent, and between one portion of data and the next. Both are overridable per call
@@ -115,13 +115,15 @@ export class DbConnection {
 		const idleTimeout  = options?.idleTimeoutMs ?? NEXT_ROW_TIMEOUT_MS
 		// Validate the silence deadlines first, before any driver is loaded: a negative,
 		// NaN or infinite value would otherwise fire at once (or never) instead of failing
-		// as the programming error it is. 0 means "no deadline for this phase". Like every
-		// other failure it ends the call with a finish, not a bare rejection.
-		try {
-			assertTimeoutMs('execStream: firstDataTimeoutMs', firstTimeout)
-			assertTimeoutMs('execStream: idleTimeoutMs', idleTimeout)
-		} catch (err) {
-			callback({ kind: 'finish', error: toDbError(err, 'query') })
+		// as the programming error it is. 0 means "no deadline for this phase". A bad value
+		// is a programming error, so it throws a TypeError exactly like execTxDynamic's
+		// timeout validation instead of being reported as a 'query' error.
+		assertTimeoutMs('execStream: firstDataTimeoutMs', firstTimeout)
+		assertTimeoutMs('execStream: idleTimeoutMs', idleTimeout)
+		// An already-aborted external signal must not even load the driver: end the call
+		// as aborted before any driver module is imported.
+		if (options?.signal?.aborted) {
+			callback({ kind: 'finish', error: abortError(options.signal.reason) })
 			return
 		}
 		let adapter: IDbAdapter
@@ -145,11 +147,6 @@ export class DbConnection {
 				: `timeout: no new data from the database within ${humanMs(ms)}`,
 			kind: 'timeout',
 		})
-		const abortedError = (reason: unknown): TDbError => ({
-			message: reason instanceof Error ? reason.message : String(reason ?? 'aborted'),
-			kind: 'aborted',
-		})
-
 		// Ends the call from here: tells the adapter to tear its connection down, hands
 		// the error to the callback and releases the race, all at once.
 		const finishEarly = (error: TDbError): void => {
@@ -203,10 +200,10 @@ export class DbConnection {
 		let onExternalAbort: (() => void) | undefined
 		if (options?.signal) {
 			if (options.signal.aborted) {
-				finishEarly(abortedError(options.signal.reason))
+				finishEarly(abortError(options.signal.reason))
 				return
 			}
-			onExternalAbort = (): void => finishEarly(abortedError(options.signal!.reason))
+			onExternalAbort = (): void => finishEarly(abortError(options.signal!.reason))
 			options.signal.addEventListener('abort', onExternalAbort, { once: true })
 		}
 

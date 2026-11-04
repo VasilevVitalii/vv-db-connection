@@ -168,6 +168,33 @@ test('mssql: a mixed SELECT; UPDATE batch keeps the DML result', async () => {
 	assert.deepEqual(affected, [3])
 })
 
+// review5 §2.3: under SET NOCOUNT ON a SELECT emits no rowsaffected, so a following
+// DML's count arrives while inSelect is still open. It must surface as a DML result,
+// not be eaten as the SELECT's own (suppressed) row count.
+test('mssql: a NOCOUNT-suppressed SELECT does not eat the following DML count', async () => {
+	class FakeRequest extends EventEmitter {
+		stream = false
+		input(): void {}
+		query(): void {
+			setImmediate(() => {
+				this.emit('recordset', { v: { name: 'v', type: sql.Int, length: 4, scale: undefined, precision: 10 } })
+				this.emit('row', { v: 1 })
+				// SELECT's rowsaffected suppressed by SET NOCOUNT ON — only the UPDATE emits one
+				this.emit('rowsaffected', 3)
+				this.emit('done', { rowsAffected: [3] })
+			})
+		}
+	}
+	const req = new FakeRequest()
+	const pool = { request: () => req }
+	const adapter = new MssqlAdapter({ kind: 'mssql', server: 'x', auth: { kind: 'mssql', user: 'u', password: 'p' } })
+	;(adapter as unknown as { _pool: unknown })._pool = { connect: async () => pool }
+	const events: { kind: string; count?: number }[] = []
+	await adapter.execStream('SET NOCOUNT ON; SELECT v FROM t; SET NOCOUNT OFF; UPDATE b SET x = 2', [], (e) => events.push(e))
+	const affected = events.filter((e) => e.kind === 'rowsAffected').map((e) => e.count)
+	assert.deepEqual(affected, [3])
+})
+
 // review3 §2.5: a lone SELECT must not emit a spurious empty-schema DML result - its
 // rowsAffected entry is the returned-row count and the rows already went out as 'row'.
 test('mssql: a lone SELECT emits no DML result', async () => {
@@ -258,19 +285,24 @@ test('mssql: param not found fails before connecting', async () => {
 	let connected = 0
 	const adapter = new MssqlAdapter({ kind: 'mssql', server: 'x', auth: { kind: 'mssql', user: 'u', password: 'p' } })
 	;(adapter as unknown as { _pool: unknown })._pool = { connect: async () => { connected += 1; throw new Error('unreachable') } }
-	await assert.rejects(adapter.execStream('SELECT :missing AS x', [], () => {}), /param not found: missing/)
+	const events: { kind: string; error?: { message?: string } }[] = []
+	await adapter.execStream('SELECT :missing AS x', [], (e) => events.push(e))
 	assert.equal(connected, 0)
+	assert.equal(events.length, 1)
+	assert.equal(events[0]!.kind, 'finish')
+	assert.match(events[0]!.error?.message ?? '', /param not found: missing/)
 })
 
 test('mssql: an out param fails before connecting', async () => {
 	let connected = 0
 	const adapter = new MssqlAdapter({ kind: 'mssql', server: 'x', auth: { kind: 'mssql', user: 'u', password: 'p' } })
 	;(adapter as unknown as { _pool: unknown })._pool = { connect: async () => { connected += 1; throw new Error('unreachable') } }
-	await assert.rejects(
-		adapter.execStream('SELECT 1 AS x', [{ name: 'x', value: 1, type: 'Int', direction: 'out' }], () => {}),
-		/mssql: out parameters are not supported/,
-	)
+	const events: { kind: string; error?: { message?: string } }[] = []
+	await adapter.execStream('SELECT 1 AS x', [{ name: 'x', value: 1, type: 'Int', direction: 'out' }], (e) => events.push(e))
 	assert.equal(connected, 0)
+	assert.equal(events.length, 1)
+	assert.equal(events[0]!.kind, 'finish')
+	assert.match(events[0]!.error?.message ?? '', /mssql: out parameters are not supported/)
 })
 
 // review4 §2.2: execStream with an already-aborted signal used to `return` silently after

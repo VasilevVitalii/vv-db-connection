@@ -29,18 +29,16 @@ test('version/ping/execTxDynamic return { ok: false } when the driver kind is un
 	assert.equal((await db.execTxDynamic(async () => {})).ok, false)
 })
 
-// review3 §2.3: a negative / NaN / infinite silence deadline is a programming error and
-// must fail up front with a finish event, not fire at once (or never) once the stream has
-// started - and not reject bare, which would bypass the finish contract.
-test('execStream ends with a finish event on a negative, NaN or infinite silence timeout', async () => {
+// review5 2.10: a negative / NaN / infinite silence deadline is a programming error and
+// must fail up front with a TypeError, exactly like execTxDynamic's timeout validation -
+// not be reported as a 'query' finish event.
+test('execStream rejects with a TypeError on a negative, NaN or infinite silence timeout', async () => {
 	const db = new DbConnection({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
 	for (const options of [{ firstDataTimeoutMs: -1 }, { idleTimeoutMs: NaN }, { idleTimeoutMs: Infinity }]) {
-		const events: TDbStreamEvent[] = []
-		await db.execStream('SELECT 1', [], (e) => events.push(e), options)
-		assert.equal(events.length, 1)
-		const e = events[0] as { kind: 'finish'; error: TDbError }
-		assert.equal(e.kind, 'finish')
-		assert.match(e.error.message, /non-negative/)
+		await assert.rejects(
+			db.execStream('SELECT 1', [], () => {}, options),
+			/must be a non-negative finite number of milliseconds/,
+		)
 	}
 })
 

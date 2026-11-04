@@ -25,8 +25,13 @@ export function toDbError(err: unknown, kind: TDbErrorKind): TDbError {
 // so a raw throw that is not a TDbError is the user's code.
 export function isDbError(err: unknown): err is TDbError {
 	if (typeof err !== 'object' || err === null) return false
-	const e = err as { message?: unknown; kind?: unknown }
-	return typeof e.message === 'string' && (e.kind === 'connect' || e.kind === 'query' || e.kind === 'tx' || e.kind === 'user' || e.kind === 'timeout' || e.kind === 'aborted')
+	const e = err as { message?: unknown; kind?: unknown; code?: unknown; stack?: unknown }
+	return typeof e.message === 'string'
+		&& (e.kind === 'connect' || e.kind === 'query' || e.kind === 'tx' || e.kind === 'user' || e.kind === 'timeout' || e.kind === 'aborted')
+		// A real TDbError carries an error identifier (toDbError folds number/gdscode/
+		// sqlState into `code`) or a stack from the underlying Error. A bare {message,
+		// kind} literal is a user throw, not a database error.
+		&& (e.code != null || e.stack != null)
 }
 
 // Runs a transaction body against a deadline and/or an external AbortSignal. The body

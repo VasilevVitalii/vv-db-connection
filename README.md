@@ -95,6 +95,7 @@ await db.execStream(query, params, (event) => {
   if (event.kind === 'schema')       { /* event.schema: TDbCol[] */ }
   if (event.kind === 'row')          { /* event.row: Record<string, unknown> */ }
   if (event.kind === 'rowsAffected') { /* event.count: number — DML only */ }
+  if (event.kind === 'outParams')    { /* event.params: Record<string, unknown> — Oracle only */ }
   if (event.kind === 'finish')       { /* event.error?: TDbError */ }
 }, { firstDataTimeoutMs: 30_000, idleTimeoutMs: 30_000 })
 ```
@@ -113,7 +114,7 @@ type TExecOptions = {
 }
 ```
 
-An external `signal` aborts the running query — the call ends with `{ kind: 'aborted', ... }`; a silence timeout ends it with `{ kind: 'timeout', ... }`. A negative, `NaN` or infinite `firstDataTimeoutMs`/`idleTimeoutMs` is a programming error: `execStream` ends at once with a `finish` carrying the error (and `exec` rejects) rather than timing out instantly or never.
+An external `signal` aborts the running query — the call ends with `{ kind: 'aborted', ... }`; a silence timeout ends it with `{ kind: 'timeout', ... }`. A negative, `NaN` or infinite `firstDataTimeoutMs`/`idleTimeoutMs` is a programming error: the call rejects with a `TypeError` — `execStream` and `exec` alike, mirroring `execTxDynamic`'s `timeoutMs` — rather than timing out instantly or never.
 
 ### `execTxDynamic` — transaction
 
@@ -171,6 +172,14 @@ db.user()   // e.g. "admin"
 
 `kind` is the discriminator of the active connection (`TDbKind`); `title` and `user` are a human-readable description for log output.
 
+The standalone helpers `dbTitle` and `dbUser` derive the same strings from a `TConnectionParam` without opening a connection (so they never load a driver module):
+
+```ts
+import { dbTitle, dbUser } from 'vv-db-connection'
+dbTitle(connection) // "localhost:5432 [mydb]"
+dbUser(connection)  // "admin"
+```
+
 ## Query parameters
 
 All methods accept named parameters in `:name` syntax, regardless of the underlying driver. Each adapter translates them to the driver's native format:
@@ -207,6 +216,7 @@ type TDbError = {
   message: string
   code?: string   // driver code: SQLSTATE (pg), ORA-xxxxx / NJS-xxxx (ora), SQL Server number (mssql), gdscode (fb)
   kind: TDbErrorKind
+  stack?: string  // the underlying Error's stack, when the failure came from a real Error (a driver throw)
 }
 
 type TDbKind = 'mssql' | 'pg' | 'ora' | 'fb' // the connection discriminator (db.kind())
@@ -258,7 +268,7 @@ type TDbTxCb<T = void> = (exec: TDbTxExec, signal: AbortSignal) => Promise<T>
 
 Every failure is a `TDbError`: `kind` says what happened (`connect` — could not open the connection, `query` — the query failed, `tx` — `BEGIN`/commit failed, `user` — the callback threw its own error, `timeout` — no data in time, `aborted` — an external `signal` fired), `code` carries the driver's own error code, and `message` the human text. Failures are told apart by `code`/`kind`, not by parsing `message`.
 
-Unlike `exec`, a statement inside a transaction returns a single set of rows — no schema and no multi-result-set handling, apart from Oracle `implicitResults`, which arrive as separate `{ schema, rows }` sets (see `execTxDynamic`).
+Unlike `exec`, a statement inside a transaction returns a single set of rows — no schema and no multi-result-set handling, apart from Oracle `implicitResults`, which arrive as separate `{ schema, rows }` sets (see `execTxDynamic`). A DML statement reports `rowsAffected` even when 0 rows matched (`0`, not unset); a mixed batch (a DML followed by a `SELECT`) reports only the DML's count, since the `SELECT`'s returned rows are not a "rows affected" count.
 
 ## Adapter notes
 

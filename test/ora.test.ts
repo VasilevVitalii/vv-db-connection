@@ -390,13 +390,17 @@ test('ora: param not found fails before acquiring a connection', async (t) => {
 		getConnection: async () => { acquired += 1; throw new Error('unreachable') },
 		close: async () => {},
 	}))
+	const events: { kind: string; error?: { message?: string } }[] = []
 	try {
 		const adapter = new OraAdapter({ kind: 'ora', host: 'h', port: 1521, service: 's', user: 'u', password: 'p' } as TConnOra)
-		await assert.rejects(adapter.execStream('SELECT :missing FROM dual', [], () => {}), /param not found: missing/)
+		await adapter.execStream('SELECT :missing FROM dual', [], (e) => events.push(e))
 	} finally {
 		m.mock.restore()
 	}
 	assert.equal(acquired, 0)
+	assert.equal(events.length, 1)
+	assert.equal(events[0]!.kind, 'finish')
+	assert.match(events[0]!.error?.message ?? '', /param not found: missing/)
 })
 
 // review3 §2.8: a PL/SQL block with DBMS_SQL.RETURN_RESULT returns its result sets in
