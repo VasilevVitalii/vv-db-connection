@@ -70,6 +70,14 @@ function buildQuery(query: string, params: TDbParam[]): { text: string; values: 
 	return { text, values }
 }
 
+// Result commands that report affected rows. Keying off this whitelist (not "!== 'SELECT'")
+// keeps FETCH/COPY/CREATE TABLE AS from surfacing a spurious count and keeps
+// INSERT..RETURNING reporting its real one.
+const DML_COMMANDS = new Set(['INSERT', 'UPDATE', 'DELETE', 'MERGE'])
+function isDmlCommand(command: string): boolean {
+	return DML_COMMANDS.has(command)
+}
+
 export class PgAdapter implements IDbAdapter {
 	constructor(private readonly p: TConnPg) {
 		assertTimeoutMs('pg: connectTimeout', p.connectTimeout)
@@ -201,9 +209,8 @@ export class PgAdapter implements IDbAdapter {
 					for (const row of rs.rows) {
 						callback({ kind: 'row', row })
 					}
-					// Report rows changed by a DML. Keying off command (not the absence of
-					// result columns) keeps INSERT..RETURNING reporting its affected count.
-					if (rs.command !== 'SELECT' && typeof rs.rowCount === 'number') {
+					// Report rows changed by a DML (whitelist, so FETCH/COPY/CTAS stay out).
+					if (isDmlCommand(rs.command) && typeof rs.rowCount === 'number') {
 						callback({ kind: 'rowsAffected', count: rs.rowCount })
 					}
 				}
@@ -223,9 +230,8 @@ export class PgAdapter implements IDbAdapter {
 						if (!schemaEmitted) {
 							callback({ kind: 'schema', schema: toSchema(result.fields ?? []) })
 						}
-						// Report rows changed by a DML. Keying off command keeps
-						// INSERT..RETURNING reporting its affected count.
-						if (result.command !== 'SELECT' && typeof result.rowCount === 'number') {
+						// Report rows changed by a DML (whitelist, so FETCH/COPY/CTAS stay out).
+						if (result.command !== undefined && isDmlCommand(result.command) && typeof result.rowCount === 'number') {
 							callback({ kind: 'rowsAffected', count: result.rowCount })
 						}
 						resolve()
@@ -296,14 +302,27 @@ export class PgAdapter implements IDbAdapter {
 						throw toDbError(err, 'query')
 					}
 					return client.query({ text: q.text, values: q.values }).then(
-						(res) => ({
-							rows:         res.rows as Record<string, unknown>[],
-							// DML only (TDbRes.rowsAffected contract): pg's rowCount also
-							// counts SELECT rows, so key off result.command - INSERT/
-							// UPDATE/DELETE/MERGE (RETURNING included) report the affected
-							// count, SELECT reports nothing.
-							rowsAffected: res.command !== 'SELECT' ? res.rowCount ?? undefined : undefined,
-						}),
+						(res) => {
+							// A parameterless multi-statement query runs the simple protocol,
+							// whose results pg delivers as an array of per-statement results
+							// (each with its own rows/command/rowCount).
+							if (Array.isArray(res)) {
+								const rows = res.flatMap((r) => r.rows ?? [])
+								const dml = res.filter((r) => isDmlCommand(r.command))
+								const affected = dml.reduce((n, r) => n + (r.rowCount ?? 0), 0)
+								return {
+									rows:         rows as Record<string, unknown>[],
+									rowsAffected: dml.length > 0 ? affected : undefined,
+								}
+							}
+							return {
+								rows:         res.rows as Record<string, unknown>[],
+								// DML only (TDbRes.rowsAffected contract): report the count for
+								// INSERT/UPDATE/DELETE/MERGE (RETURNING included), nothing for
+								// SELECT/FETCH/COPY/CTAS.
+								rowsAffected: isDmlCommand(res.command) ? res.rowCount ?? undefined : undefined,
+							}
+						},
 						// Tag the failure as a DB query error so it stays 'query' even when
 						// it bubbles through the user's callback (which may re-throw it).
 						(err) => { throw toDbError(err, 'query') },

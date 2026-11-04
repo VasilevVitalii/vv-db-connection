@@ -344,6 +344,18 @@ test('ora: a param written in two cases binds under both spellings', () => {
 	assert.deepEqual(q.binds, { V: 1, v: 1 })
 })
 
+// review8 §2.7: two params differing only by case (:V vs :v) are the same Oracle bind,
+// so a silent overwrite would be wrong - buildQuery rejects the conflict up front.
+test('ora: two params differing only by case are rejected', () => {
+	assert.throws(
+		() => buildQuery('SELECT :V AS a, :v AS b FROM dual', [
+			{ name: 'V', value: 1 },
+			{ name: 'v', value: 2 },
+		]),
+		/duplicate param \(case-insensitive\)/,
+	)
+})
+
 // review4 §2.4: the isTrigger probe missed CREATE [OR REPLACE] EDITIONABLE/NONEDITIONABLE
 // TRIGGER and the REFERENCING clause, so :new/:old inside those were treated as binds (the
 // server answers ORA-01008) and a REFERENCING NEW AS n / OLD AS o rename was never honoured

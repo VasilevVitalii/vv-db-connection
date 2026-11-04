@@ -63,6 +63,15 @@ test('an external signal aborts the transaction with kind aborted', async () => 
 	}
 })
 
+// review8 §2.15: without a deadline or an external signal the body must still settle as a
+// TResult - a throwing body reports kind 'query', never rejects the caller (symmetric with
+// the deadline path).
+test('withTxTimeout without a deadline reports a throwing body as query', async () => {
+	const r = await withTxTimeout(undefined, async () => { throw new Error('boom') })
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'query')
+})
+
 test('an already-aborted external signal settles at once without running the body', async () => {
 	const controller = new AbortController()
 	controller.abort(new Error('already'))

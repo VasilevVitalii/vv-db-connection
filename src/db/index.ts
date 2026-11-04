@@ -133,7 +133,11 @@ export class DbConnection {
 		// An already-aborted external signal must not even load the driver: end the call
 		// as aborted before any driver module is imported.
 		if (options?.signal?.aborted) {
-			callback({ kind: 'finish', error: abortError(options.signal.reason) })
+			// The finish reaches the consumer's callback too; a throw from that handler must
+			// not reject execStream (symmetric with the other finish paths).
+			try {
+				callback({ kind: 'finish', error: abortError(options.signal.reason) })
+			} catch { /* the consumer's own finish handler threw */ }
 			return
 		}
 		let adapter: IDbAdapter

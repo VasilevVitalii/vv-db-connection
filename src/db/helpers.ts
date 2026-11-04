@@ -54,8 +54,15 @@ export function withTxTimeout<T>(
 	const controller = new AbortController()
 	const hasDeadline = timeoutMs !== undefined && timeoutMs !== 0
 
-	// Neither a deadline nor an external signal: run the body directly, as before.
-	if (!hasDeadline && !external) return body(controller.signal, () => {})
+	// Neither a deadline nor an external signal: run the body directly, but keep the
+	// rejection symmetric with the deadline path - a throwing body must settle as
+	// { ok: false, kind: 'query' }, never reject the caller.
+	if (!hasDeadline && !external) {
+		return body(controller.signal, () => {}).then(
+			(r) => r,
+			(err) => ({ ok: false, error: toDbError(err, 'query') }),
+		)
+	}
 
 	// An already-aborted external signal settles the race at once without running the
 	// body - its abort event has already fired and will not fire again.

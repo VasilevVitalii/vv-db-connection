@@ -106,6 +106,14 @@ export function buildQuery(query: string, params: TDbParam[]): { sql: string; bi
 	for (const name of used) {
 		if (!params.some((p) => p.name.toLowerCase() === name.toLowerCase())) throw new Error(`ora: param not found: ${name}`)
 	}
+	// Oracle bind names are case-insensitive, so two params differing only by case (:v vs
+	// :V) would silently overwrite each other's bind - reject the conflict up front.
+	const seen = new Set<string>()
+	for (const p of params) {
+		const lower = p.name.toLowerCase()
+		if (seen.has(lower)) throw new Error(`ora: duplicate param (case-insensitive): ${p.name}`)
+		seen.add(lower)
+	}
 	const binds: Record<string, OraBindValue> = {}
 	for (const p of params) {
 		// Oracle bind names are case-insensitive: bind the value under every spelling the
