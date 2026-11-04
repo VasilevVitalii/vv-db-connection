@@ -287,3 +287,49 @@ test('execTxDynamic returns the callback value as result', async (t) => {
 	assert.equal(r.ok, true)
 	if (r.ok) assert.equal(r.result, 42)
 })
+
+// review14 2.1: some mssql releases reject the query() promise on a stream error BEFORE
+// the 'done' event frees the connection. The .catch must record the error, not reject —
+// rejecting there would run the rollback below on a connection the failed request still
+// holds (a deadlock). exec() must reject only after 'done'.
+test('execTxDynamic defers exec rejection to the done event, not the query() promise', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = { socket: { destroy() {} } }
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+
+	let doneFired = false
+	t.mock.method(sql.Request.prototype, 'query', function (this: sql.Request) {
+		return new Promise((_resolve, reject) => {
+			// Error event first, then the promise rejects (a release whose promise rejects
+			// on error), and only a later tick frees the connection via 'done'.
+			setImmediate(() => {
+				this.emit('error', new Error('boom'))
+				reject(new Error('boom'))
+				setImmediate(() => {
+					doneFired = true
+					this.emit('done', {})
+				})
+			})
+		})
+	})
+
+	const adapter = new MssqlAdapter(conn)
+	let rejectedBeforeDone = false
+	const r = await adapter.execTxDynamic(async (exec) => {
+		try {
+			await exec('SELECT 1', [])
+		} catch {
+			rejectedBeforeDone = !doneFired
+			throw new Error('callback rethrow')
+		}
+	})
+
+	assert.equal(rejectedBeforeDone, false, 'exec must reject only after the done event frees the connection')
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'user')
+})

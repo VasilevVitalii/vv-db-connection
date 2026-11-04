@@ -348,7 +348,11 @@ export class MssqlAdapter implements IDbAdapter {
 							if (error.err) reject(toDbError(error.err, 'query'))
 							else resolve({ rows, rowsAffected: hasDml ? dmlTotal : undefined })
 						})
-						req.query(q).catch((err) => reject(toDbError(err, 'query')))
+						// Some mssql releases reject the query() promise on a stream error
+						// (before 'done' frees the connection); rejecting here would run the
+						// rollback below on a connection the failed request still holds. Record
+						// it and let the 'done' listener reject once the connection is free.
+						req.query(q).catch((err) => { error.err = err })
 					})
 				}
 				// The callback's resolved value is the transaction's result: it is only

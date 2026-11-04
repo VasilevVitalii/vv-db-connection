@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import oracledb from 'oracledb'
+import { EventEmitter } from 'node:events'
 import { DbConnection } from '../src/index'
 import type { TDbTxResult } from '../src/index'
 import { OraAdapter, oraBind, buildQuery, isRowQuery } from '../src/db/adapters/ora'
@@ -671,4 +672,38 @@ test('ora: a throw from the finish callback on a direct adapter still resolves',
 	})
 	// Reaching here is the assertion: the throw must not reject execStream nor skip the
 	// adapter's resolve() (which would hang the call forever).
+})
+
+// review14 2.2: execStream's bounded wait for the stream 'close' used to leave its 1s
+// fallback timer armed after the race settled, holding the event loop and delaying
+// short-lived scripts/tests by ~1s. The timer must be cleared once the race is over.
+test('ora: execStream clears its close-wait fallback timer after the stream closes', async (t) => {
+	const stream = new EventEmitter()
+	const fakeConn = {
+		break: () => Promise.resolve(),
+		close: () => Promise.resolve(),
+		queryStream: () => {
+			// Fire the stream events on the next tick, after the adapter has attached
+			// its listeners synchronously right below queryStream().
+			setImmediate(() => {
+				stream.emit('metadata', [])
+				stream.emit('data', { A: 1 })
+				stream.emit('close')
+			})
+			return stream
+		},
+		execute: () => { throw new Error('must not be reached') },
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	let armed: unknown
+	const cleared: unknown[] = []
+	t.mock.method(globalThis, 'setTimeout', (fn: () => void) => { armed = { fn }; return armed })
+	t.mock.method(globalThis, 'clearTimeout', (handle?: unknown) => { cleared.push(handle) })
+
+	const adapter = new OraAdapter({ kind: 'ora', host: 'h', port: 1521, service: 's', user: 'u', password: 'p' } as TConnOra)
+	await adapter.execStream('SELECT 1 FROM dual', [], () => {})
+
+	assert.equal(cleared.length, 1, 'the fallback timer must be cleared once the race settles')
+	assert.equal(cleared[0], armed, 'the cleared handle must be the armed fallback timer')
 })

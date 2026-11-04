@@ -271,7 +271,7 @@ export class OraAdapter implements IDbAdapter {
 		// driver answers NJS-032 and the connection never returns to the pool. The interrupt
 		// promise is remembered here so the finally can await it before closing.
 		let interrupt: Promise<void> | undefined
-		let stream: oracledb.QueryStream<any> | undefined
+		let stream: oracledb.QueryStream<Record<string, unknown>> | undefined
 		let streamClosed: Promise<void> | undefined
 		try {
 			await new Promise<void>((resolve) => {
@@ -392,8 +392,14 @@ export class OraAdapter implements IDbAdapter {
 		// a bounded fallback so a stuck stream cannot hang release) before close(), or the
 		// driver answers NJS-032 and the connection is dropped instead of pooled.
 		if (streamClosed) {
-			const fallback = new Promise<void>((res) => { setTimeout(res, 1000) })
+			let timer: ReturnType<typeof setTimeout> | undefined
+			const fallback = new Promise<void>((res) => { timer = setTimeout(res, 1000) })
 			await Promise.race([streamClosed, fallback])
+			// The fallback only bounds the wait for a stuck stream: once the race has
+			// settled, clear it so a fast 'close' does not leave a 1s timer holding the
+			// event loop (short-lived scripts and tests would exit ~1s late). A no-op if
+			// the fallback itself already fired.
+			if (timer !== undefined) clearTimeout(timer)
 		}
 		// close() can itself throw (connection in use after a stream failure); drop it
 		// rather than leak the pool slot silently. A drop discards the session and any

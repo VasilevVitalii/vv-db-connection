@@ -218,8 +218,11 @@ export class DbConnection {
 		const idleError = timeoutError('idle', idleTimeout)
 		arm(firstTimeout, firstError)
 
-		// An external signal the caller owns: forward it to the internal controller, which
-		// is what the adapter listens to, and end the call as aborted.
+		// The external signal may have aborted while _adapter() was loading the driver
+		// (the early check above ran before that await): re-check it now so an abort that
+		// fired during load still ends the call as aborted instead of running a query on a
+		// signal the caller already gave up on. Otherwise forward it to the internal
+		// controller, which is what the adapter listens to.
 		let onExternalAbort: (() => void) | undefined
 		if (options?.signal) {
 			if (options.signal.aborted) {
