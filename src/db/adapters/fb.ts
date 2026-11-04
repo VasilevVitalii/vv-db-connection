@@ -386,7 +386,7 @@ export class FbAdapter implements IDbAdapter {
 
 	async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, external?: AbortSignal): Promise<TResult<T, TDbError>> {
 		const options = this._options()
-		return withTxTimeout(timeoutMs, async (signal, clearDeadline) => {
+		return withTxTimeout(timeoutMs, async (signal, armCommitDeadline) => {
 			let db: Firebird.Database
 			try {
 				db = await this.attach(options, this.p.connectTimeout, signal)
@@ -444,10 +444,11 @@ export class FbAdapter implements IDbAdapter {
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
 				}
 				try {
-					// The COMMIT outcome must not be raced by the deadline: a 'timeout' here
-					// would be ambiguous (the server may have committed), and a caller retrying
-					// would double-apply the transaction. The external abort still applies.
-					clearDeadline()
+					// The COMMIT phase is bounded by a hard timer (armCommitDeadline) that
+					// reports an ambiguous outcome (COMMIT_TIMEOUT) rather than 'timeout': the
+					// server may already have committed, so a plain timeout would make a
+					// retry double-apply. The external abort still applies.
+					armCommitDeadline()
 					await new Promise<void>((resolve, reject) => {
 						transaction.commit((err: Error | null) => { if (err) reject(err); else resolve() })
 					})

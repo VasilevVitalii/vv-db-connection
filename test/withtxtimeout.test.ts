@@ -72,6 +72,23 @@ test('withTxTimeout without a deadline reports a throwing body as query', async 
 	if (!r.ok) assert.equal(r.error.kind, 'query')
 })
 
+// review8 §1.1 (variant A): a commit that hangs longer than the deadline is bounded by a
+// separate "hard" timer reporting an ambiguous outcome (kind 'tx', code 'COMMIT_TIMEOUT')
+// - the server may already have committed, so a retry must be idempotent.
+test('withTxTimeout: a hanging commit is bounded by the hard timer', async () => {
+	const r = await withTxTimeout<unknown>(30, async (_signal, armCommitDeadline) => {
+		armCommitDeadline()
+		// A commit that never settles (half-open TCP / stuck server).
+		await new Promise<never>(() => {})
+		return { ok: true as const, result: undefined }
+	})
+	assert.equal(r.ok, false)
+	if (!r.ok) {
+		assert.equal(r.error.kind, 'tx')
+		assert.equal(r.error.code, 'COMMIT_TIMEOUT')
+	}
+})
+
 test('an already-aborted external signal settles at once without running the body', async () => {
 	const controller = new AbortController()
 	controller.abort(new Error('already'))

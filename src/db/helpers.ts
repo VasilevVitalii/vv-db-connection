@@ -42,7 +42,7 @@ export function isDbError(err: unknown): err is TDbError {
 // result that arrives after the deadline is ignored - the race has already been settled.
 export function withTxTimeout<T>(
 	timeoutMs: number | undefined,
-	body: (signal: AbortSignal, clearDeadline: () => void) => Promise<TResult<T, TDbError>>,
+	body: (signal: AbortSignal, armCommitDeadline: () => void) => Promise<TResult<T, TDbError>>,
 	external?: AbortSignal,
 ): Promise<TResult<T, TDbError>> {
 	// Validate the deadline first, synchronously: a negative value would fire the timer
@@ -73,12 +73,19 @@ export function withTxTimeout<T>(
 	return new Promise<TResult<T, TDbError>>((resolve) => {
 		let settled = false
 		let timer: ReturnType<typeof setTimeout> | undefined
-		// Stops the deadline from firing during the commit/rollback teardown: a deadline
-		// that fires mid-COMMIT reports 'timeout' while the server may already have
-		// committed, so a caller retrying would double-apply the transaction. The external
-		// abort signal is NOT cleared - the caller can still abort the transaction.
-		const clearDeadline = (): void => {
-			if (timer) { clearTimeout(timer); timer = undefined }
+		// Lifts the main deadline before the COMMIT teardown and, in its place, arms a
+		// "hard" timer of the same duration that bounds the commit phase itself. A deadline
+		// firing mid-COMMIT must not report 'timeout' (the server may already have
+		// committed - a retry would double-apply), so this hard timer reports an explicit
+		// ambiguous outcome (kind 'tx', code 'COMMIT_TIMEOUT') instead. The external abort
+		// signal is NOT cleared - the caller can still abort the transaction.
+		const armCommitDeadline = (): void => {
+			if (timer) clearTimeout(timer)
+			if (!hasDeadline) { timer = undefined; return }
+			timer = setTimeout(() => {
+				controller.abort(new CommitTimeout())
+				settle({ ok: false, error: { message: 'COMMIT outcome unknown', kind: 'tx', code: 'COMMIT_TIMEOUT' } })
+			}, timeoutMs)
 		}
 		const cleanup = (): void => {
 			if (timer) clearTimeout(timer)
@@ -101,7 +108,7 @@ export function withTxTimeout<T>(
 			}, timeoutMs)
 		}
 		external?.addEventListener('abort', onExternalAbort, { once: true })
-		body(controller.signal, clearDeadline).then(
+		body(controller.signal, armCommitDeadline).then(
 			(r) => settle(r),
 			// The body itself rejected - a real failure of the transaction work, not a
 			// deadline. Labelling it TIMEOUT would hide the actual error from the caller.
@@ -126,6 +133,13 @@ class TxTimeout extends Error {
 	constructor() { super('TIMEOUT') }
 }
 
+// The "hard" commit timer (see armCommitDeadline) aborts with this reason. It must be
+// distinguishable from TxTimeout so the resulting error reports an ambiguous commit
+// outcome (kind 'tx', code 'COMMIT_TIMEOUT') rather than a plain timeout.
+class CommitTimeout extends Error {
+	constructor() { super('COMMIT outcome unknown') }
+}
+
 // Maps an AbortSignal's reason to a TDbError. The internal transaction deadline aborts
 // with a TxTimeout (see withTxTimeout), so that case reports kind 'timeout'; every other
 // reason is an external abort and reports kind 'aborted'. The adapters call this from
@@ -134,6 +148,9 @@ class TxTimeout extends Error {
 export function abortError(reason: unknown): TDbError {
 	if (reason instanceof TxTimeout) {
 		return { message: 'TIMEOUT', kind: 'timeout' }
+	}
+	if (reason instanceof CommitTimeout) {
+		return { message: 'COMMIT outcome unknown', kind: 'tx', code: 'COMMIT_TIMEOUT' }
 	}
 	return abortedError(reason)
 }

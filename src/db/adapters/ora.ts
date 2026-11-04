@@ -260,10 +260,11 @@ export class OraAdapter implements IDbAdapter {
 		// driver answers NJS-032 and the connection never returns to the pool. The interrupt
 		// promise is remembered here so the finally can await it before closing.
 		let interrupt: Promise<void> | undefined
+		let stream: oracledb.QueryStream<any> | undefined
+		let streamClosed: Promise<void> | undefined
 		try {
 			await new Promise<void>((resolve) => {
 				let done = false
-				let stream: oracledb.QueryStream<any> | undefined
 				const finish = (error?: TDbError): void => {
 					if (done) return
 					done = true
@@ -325,6 +326,11 @@ export class OraAdapter implements IDbAdapter {
 				}
 				try {
 					stream = conn.queryStream(sql, binds, { outFormat: oracledb.OUT_FORMAT_OBJECT })
+					// Remember when the driver releases the slot, so finally can wait for it
+					// (not just break()) before close() - on abort/error the stream's 'close'
+					// fires after destroy/error, and close() before it would NJS-032 and drop
+					// the connection instead of returning it to the pool.
+					streamClosed = new Promise<void>((res) => { stream!.once('close', () => res()) })
 				} catch (err) {
 					finish(toDbError(err, 'query'))
 					return
@@ -348,6 +354,13 @@ export class OraAdapter implements IDbAdapter {
 		// Wait for the interrupt before closing, so close() does not race the in-flight
 		// statement and get NJS-032 (which would drop the connection out of the pool).
 		if (interrupt) { try { await interrupt } catch {} }
+		// On abort/error the stream's 'close' fires after destroy/error; wait for it (with
+		// a bounded fallback so a stuck stream cannot hang release) before close(), or the
+		// driver answers NJS-032 and the connection is dropped instead of pooled.
+		if (streamClosed) {
+			const fallback = new Promise<void>((res) => { setTimeout(res, 1000) })
+			await Promise.race([streamClosed, fallback])
+		}
 		// close() can itself throw (connection in use after a stream failure); drop it
 		// rather than leak the pool slot silently.
 		try { await conn.close() } catch { try { await conn.close({ drop: true }) } catch {} }
@@ -355,7 +368,7 @@ export class OraAdapter implements IDbAdapter {
 }
 
 	async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, external?: AbortSignal): Promise<TResult<T, TDbError>> {
-		return withTxTimeout(timeoutMs, async (signal, clearDeadline) => {
+		return withTxTimeout(timeoutMs, async (signal, armCommitDeadline) => {
 			let conn: oracledb.Connection
 			try {
 				conn = await (await this.pool()).getConnection()
@@ -446,10 +459,11 @@ export class OraAdapter implements IDbAdapter {
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
 				}
 				try {
-					// The COMMIT outcome must not be raced by the deadline: a 'timeout' here
-					// would be ambiguous (the server may have committed), and a caller retrying
-					// would double-apply the transaction. The external abort still applies.
-					clearDeadline()
+					// The COMMIT phase is bounded by a hard timer (armCommitDeadline) that
+					// reports an ambiguous outcome (COMMIT_TIMEOUT) rather than 'timeout': the
+					// server may already have committed, so a plain timeout would make a
+					// retry double-apply. The external abort still applies.
+					armCommitDeadline()
 					await conn.commit()
 				} catch (err) {
 					// Same race as the cb path above: on an abort the teardown already owns
