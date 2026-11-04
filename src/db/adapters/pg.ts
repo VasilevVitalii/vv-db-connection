@@ -165,14 +165,14 @@ export class PgAdapter implements IDbAdapter {
 		try {
 			q = buildQuery(query, params)
 		} catch (err) {
-			callback({ kind: 'finish', error: toDbError(err, 'query') })
+			try { callback({ kind: 'finish', error: toDbError(err, 'query') }) } catch { /* the consumer's finish handler threw */ }
 			return
 		}
 		let client: PoolClient
 		try {
 			client = await this.pool().connect()
 		} catch (err) {
-			callback({ kind: 'finish', error: toDbError(err, 'connect') })
+			try { callback({ kind: 'finish', error: toDbError(err, 'connect') }) } catch { /* the consumer's finish handler threw */ }
 			return
 		}
 		// The socket is destroyed rather than ended: a graceful end waits for a server
@@ -196,7 +196,7 @@ export class PgAdapter implements IDbAdapter {
 			onAbort()
 			client.removeListener('error', onError)
 			client.release(true)
-			callback({ kind: 'finish', error: abortError(signal.reason) })
+			try { callback({ kind: 'finish', error: abortError(signal.reason) }) } catch { /* the consumer's finish handler threw */ }
 			return
 		}
 		try {
@@ -248,7 +248,7 @@ export class PgAdapter implements IDbAdapter {
 				callback({ kind: 'finish' })
 			} catch { /* the consumer's finish handler threw - nothing left to report */ }
 		} catch (err) {
-			callback({ kind: 'finish', error: signal?.aborted ? abortError(signal.reason) : toDbError(err, 'query') })
+			try { callback({ kind: 'finish', error: signal?.aborted ? abortError(signal.reason) : toDbError(err, 'query') }) } catch { /* the consumer's finish handler threw */ }
 		} finally {
 			signal?.removeEventListener('abort', onAbort)
 			// Remove the error listener before handing the client back: the pool reuses the

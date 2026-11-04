@@ -256,7 +256,7 @@ export class OraAdapter implements IDbAdapter {
 		try {
 			({ sql, binds } = buildQuery(query, params))
 		} catch (err) {
-			callback({ kind: 'finish', error: toDbError(err, 'query') })
+			try { callback({ kind: 'finish', error: toDbError(err, 'query') }) } catch { /* the consumer's finish handler threw */ }
 			return
 		}
 		const rowQuery = isRowQuery(sql)
@@ -264,7 +264,7 @@ export class OraAdapter implements IDbAdapter {
 		try {
 			conn = await (await this.pool()).getConnection()
 		} catch (err) {
-			callback({ kind: 'finish', error: toDbError(err, 'connect') })
+			try { callback({ kind: 'finish', error: toDbError(err, 'connect') }) } catch { /* the consumer's finish handler threw */ }
 			return
 		}
 		// break() interrupts the statement on the server; close() must wait for it, or the
@@ -280,7 +280,9 @@ export class OraAdapter implements IDbAdapter {
 					if (done) return
 					done = true
 					signal?.removeEventListener('abort', onAbort)
-					callback({ kind: 'finish', error })
+					// A throw from the consumer's finish handler must not skip resolve()
+					// (the stream contract is one finish + one resolve) nor reach the driver.
+					try { callback({ kind: 'finish', error }) } catch { /* the consumer's finish handler threw */ }
 					resolve()
 				}
 				// break() interrupts the statement running on the server, whether it is a
@@ -317,7 +319,15 @@ export class OraAdapter implements IDbAdapter {
 							// sets here; emit each as its own schema+rows so exec() reports
 							// one result per result set instead of dropping the rows.
 							const implicit = await readImplicitResults(res)
-							if (done) return // aborted while the implicit rows were fetched
+							// Aborted while the implicit rows were fetched: the caller has
+							// given up, but the unread cursor (isRowQuery may have misjudged
+							// a SELECT, leaving res.resultSet non-empty) must still be closed
+							// best-effort, or its server cursor leaks - the same close the
+							// normal path performs at the bottom of this handler.
+							if (done) {
+								try { await res.resultSet?.close() } catch { /* best-effort */ }
+								return
+							}
 							// The block's own result (affected count and out-parameters)
 							// comes BEFORE the implicit sets: exec() attaches outParams to
 							// the current result, and if they fired after the sets they would
@@ -386,7 +396,10 @@ export class OraAdapter implements IDbAdapter {
 			await Promise.race([streamClosed, fallback])
 		}
 		// close() can itself throw (connection in use after a stream failure); drop it
-		// rather than leak the pool slot silently.
+		// rather than leak the pool slot silently. A drop discards the session and any
+		// uncommitted work without surfacing it - an accepted trade-off (a lost session is
+		// cheaper than a permanently leaked pool slot), and there is no logging channel in
+		// this library to report it through.
 		try { await conn.close() } catch { try { await conn.close({ drop: true }) } catch {} }
 	}
 }

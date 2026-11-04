@@ -142,24 +142,36 @@ function buildQuery(query: string, params: TDbParam[]): { sql: string; values: u
 // valid. Here the close is seen right after the driver has scheduled that reconnect,
 // the timer is cancelled, and the query ends with an error. The "error" and "reconnect"
 // events of the database are taken as the same loss. The "error" listener stays for
-// good: the driver emits it from the socket handler, and without a listener the loss is
-// silently swallowed instead of surfacing.
+// good while the query runs: the driver emits it from the socket handler, and without a
+// listener the loss is silently swallowed instead of surfacing. The returned cleanup
+// detaches all three listeners once the query is done. Today each attach is closed by
+// its own query, so the db (and its listeners) is simply garbage-collected, but removing
+// them explicitly keeps a future pooled Firebird from accumulating one set per query and
+// tripping MaxListeners.
 /* eslint-disable @typescript-eslint/no-explicit-any */
-function watchConnection(db: Firebird.Database, onLost: (error: TDbError) => void): void {
+function watchConnection(db: Firebird.Database, onLost: (error: TDbError) => void): () => void {
 	// The typings leave out that Database is an EventEmitter.
 	const events: any = db
 	const conn: any   = events.connection
 	// A `code` tags these as real database errors: a bare {message, kind} literal would
 	// fail isDbError() (no code/stack) and be re-labelled 'user', which breaks the retry
 	// contract (query errors are retried, user errors are not).
-	events.on('error', (err: unknown) => onLost({ message: `fb: connection lost: ${String(err)}`, kind: 'query', code: 'FB_CONN_LOST' }))
-	events.on('reconnect', () => onLost({ message: 'fb: connection lost, the driver reattached on its own', kind: 'query', code: 'FB_CONN_LOST' }))
-	conn?._socket?.on('close', () => {
+	const onError = (err: unknown): void => onLost({ message: `fb: connection lost: ${String(err)}`, kind: 'query', code: 'FB_CONN_LOST' })
+	const onReconnect = (): void => onLost({ message: 'fb: connection lost, the driver reattached on its own', kind: 'query', code: 'FB_CONN_LOST' })
+	const onClose = (): void => {
 		// Set by our own detach at the end of the query - a close that was asked for.
 		if (conn._isDetach) return
 		clearTimeout(conn._retry_connection_id)
 		onLost({ message: 'fb: connection lost', kind: 'query', code: 'FB_CONN_LOST' })
-	})
+	}
+	events.on('error', onError)
+	events.on('reconnect', onReconnect)
+	conn?._socket?.on('close', onClose)
+	return (): void => {
+		events.removeListener('error', onError)
+		events.removeListener('reconnect', onReconnect)
+		conn?._socket?.removeListener('close', onClose)
+	}
 }
 
 // Drops the connection at once, without a detach the server would have to answer.
@@ -276,18 +288,24 @@ export class FbAdapter implements IDbAdapter {
 			sql = parsed.sql
 			values = parsed.values
 		} catch (err) {
-			callback({ kind: 'finish', error: toDbError(err, 'query') })
+			try { callback({ kind: 'finish', error: toDbError(err, 'query') }) } catch { /* the consumer's finish handler threw */ }
 			return
 		}
 		const options = this._options()
 		return new Promise<void>((resolve) => {
 			let done = false
 			let db: Firebird.Database | undefined
+			let unwatch: (() => void) | undefined
 			const finish = (error?: TDbError): void => {
 				if (done) return
 				done = true
+				// Detach the connection-loss listeners now that the query is settled -
+				// they are no longer needed and must not outlive the attach.
+				unwatch?.()
 				signal?.removeEventListener('abort', onAbort)
-				callback({ kind: 'finish', error })
+				// A throw from the consumer's finish handler must not skip resolve()
+				// (the stream contract is one finish + one resolve) nor reach the driver.
+				try { callback({ kind: 'finish', error }) } catch { /* the consumer's finish handler threw */ }
 				resolve()
 			}
 			const onAbort = (): void => {
@@ -302,7 +320,7 @@ export class FbAdapter implements IDbAdapter {
 					// Given up while the attach was on its way - nobody is waiting for this one.
 					if (done) { dropConnection(attached); return }
 					db = attached
-					watchConnection(db, (error) => {
+					unwatch = watchConnection(db, (error) => {
 						dropConnection(attached)
 						finish(error)
 					})
@@ -409,11 +427,12 @@ export class FbAdapter implements IDbAdapter {
 			// cancels that reconnect; the next statement / commit then fails loudly instead
 			// of reattaching in the background.
 			let connLost: TDbError | undefined
-			watchConnection(db, (error) => { connLost = error; dropConnection(db) })
+			const unwatch = watchConnection(db, (error) => { connLost = error; dropConnection(db) })
 			// attach() may have resolved after the deadline already fired: the listener
 			// above was added too late to ever run, and the finally below skips detach() on
 			// an aborted signal. Drop the socket here instead of leaking it.
 			if (signal.aborted) {
+				unwatch()
 				teardown()
 				return { ok: false, error: abortError(signal.reason) }
 			}
@@ -492,6 +511,7 @@ export class FbAdapter implements IDbAdapter {
 				}
 				return { ok: false, error: toDbError(err, 'tx') }
 			} finally {
+				unwatch()
 				signal.removeEventListener('abort', teardown)
 				if (!signal.aborted) {
 					// detach() waits for the server's answer and would hang on a server that

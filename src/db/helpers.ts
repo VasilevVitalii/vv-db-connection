@@ -150,6 +150,7 @@ export function withTxTimeout<T>(
 }
 
 function abortedError(reason: unknown): TDbError {
+	const stack = reason instanceof Error ? reason.stack : undefined
 	return {
 		message: reason instanceof Error ? reason.message : String(reason ?? 'aborted'),
 		kind: 'aborted',
@@ -157,7 +158,10 @@ function abortedError(reason: unknown): TDbError {
 		// (no stack to fall back on), so isDbError() still recognizes it as a structured
 		// error instead of re-labelling it 'user'.
 		code: 'ABORTED',
-		...(reason instanceof Error ? { stack: reason.stack } : {}),
+		// Like toDbError: spread `stack` only when it is actually present. A plain Error
+		// normally carries one, but one constructed oddly can hold `stack: undefined`,
+		// which must not surface as an explicit `stack: undefined` key.
+		...(stack != null ? { stack } : {}),
 	}
 }
 

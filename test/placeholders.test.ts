@@ -168,3 +168,11 @@ test('pg: a /* inside a dollar-quoted string is not a comment', () => {
 	assert.equal(pgRewrite('SELECT $$ a/*b*/ :x $$ , :a'), 'SELECT $$ a/*b*/ :x $$ , @a')
 	assert.equal(pgRewrite('SELECT $body$ a/*b*/ :x $body$ , :a'), 'SELECT $body$ a/*b*/ :x $body$ , @a')
 })
+
+// review12 §4: the old masker tagged every comment with a fixed NUL token (`\0<i>\0`), so
+// a literal copy of that token in the input was rewritten into a comment on restore. The
+// separator is now picked from control characters absent from the input, so a literal NUL
+// (or the old token) survives the round-trip unchanged.
+test('pg: a literal NUL token in the input is not mistaken for a comment mask', () => {
+	assert.equal(pgRewrite('SELECT 1 /* a */ \u00000\u0000 :x'), 'SELECT 1 /* a */ \u00000\u0000 @x')
+})

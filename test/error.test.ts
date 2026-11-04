@@ -113,3 +113,14 @@ test('abortError forwards the stack of a real Error reason', () => {
 test('abortError leaves stack unset for a non-Error reason', () => {
 	assert.equal('stack' in abortError('cancelled'), false)
 })
+
+// review12 §2.3: an Error whose `stack` was set to undefined must not surface an
+// explicit `stack: undefined` key - abortError spreads the stack only when present.
+test('abortError does not surface an explicit stack:undefined for an Error without a stack', () => {
+	const reason = new Error('cancelled')
+	;(reason as { stack?: string }).stack = undefined
+	const mapped = abortError(reason)
+	assert.equal(mapped.kind, 'aborted')
+	assert.equal(mapped.message, 'cancelled')
+	assert.equal('stack' in mapped, false)
+})

@@ -615,3 +615,60 @@ test('ora: execTxDynamic surfaces PL/SQL implicit results', { skip }, async (t) 
 		await db.close()
 	}
 })
+
+// review12 §2.1: on the DML/PL-SQL path a mid-fetch abort used to return from the
+// execute handler before closing res.resultSet, leaking the unread cursor (a SELECT
+// misrouted to execute() leaves its rows on res.resultSet). The abort branch must still
+// close it, exactly like the normal path does.
+test('ora: an abort while fetching implicit rows still closes the unread resultSet', async (t) => {
+	let resultSetClosed = 0
+	let resolveRows!: (rows: unknown[]) => void
+	const fakeConn = {
+		break: () => Promise.resolve(),
+		close: () => Promise.resolve(),
+		queryStream: () => { throw new Error('not a row query') },
+		execute: async () => ({
+			resultSet: { close: async () => { resultSetClosed += 1 } },
+			rowsAffected: 0,
+			implicitResults: [
+				{ metaData: [{ name: 'A', dbTypeName: 'NUMBER' }], getRows: () => new Promise<unknown[]>((resolve) => { resolveRows = resolve }), close: async () => {} },
+			],
+			outBinds: undefined,
+		}),
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: 'h', port: 1521, service: 's', user: 'u', password: 'p' } as TConnOra)
+	const controller = new AbortController()
+	const events: string[] = []
+	const run = adapter.execStream('UPDATE t SET x = 1', [], (e) => events.push(e.kind), controller.signal)
+
+	await new Promise((resolve) => setImmediate(resolve)) // execute() ran, readImplicitResults blocked on getRows
+	controller.abort(new Error('cancelled'))               // done = true, finish(aborted)
+	resolveRows([])                                         // readImplicitResults completes -> aborted branch closes resultSet
+	await run
+	await new Promise((resolve) => setImmediate(resolve))  // flush the execute handler's close
+
+	assert.equal(resultSetClosed, 1, 'the unread resultSet must be closed on the abort path')
+	assert.equal(events[events.length - 1], 'finish')
+})
+
+// review12 §2.2: DbConnection contains a finish-callback throw, but a direct IDbAdapter
+// consumer has no outer layer - the adapter's own finish() must swallow it so resolve()
+// still runs (otherwise execStream hangs forever).
+test('ora: a throw from the finish callback on a direct adapter still resolves', async (t) => {
+	const fakeConn = {
+		break: () => Promise.resolve(),
+		close: () => Promise.resolve(),
+		queryStream: () => { throw new Error('not a row query') },
+		execute: async () => ({ resultSet: undefined, rowsAffected: 1, implicitResults: undefined, outBinds: undefined }),
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: 'h', port: 1521, service: 's', user: 'u', password: 'p' } as TConnOra)
+	await adapter.execStream('UPDATE t SET x = 1', [], (event) => {
+		if (event.kind === 'finish') throw new Error('finish boom')
+	})
+	// Reaching here is the assertion: the throw must not reject execStream nor skip the
+	// adapter's resolve() (which would hang the call forever).
+})

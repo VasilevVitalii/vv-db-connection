@@ -184,6 +184,10 @@ dbTitle(connection) // "localhost:5432 [mydb]"
 dbUser(connection)  // "admin"
 ```
 
+### `IDbAdapter` (low-level adapter contract)
+
+`IDbAdapter` is exported for the rare caller that needs the adapter behind `DbConnection` — typically to mock it in tests. `DbConnection` is the intended surface: it picks the adapter from `connection.kind`, loads the driver lazily, and enforces the stream contract (exactly one `finish` per call, consumer-callback throws contained). An adapter implements `versionQuery`, `pingQuery`, `execStream` and `close`; building one directly means you re-validate its config yourself — each adapter does that in its own constructor (connect timeout, Oracle pool sizing), exactly as `DbConnection` does.
+
 ## Query parameters
 
 All methods accept named parameters in `:name` syntax, regardless of the underlying driver. Each adapter translates them to the driver's native format:
@@ -281,7 +285,7 @@ Unlike `exec`, a statement inside a transaction returns a single set of rows —
 
 **PostgreSQL** — a `pg.Pool` per `DbConnection`. Parameterized queries stream rows via `pg.Query` (`'row'` event) without buffering. Any query with no parameters — an unparameterized `SELECT * FROM big` or a multi-statement string — goes through the simple query protocol, which buffers the whole result in memory; bind one `:name` to a parameter to force the streaming path. A backend does not notice its client is gone until it has something to send, so an aborted query is cancelled from a connection of its own (`pg_cancel_backend`), which needs the same role and a spare connection slot.
 
-**Oracle** — `conn.queryStream()` with `OUT_FORMAT_OBJECT` for `SELECT`/`WITH` (leading whitespace and comments are ignored when routing), rows arrive as plain objects; DML and PL/SQL go through `conn.execute()` (auto-committed). Connections come from an `oracledb` pool (`createPool`, sized via `poolMin`/`poolMax`/`poolIncrement`/`queueTimeout`) and are released back in a `finally` block.
+**Oracle** — `conn.queryStream()` with `OUT_FORMAT_OBJECT` for `SELECT`/`WITH` (leading whitespace and comments are ignored when routing), rows arrive as plain objects; DML and PL/SQL go through `conn.execute()` (auto-committed). Connections come from an `oracledb` pool (`createPool`, sized via `poolMin`/`poolMax`/`poolIncrement`/`queueTimeout`) and are released back in a `finally` block — on the normal and plain-error paths. On an abort (deadline or external signal) the in-flight statement is interrupted (`break()`) and the connection is closed back to the pool; a close that still fails is dropped (`close({ drop: true })`), discarding the session rather than leaking the pool slot.
 
 **Firebird** — `node-firebird` has no streaming API; the adapter drives the low-level `Transaction`/`Statement` wire API directly, so a single prepared statement serves the column schema, the streamed rows and the affected-row count (the high-level `sequentially()` re-prepares internally and cannot do all three). The column schema comes from the statement's describe (`newStatement`), so it carries the real driver type names and is emitted even for an empty result — never inferred from the first row. DML reports `rowsAffected` from the statement's record counts (`isc_info_sql_records`). Text blobs are fetched as text (`blobAsText`); binary blobs (`SUB_TYPE 0`) are not supported. A lost connection ends the query with `fb: connection lost`: on a closed socket the driver would quietly attach anew and leave the read waiting for an answer that never comes, so that reconnect is cancelled and the driver's `error` / `reconnect` events are taken as the same loss.
 

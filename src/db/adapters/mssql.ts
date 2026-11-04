@@ -127,7 +127,7 @@ export class MssqlAdapter implements IDbAdapter {
 			q = buildMssqlQuery(query, params)
 			for (const p of params) assertMssqlParam(p)
 		} catch (err) {
-			callback({ kind: 'finish', error: toDbError(err, 'query') })
+			try { callback({ kind: 'finish', error: toDbError(err, 'query') }) } catch { /* the consumer's finish handler threw */ }
 			return
 		}
 
@@ -135,11 +135,11 @@ export class MssqlAdapter implements IDbAdapter {
 		try {
 			pool = await this.pool()
 		} catch (err) {
-			callback({ kind: 'finish', error: toDbError(err, 'connect') })
+			try { callback({ kind: 'finish', error: toDbError(err, 'connect') }) } catch { /* the consumer's finish handler threw */ }
 			return
 		}
 		if (signal?.aborted) {
-			callback({ kind: 'finish', error: abortError(signal.reason) })
+			try { callback({ kind: 'finish', error: abortError(signal.reason) }) } catch { /* the consumer's finish handler threw */ }
 			return
 		}
 
@@ -173,7 +173,9 @@ export class MssqlAdapter implements IDbAdapter {
 				if (done) return
 				done = true
 				signal?.removeEventListener('abort', onAbort)
-				callback({ kind: 'finish', error: err })
+				// A throw from the consumer's finish handler must not skip resolve()
+				// (the stream contract is one finish + one resolve) nor reach the driver.
+				try { callback({ kind: 'finish', error: err }) } catch { /* the consumer's finish handler threw */ }
 				resolve()
 			}
 			signal?.addEventListener('abort', onAbort)

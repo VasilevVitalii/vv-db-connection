@@ -280,3 +280,35 @@ test('fb: a socket close in a transaction is classified as query', async (t) => 
 		assert.equal(r.error.code, 'FB_CONN_LOST')
 	}
 })
+
+// review12 §4: the loss listeners must not outlive the query. After a successful
+// transaction the error/reconnect listeners on the db and the close listener on the socket
+// are removed (a future pooled Firebird would otherwise accumulate one set per query).
+test('fb: the connection-loss listeners are removed when the transaction ends', async (t) => {
+	const fakeDb = new EventEmitter() as EventEmitter & Record<string, unknown>
+	const fakeSocket = Object.assign(new EventEmitter(), { destroy: (): void => {} })
+	const fakeDbConn = { _isDetach: false, _retry_connection_id: undefined, _socket: fakeSocket }
+	fakeDb.connection = fakeDbConn
+	const fakeTx = {
+		queryAsync: async (): Promise<unknown> => ({ rows: [], recordCounts: undefined }),
+		commit: (cb: (e: unknown) => void): void => cb(null),
+		rollback: (cb: () => void): void => cb(),
+	}
+	fakeDb.transaction = (_iso: unknown, cb: (e: unknown, t: unknown) => void): void => cb(null, fakeTx)
+
+	t.mock.method(fbLive, 'attach', (_options: unknown, cb: (err: unknown, db: unknown) => void) => {
+		fbLive.connection = fakeDbConn
+		cb(null, fakeDb)
+	})
+
+	const adapter = new FbAdapter({ kind: 'fb', host: '127.0.0.1', database: '/tmp/x.fdb', user: 'u', password: 'p' } as TConnFb)
+	const r = await adapter.execTxDynamic(async (exec) => {
+		await exec('SELECT 1 FROM rdb$database', [])
+		return undefined
+	})
+
+	assert.equal(r.ok, true)
+	assert.equal(fakeDb.listenerCount('error'), 0, 'error listener must be removed')
+	assert.equal(fakeDb.listenerCount('reconnect'), 0, 'reconnect listener must be removed')
+	assert.equal(fakeSocket.listenerCount('close'), 0, 'socket close listener must be removed')
+})

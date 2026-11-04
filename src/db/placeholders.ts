@@ -56,7 +56,9 @@ export const SQL_ATOM_ORA = new RegExp(`${ORA_Q_QUOTE.source}|${SQL_ATOM.source}
 // The scan regex is `atom` plus the placeholder alternative; rebuilding it on every call
 // recompiles on each exec (and in a transaction, on every statement). Cache by atom - the
 // atom set is closed (SQL_ATOM, SQL_ATOM_PG, SQL_ATOM_ORA, SQL_ATOM_MSSQL), so the cache
-// stays tiny. String.replace resets a global regex's lastIndex, so reuse is safe.
+// stays tiny. String.replace resets a global regex's lastIndex, so reuse is safe across
+// calls - but the regex is shared: fn must NOT re-enter mapPlaceholders with the same
+// atom (a call inside fn would reset lastIndex mid-scan and corrupt the outer match).
 const scanCache = new Map<RegExp, RegExp>()
 function scanFor(atom: RegExp): RegExp {
 	let scan = scanCache.get(atom)
@@ -84,13 +86,24 @@ export function mapPlaceholders(query: string, fn: (name: string) => string, to?
 // pg nests block comments (/* /* x */ y */); the flat SQL_ATOM block-comment alternative
 // stops at the first */ and would expose the tail of an outer comment, letting a :name
 // inside it be rewritten. This pre-pass masks every well-formed block comment - nesting
-// included - to a NUL-tagged token (no colon, so the placeholder scan cannot see into
-// it); the caller restores the tokens after mapPlaceholders. Strings, quoted identifiers
-// and line comments are copied through verbatim and stay in place for SQL_ATOM_PG to
-// handle, so a /* inside a string or identifier is not treated as a comment. An
-// unterminated block comment is left as-is (a SQL error, not this parser's to fix).
+// included - to a `<sep><index><sep>` token (no colon, so the placeholder scan cannot see
+// into it); the caller restores the tokens after mapPlaceholders. Strings, quoted
+// identifiers and line comments are copied through verbatim and stay in place for
+// SQL_ATOM_PG to handle, so a /* inside a string or identifier is not treated as a
+// comment. An unterminated block comment is left as-is (a SQL error, not this parser's
+// to fix). The separator is picked below from control characters absent from the input,
+// so it cannot collide with the text being masked - including a literal NUL, which would
+// otherwise break restore().
 export function maskPgBlockComments(sql: string): { masked: string; restore: (s: string) => string } {
 	const comments: string[] = []
+	// The mask token is `<sep><index><sep>`. sep must never occur in the input, or
+	// restore() would split a literal copy of it and rewrite that text into a comment.
+	// NUL is the usual choice (illegal in SQL text), but rather than assume, take the
+	// first control character absent from sql - control characters other than 	 \n \r
+	// are not legal SQL, so the first free one is guaranteed unique. The private-use
+	// fallback only covers a degenerate input made entirely of control characters.
+	const CONTROL = '\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\u0008\u000B\u000C\u000E\u000F\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001A\u001B\u001C\u001D\u001E\u001F'
+	const sep = [...CONTROL].find((c) => !sql.includes(c)) ?? '\uE000'
 	let out = ''
 	let i = 0
 	while (i < sql.length) {
@@ -171,7 +184,7 @@ export function maskPgBlockComments(sql: string): { masked: string; restore: (s:
 			}
 			if (depth === 0) {
 				comments.push(sql.slice(i, j))
-				out += `\u0000${comments.length - 1}\u0000`
+				out += `${sep}${comments.length - 1}${sep}`
 				i = j
 				continue
 			}
@@ -186,7 +199,7 @@ export function maskPgBlockComments(sql: string): { masked: string; restore: (s:
 			let r = s
 			// split/join, not replace: a comment may contain `$` (e.g. `$tag$`, `$1`), which
 			// replace() would treat as a special pattern.
-			for (let k = comments.length - 1; k >= 0; k--) r = r.split(`\u0000${k}\u0000`).join(comments[k]!)
+			for (let k = comments.length - 1; k >= 0; k--) r = r.split(`${sep}${k}${sep}`).join(comments[k]!)
 			return r
 		},
 	}

@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import sql from 'mssql'
 import { DbConnection } from '../src/index'
+import { MssqlAdapter } from '../src/db/adapters/mssql'
 import type { TConnMssql } from '../src/db/connection'
 import type { TDbStreamEvent } from '../src/db/types'
 
@@ -63,4 +64,23 @@ test('a throw from the finish callback itself is dropped, not re-thrown', async 
 	await db.execStream('SELECT 1', [], () => { throw new Error('always throws') })
 	// Reaching here is the assertion: the throw on every event must not reject
 	// execStream nor propagate into the driver.
+})
+
+// review12 §2.2: DbConnection contains the finish-callback throw, but a direct
+// IDbAdapter consumer has no outer layer - the adapter's own settle() must swallow it so
+// resolve() still runs (otherwise execStream hangs forever).
+test('a throw from the finish callback on a direct adapter still resolves execStream', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) {
+		return Promise.resolve(this)
+	})
+	t.mock.method(sql.ConnectionPool.prototype, 'request', function () {
+		return new FakeRequest() as unknown as sql.Request
+	})
+
+	const adapter = new MssqlAdapter(conn)
+	await adapter.execStream('SELECT 1', [], (event) => {
+		if (event.kind === 'finish') throw new Error('finish boom')
+	})
+	// Reaching here is the assertion: the throw must not reject execStream nor skip the
+	// adapter's resolve() (which would hang the call forever).
 })
