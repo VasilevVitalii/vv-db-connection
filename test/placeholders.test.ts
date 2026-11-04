@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mapPlaceholders, SQL_ATOM_PG, SQL_ATOM_ORA, SQL_ATOM_MSSQL } from '../src/db/placeholders'
+import { mapPlaceholders, maskPgBlockComments, SQL_ATOM_PG, SQL_ATOM_ORA, SQL_ATOM_MSSQL } from '../src/db/placeholders'
 
 const toAt = (name: string): string => `@${name}`
 
@@ -126,4 +126,29 @@ test('leaves uppercase and national Oracle q-quotes alone', () => {
 test('does not mistake a pg date/time typed literal for an E-string', () => {
 	assert.equal(mapPlaceholders("SELECT date'2020-01-01' AS d, :v", toAt, undefined, SQL_ATOM_PG), "SELECT date'2020-01-01' AS d, @v")
 	assert.equal(mapPlaceholders("SELECT time'12:30:00' AS t, :v", toAt, undefined, SQL_ATOM_PG), "SELECT time'12:30:00' AS t, @v")
+})
+
+// pg nests block comments; the flat SQL_ATOM block-comment alternative would stop at the
+// first */ and expose a :name inside the outer comment. maskPgBlockComments (used by pg's
+// buildQuery) must hide the whole nested comment from the placeholder scan, then restore it.
+function pgRewrite(sql: string): string {
+	const { masked, restore } = maskPgBlockComments(sql)
+	return restore(mapPlaceholders(masked, toAt, undefined, SQL_ATOM_PG))
+}
+
+test('pg: a nested block comment hides a :name inside it', () => {
+	assert.equal(pgRewrite('SELECT 1 /* outer /* inner */ :v */ , :a'), 'SELECT 1 /* outer /* inner */ :v */ , @a')
+})
+
+test('pg: a nested comment containing $ is restored verbatim', () => {
+	assert.equal(pgRewrite('SELECT 1 /* $1 $tag$ :x */ , :a'), 'SELECT 1 /* $1 $tag$ :x */ , @a')
+})
+
+test('pg: a /* inside a string literal is not a comment', () => {
+	assert.equal(pgRewrite("SELECT 'a/*b*/c' , :a"), "SELECT 'a/*b*/c' , @a")
+	assert.equal(pgRewrite('SELECT "a/*b*/c" , :a'), 'SELECT "a/*b*/c" , @a')
+})
+
+test('pg: a placeholder after a comment still binds', () => {
+	assert.equal(pgRewrite('SELECT /* c */ :a'), 'SELECT /* c */ @a')
 })

@@ -100,6 +100,27 @@ test('version still falls back to the second query on a query failure', async (t
 	assert.equal(exec.mock.callCount(), 2)
 })
 
+// review8 §2.8/2.12 (deferred): version/ping used to load the driver before validating the
+// silence deadlines, so an unknown kind + bad timeout surfaced as 'connect' instead of the
+// TypeError it is. The deadlines must be validated before _adapter().
+test('version/ping reject a bad timeout as a TypeError before loading the driver', async () => {
+	const db = new DbConnection(unknown)
+	await assert.rejects(() => db.version({ firstDataTimeoutMs: -1 }), TypeError)
+	await assert.rejects(() => db.ping({ idleTimeoutMs: NaN }), TypeError)
+})
+
+// review8 §2.13 (deferred): when both the primary and the fallback version query fail, the
+// fallback's own reason was dropped. It must be kept in the message.
+test('version reports both failures when the fallback also fails', async (t) => {
+	const db = new DbConnection({ kind: 'ora', host: '127.0.0.1', service: 'x', user: 'u', password: 'p' } as TConnOra)
+	t.mock.method(db, 'exec', async () =>
+		({ ok: false, error: { message: 'insufficient privileges', kind: 'query' } }) as TResult<TDbRes[], TDbError>,
+	)
+	const v = await db.version()
+	assert.equal(v.ok, false)
+	assert.match(v.error.message, /fallback also failed/)
+})
+
 // review4 §2.6: execTxDynamic validated its timeout after loading the driver, so an invalid
 // timeout on an unknown kind surfaced as a connect error instead of the TypeError the docs
 // promise. The validation must run first and reject before any driver is touched.

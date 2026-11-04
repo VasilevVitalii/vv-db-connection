@@ -1,5 +1,3 @@
-import type { TResult } from '../tresult'
-
 // A query/transaction parameter. The driver infers the SQL type from `value` unless
 // `type` forces a driver-native type name (mssql: 'DateTime2', 'NVarChar', ...; oracle:
 // 'NUMBER', 'VARCHAR2', 'DATE', 'CLOB', ...). Forcing it pins the exact bind type - e.g.
@@ -55,6 +53,12 @@ export type TDbError = {
 	// query failure inside a transaction.
 	stack?: string
 }
+
+// The uniform result envelope for exec/execTxDynamic/version/ping: `ok` discriminates,
+// `result` carries the value on success, `error` is a TDbError on failure. The error
+// type is generic so a caller can narrow it to a stricter shape. Defined here (not in
+// tresult.ts) so types.ts and tresult.ts no longer import each other in a cycle.
+export type TResult<T, E = TDbError> = { ok: true; result: T } | { ok: false; error: E }
 
 // Per-call knobs for exec/execStream: an external AbortSignal to cancel the query, and
 // how long it may stay silent before the first data and between portions (milliseconds).

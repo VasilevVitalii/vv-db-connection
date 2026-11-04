@@ -66,3 +66,84 @@ export function mapPlaceholders(query: string, fn: (name: string) => string, to?
 		return fn(groups.ph)
 	})
 }
+
+// pg nests block comments (/* /* x */ y */); the flat SQL_ATOM block-comment alternative
+// stops at the first */ and would expose the tail of an outer comment, letting a :name
+// inside it be rewritten. This pre-pass masks every well-formed block comment - nesting
+// included - to a NUL-tagged token (no colon, so the placeholder scan cannot see into
+// it); the caller restores the tokens after mapPlaceholders. Strings, quoted identifiers
+// and line comments are copied through verbatim and stay in place for SQL_ATOM_PG to
+// handle, so a /* inside a string or identifier is not treated as a comment. An
+// unterminated block comment is left as-is (a SQL error, not this parser's to fix).
+export function maskPgBlockComments(sql: string): { masked: string; restore: (s: string) => string } {
+	const comments: string[] = []
+	let out = ''
+	let i = 0
+	while (i < sql.length) {
+		const c = sql[i]
+		if (c === "'") {
+			// String literal: '' doubles the quote, a backslash is an ordinary character
+			// in a standard string.
+			out += c; i++
+			while (i < sql.length) {
+				out += sql[i]
+				if (sql[i] === "'") {
+					if (sql[i + 1] === "'") { out += "'"; i += 2; continue }
+					i++; break
+				}
+				i++
+			}
+			continue
+		}
+		if (c === '"') {
+			// Quoted identifier: "" doubles the quote.
+			out += c; i++
+			while (i < sql.length) {
+				out += sql[i]
+				if (sql[i] === '"') {
+					if (sql[i + 1] === '"') { out += '"'; i += 2; continue }
+					i++; break
+				}
+				i++
+			}
+			continue
+		}
+		if (c === '-' && sql[i + 1] === '-') {
+			// Line comment runs to the end of the line.
+			const nl = sql.indexOf('\n', i)
+			const end = nl < 0 ? sql.length : nl
+			out += sql.slice(i, end)
+			i = end
+			continue
+		}
+		if (c === '/' && sql[i + 1] === '*') {
+			// Block comment, possibly nested: balance /* against */.
+			let depth = 1
+			let j = i + 2
+			while (j < sql.length && depth > 0) {
+				if (sql[j] === '/' && sql[j + 1] === '*') { depth++; j += 2; continue }
+				if (sql[j] === '*' && sql[j + 1] === '/') { depth--; j += 2; continue }
+				j++
+			}
+			if (depth === 0) {
+				comments.push(sql.slice(i, j))
+				out += `\u0000${comments.length - 1}\u0000`
+				i = j
+				continue
+			}
+			// Unterminated: fall through and copy the two characters literally.
+		}
+		out += c
+		i++
+	}
+	return {
+		masked: out,
+		restore: (s: string): string => {
+			let r = s
+			// split/join, not replace: a comment may contain `$` (e.g. `$tag$`, `$1`), which
+			// replace() would treat as a special pattern.
+			for (let k = comments.length - 1; k >= 0; k--) r = r.split(`\u0000${k}\u0000`).join(comments[k]!)
+			return r
+		},
+	}
+}

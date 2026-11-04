@@ -266,6 +266,11 @@ export class DbConnection {
 	}
 
 	public async version(options?: TExecOptions): Promise<TResult<string, TDbError>> {
+		// Validate the silence deadlines before loading the adapter: an unknown `kind`
+		// together with a bad timeout must fail as the programming error it is (TypeError),
+		// not as a 'connect' error from a driver that never should have been loaded.
+		assertTimeoutMs('version: firstDataTimeoutMs', options?.firstDataTimeoutMs ?? FIRST_DATA_TIMEOUT_MS)
+		assertTimeoutMs('version: idleTimeoutMs', options?.idleTimeoutMs ?? NEXT_ROW_TIMEOUT_MS)
 		let adapter: IDbAdapter
 		try {
 			adapter = await this._adapter()
@@ -287,6 +292,10 @@ export class DbConnection {
 			if (fb.ok) {
 				const firstRow = fb.result[0]?.rows[0]
 				if (firstRow) return { ok: true, result: String(Object.values(firstRow)[0]) }
+			} else {
+				// Both the primary and the fallback failed: report the primary error and
+				// keep the fallback's own reason too, instead of hiding it.
+				return { ok: false, error: { ...res.error, message: `${res.error.message} (fallback also failed: ${fb.error.message})` } }
 			}
 		}
 		return { ok: false, error: res.error }
@@ -344,6 +353,10 @@ export class DbConnection {
 	}
 
 	public async ping(options?: TExecOptions): Promise<TResult<null, TDbError>> {
+		// Same as version(): a bad timeout must fail as a TypeError before any driver is
+		// loaded, not surface as a 'connect' error.
+		assertTimeoutMs('ping: firstDataTimeoutMs', options?.firstDataTimeoutMs ?? FIRST_DATA_TIMEOUT_MS)
+		assertTimeoutMs('ping: idleTimeoutMs', options?.idleTimeoutMs ?? NEXT_ROW_TIMEOUT_MS)
 		let adapter: IDbAdapter
 		try {
 			adapter = await this._adapter()

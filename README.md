@@ -86,7 +86,7 @@ if (!result.ok) {
 }
 ```
 
-Collects all rows into memory and returns `TResult<TDbRes[], TDbError>`. Each element of the array is one result set — a multi-statement query on MSSQL or PostgreSQL returns one element per statement. A DML statement (INSERT/UPDATE/DELETE) produces one result set with an empty `schema`, no rows, and `rowsAffected` set to how many rows the database actually changed; a `SELECT` leaves `rowsAffected` unset. On Oracle, a PL/SQL block that calls `DBMS_SQL.RETURN_RESULT` returns one result set per implicit result, each with its own `schema` and rows.
+Collects all rows into memory and returns `TResult<TDbRes[], TDbError>`. Each element of the array is one result set. A multi-statement query returns one element per statement on MSSQL and on PostgreSQL *without parameters* (the simple protocol); a parameterized PostgreSQL multi-statement runs the extended protocol, which delivers only the last statement's result set. A DML statement (INSERT/UPDATE/DELETE) produces one result set with an empty `schema`, no rows, and `rowsAffected` set to how many rows the database actually changed; a `SELECT` leaves `rowsAffected` unset. A DML with a `RETURNING`/`OUTPUT` clause (Firebird `INSERT ... RETURNING`, MSSQL `INSERT ... OUTPUT`) returns its rows instead and may leave `rowsAffected` unset. On Oracle, a PL/SQL block that calls `DBMS_SQL.RETURN_RESULT` returns one result set per implicit result, each with its own `schema` and rows.
 
 ### `execStream` — streaming query
 
@@ -100,7 +100,7 @@ await db.execStream(query, params, (event) => {
 }, { firstDataTimeoutMs: 30_000, idleTimeoutMs: 30_000 })
 ```
 
-Fires the callback incrementally as data arrives — for large result sets where buffering everything is undesirable. A `SELECT` emits `schema` → `row` × N → `finish`; a DML statement (INSERT/UPDATE/DELETE) emits `schema` (empty) → `rowsAffected` → `finish` — the count is how many rows the database actually changed, never a row. DDL (CREATE/DROP/ALTER) emits an empty `schema` and `finish` with no `rowsAffected`, since the database reports no count for it.
+Fires the callback incrementally as data arrives — for large result sets where buffering everything is undesirable. A `SELECT` emits `schema` → `row` × N → `finish`; a DML statement (INSERT/UPDATE/DELETE) emits `schema` (empty) → `rowsAffected` → `finish` — the count is how many rows the database actually changed, never a row. A DML with a `RETURNING`/`OUTPUT` clause (Firebird `INSERT ... RETURNING`, MSSQL `INSERT ... OUTPUT`) emits its rows as `row` events and no `rowsAffected` — the returned rows are data, not an affected-row count. DDL (CREATE/DROP/ALTER) emits an empty `schema` and `finish` with no `rowsAffected`, since the database reports no count for it.
 
 A query that goes silent is cut off on every database: no data within `firstDataTimeoutMs` after the query was sent, or no new data within `idleTimeoutMs` after the previous portion, ends it with `finish` carrying a `{ kind: 'timeout', ... }` error, and the call returns at once. The adapter is told to drop its connection (an `AbortSignal`) and is not waited for, so a driver stuck in its own teardown cannot hold the caller. `exec` goes through the same path and has the same limits. Both timeouts default to 12 hours.
 
@@ -274,7 +274,7 @@ Unlike `exec`, a statement inside a transaction returns a single set of rows —
 
 ## Adapter notes
 
-**MSSQL** — `request.stream = true`, rows delivered via events without driver-side buffering. One `ConnectionPool` per `DbConnection`, created lazily and reused across queries (a transaction opens its own pool — see `execTxDynamic`). `connectTimeout` drives tedious `connectionTimeout` and the tarn pool's `acquireTimeoutMillis`/`createTimeoutMillis`; without it, a request for a slot from an exhausted pool can wait for the 12-hour watchdog.
+**MSSQL** — `request.stream = true`, rows delivered via events without driver-side buffering. One `ConnectionPool` per `DbConnection`, created lazily and reused across queries (a transaction opens its own pool — see `execTxDynamic`). `connectTimeout` drives tedious `connectionTimeout` and the tarn pool's `acquireTimeoutMillis`/`createTimeoutMillis`; without it, a request for a slot from an exhausted pool can wait for the 12-hour watchdog. With `SET NOCOUNT ON` the per-statement affected-row count is suppressed, so `execStream` tells a `SELECT` from a DML by whether a recordset came back — a NOCOUNT-suppressed `SELECT` followed by a DML that changes exactly as many rows as the `SELECT` returned is indistinguishable and resolves to the `SELECT` (an edge case; see the transaction note above).
 
 **PostgreSQL** — a `pg.Pool` per `DbConnection`. Parameterized queries stream rows via `pg.Query` (`'row'` event) without buffering. Any query with no parameters — an unparameterized `SELECT * FROM big` or a multi-statement string — goes through the simple query protocol, which buffers the whole result in memory; bind one `:name` to a parameter to force the streaming path. A backend does not notice its client is gone until it has something to send, so an aborted query is cancelled from a connection of its own (`pg_cancel_backend`), which needs the same role and a spare connection slot.
 

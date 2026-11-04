@@ -58,14 +58,24 @@ function toSchema(meta: OraMetadata[]): TDbCol[] {
 // the rows silently.
 async function readImplicitResults(res: oracledb.Result<Record<string, unknown>>): Promise<TDbRes[]> {
 	const out: TDbRes[] = []
-	for (const item of res.implicitResults ?? []) {
+	const items = res.implicitResults ?? []
+	for (let i = 0; i < items.length; i++) {
+		const item = items[i]
 		// With resultSet:false each element would be a plain row array (no metadata);
 		// the adapter always executes with resultSet:true, so skip that shape defensively.
-		if (Array.isArray(item)) continue
+		if (item === undefined || Array.isArray(item)) continue
 		try {
 			out.push({ schema: toSchema(item.metaData as unknown as OraMetadata[]), rows: await item.getRows() })
-		} finally {
 			await item.close()
+		} catch (err) {
+			// getRows() threw mid-way: close this and every ResultSet still open behind it,
+			// or their cursors stay open and the connection stays busy. Best-effort - a
+			// close() that throws must not mask the original error.
+			for (let j = i; j < items.length; j++) {
+				const rest = items[j]
+				if (rest !== undefined && !Array.isArray(rest)) { try { await rest.close() } catch {} }
+			}
+			throw err
 		}
 	}
 	return out
@@ -162,6 +172,21 @@ export function isRowQuery(sql: string): boolean {
 export class OraAdapter implements IDbAdapter {
 	constructor(private readonly p: TConnOra) {
 		assertTimeoutMs('ora: connectTimeout', p.connectTimeout)
+		// Validate the pool sizing the way connectTimeout is: a negative, fractional or
+		// NaN poolMin/poolMax/poolIncrement/queueTimeout would otherwise go straight into
+		// oracledb.createPool and fail (or misbehave) there instead of at construction.
+		const nonNegInt = (name: string, value: number | undefined, min: number): void => {
+			if (value !== undefined && (!Number.isInteger(value) || value < min)) {
+				throw new TypeError(`ora: ${name} must be an integer >= ${min}`)
+			}
+		}
+		nonNegInt('poolMin', p.poolMin, 0)
+		nonNegInt('poolMax', p.poolMax, 1)
+		nonNegInt('poolIncrement', p.poolIncrement, 1)
+		nonNegInt('queueTimeout', p.queueTimeout, 0)
+		if (p.poolMin !== undefined && p.poolMax !== undefined && p.poolMin > p.poolMax) {
+			throw new TypeError('ora: poolMin must not exceed poolMax')
+		}
 	}
 
 	versionQuery(): string { return 'SELECT banner AS ver FROM v$version WHERE rownum = 1' }

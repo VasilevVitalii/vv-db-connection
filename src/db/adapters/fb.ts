@@ -397,6 +397,13 @@ export class FbAdapter implements IDbAdapter {
 			// still running will not send; drop the connection outright instead.
 			const teardown = (): void => { dropConnection(db) }
 			signal.addEventListener('abort', teardown, { once: true })
+			// Watch for the driver's self-reconnect exactly as execStream does: without it,
+			// a connection dropped mid-transaction schedules a fresh attach nobody tracks,
+			// on which the dead statement handles are never valid. Dropping the socket here
+			// cancels that reconnect; the next statement / commit then fails loudly instead
+			// of reattaching in the background.
+			let connLost: TDbError | undefined
+			watchConnection(db, (error) => { connLost = error; dropConnection(db) })
 			// attach() may have resolved after the deadline already fired: the listener
 			// above was added too late to ever run, and the finally below skips detach() on
 			// an aborted signal. Drop the socket here instead of leaking it.
@@ -411,6 +418,9 @@ export class FbAdapter implements IDbAdapter {
 				})
 				const transaction = tx
 				const exec = async (query: string, params: TDbParam[]): Promise<TDbTxResult> => {
+					// A connection already lost has no valid statement handle: fail now
+					// rather than let queryAsync reattach in the background.
+					if (connLost) throw connLost
 					let q: ReturnType<typeof buildQuery>
 					try {
 						q = buildQuery(query, params)
@@ -442,6 +452,12 @@ export class FbAdapter implements IDbAdapter {
 				} catch (err) {
 					if (!signal.aborted) { try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {} }
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
+				}
+				if (connLost) {
+					// The connection died before COMMIT; there is nothing to roll back and
+					// the commit cannot be sent. Report the loss instead of sending COMMIT
+					// over a dead socket.
+					return { ok: false, error: connLost }
 				}
 				try {
 					// The COMMIT phase is bounded by a hard timer (armCommitDeadline) that

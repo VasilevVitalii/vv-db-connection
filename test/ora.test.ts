@@ -384,6 +384,17 @@ test('ora: queueTimeout 0 is passed through to createPool', async (t) => {
 	assert.equal(opts.queueTimeout, 0)
 })
 
+// review8 §3.d (deferred): pool sizing went into oracledb.createPool unvalidated, so a
+// negative / fractional / NaN value failed (or misbehaved) there instead of at construction.
+test('ora: invalid pool sizing throws a TypeError at construction', () => {
+	const base = { kind: 'ora', host: 'h', port: 1521, service: 's', user: 'u', password: 'p' }
+	assert.throws(() => new OraAdapter({ ...base, poolMin: -1 } as TConnOra), TypeError)
+	assert.throws(() => new OraAdapter({ ...base, poolMax: 0 } as TConnOra), TypeError)
+	assert.throws(() => new OraAdapter({ ...base, poolIncrement: 0 } as TConnOra), TypeError)
+	assert.throws(() => new OraAdapter({ ...base, poolMin: 5, poolMax: 3 } as TConnOra), TypeError)
+	assert.throws(() => new OraAdapter({ ...base, poolMin: 1.5 } as TConnOra), TypeError)
+})
+
 // review4 §2.10: the abort finish used to carry String(signal.reason), so an Error reason
 // surfaced as "Error: timeout: ...". abortError() must take Error.message instead.
 test('ora: execStream abort reason is the error message, not "Error: ..."', async (t) => {

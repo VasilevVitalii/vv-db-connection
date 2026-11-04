@@ -2,7 +2,7 @@ import { Client, Pool, Query, type FieldDef, type PoolClient, type QueryResult }
 import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbStreamEvent, TDbTxCb, TDbTxResult } from '../types'
 import type { TConnPg } from '../connection'
 import type { TResult } from '../../tresult'
-import { mapPlaceholders, SQL_ATOM_PG } from '../placeholders'
+import { mapPlaceholders, maskPgBlockComments, SQL_ATOM_PG } from '../placeholders'
 import { toDbError, isDbError, withTxTimeout, abortError, assertTimeoutMs } from '../helpers'
 
 // PostgreSQL RowDescription carries only the type OID, not its name. Map the built-in
@@ -57,7 +57,10 @@ export function toSchema(fields: FieldDef[]): TDbCol[] {
 function buildQuery(query: string, params: TDbParam[]): { text: string; values: unknown[] } {
 	const nameToIndex = new Map<string, number>()
 	const values: unknown[] = []
-	const text = mapPlaceholders(query, (name) => {
+	// pg nests block comments; mask them (nesting included) before the placeholder scan
+	// so a :name inside an outer comment is not rewritten, then restore the tokens after.
+	const { masked, restore } = maskPgBlockComments(query)
+	const rewritten = mapPlaceholders(masked, (name) => {
 		if (!nameToIndex.has(name)) {
 			const found = params.find((p) => p.name === name)
 			if (!found) throw new Error(`pg: param not found: ${name}`)
@@ -67,7 +70,7 @@ function buildQuery(query: string, params: TDbParam[]): { text: string; values: 
 		}
 		return `$${nameToIndex.get(name)}`
 	}, undefined, SQL_ATOM_PG)
-	return { text, values }
+	return { text: restore(rewritten), values }
 }
 
 // Result commands that report affected rows. Keying off this whitelist (not "!== 'SELECT'")
@@ -216,17 +219,19 @@ export class PgAdapter implements IDbAdapter {
 				}
 			} else {
 				await new Promise<void>((resolve, reject) => {
-					const q = new Query({ text, values })
+					// `stream`, not `q`: the outer `q` (the rewritten query) is still in
+					// scope here, and shadowing it made the two reads of the name confusing.
+					const stream = new Query({ text, values })
 					let schemaEmitted = false
-					q.on('row', (row: Record<string, unknown>, result?: { fields?: FieldDef[] }) => {
+					stream.on('row', (row: Record<string, unknown>, result?: { fields?: FieldDef[] }) => {
 						if (!schemaEmitted) {
 							schemaEmitted = true
 							callback({ kind: 'schema', schema: toSchema(result?.fields ?? []) })
 						}
 						callback({ kind: 'row', row })
 					})
-					q.on('error', (err: Error) => reject(err))
-					q.on('end', (result: { fields?: FieldDef[]; rowCount?: number | null; command?: string }) => {
+					stream.on('error', (err: Error) => reject(err))
+					stream.on('end', (result: { fields?: FieldDef[]; rowCount?: number | null; command?: string }) => {
 						if (!schemaEmitted) {
 							callback({ kind: 'schema', schema: toSchema(result.fields ?? []) })
 						}
@@ -236,7 +241,7 @@ export class PgAdapter implements IDbAdapter {
 						}
 						resolve()
 					})
-					client.query(q)
+					client.query(stream)
 				})
 			}
 			try {
