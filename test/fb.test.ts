@@ -213,3 +213,70 @@ test('fb: a connection lost in a transaction is classified as query, not user', 
 		assert.equal(r.error.code, 'FB_CONN_LOST')
 	}
 })
+
+// review11 §4: the reconnect branch of watchConnection was untested. A driver that
+// reattaches on its own mid-transaction must read as a connection loss (kind 'query',
+// code 'FB_CONN_LOST'), so a subsequent exec rejects instead of running on the new socket.
+test('fb: a driver reattach in a transaction is classified as query', async (t) => {
+	const fakeDb = new EventEmitter() as EventEmitter & Record<string, unknown>
+	const fakeSocket = Object.assign(new EventEmitter(), { destroy: (): void => {} })
+	const fakeDbConn = { _isDetach: false, _retry_connection_id: undefined, _socket: fakeSocket }
+	fakeDb.connection = fakeDbConn
+	const fakeTx = {
+		queryAsync: async (): Promise<unknown> => ({ rows: [], recordCounts: undefined }),
+		commit: (cb: (e: unknown) => void): void => cb(null),
+		rollback: (cb: () => void): void => cb(),
+	}
+	fakeDb.transaction = (_iso: unknown, cb: (e: unknown, t: unknown) => void): void => cb(null, fakeTx)
+
+	t.mock.method(fbLive, 'attach', (_options: unknown, cb: (err: unknown, db: unknown) => void) => {
+		fbLive.connection = fakeDbConn
+		cb(null, fakeDb)
+	})
+
+	const adapter = new FbAdapter({ kind: 'fb', host: '127.0.0.1', database: '/tmp/x.fdb', user: 'u', password: 'p' } as TConnFb)
+	const r = await adapter.execTxDynamic(async (exec) => {
+		fakeDb.emit('reconnect')
+		await exec('SELECT 1 FROM rdb$database', [])
+		return undefined
+	})
+
+	assert.equal(r.ok, false)
+	if (!r.ok) {
+		assert.equal(r.error.kind, 'query')
+		assert.equal(r.error.code, 'FB_CONN_LOST')
+	}
+})
+
+// review11 §4: the socket 'close' branch of watchConnection was untested. An unsolicited
+// socket close (not our own detach) must read as a connection loss, not be swallowed.
+test('fb: a socket close in a transaction is classified as query', async (t) => {
+	const fakeDb = new EventEmitter() as EventEmitter & Record<string, unknown>
+	const fakeSocket = Object.assign(new EventEmitter(), { destroy: (): void => {} })
+	const fakeDbConn = { _isDetach: false, _retry_connection_id: undefined, _socket: fakeSocket }
+	fakeDb.connection = fakeDbConn
+	const fakeTx = {
+		queryAsync: async (): Promise<unknown> => ({ rows: [], recordCounts: undefined }),
+		commit: (cb: (e: unknown) => void): void => cb(null),
+		rollback: (cb: () => void): void => cb(),
+	}
+	fakeDb.transaction = (_iso: unknown, cb: (e: unknown, t: unknown) => void): void => cb(null, fakeTx)
+
+	t.mock.method(fbLive, 'attach', (_options: unknown, cb: (err: unknown, db: unknown) => void) => {
+		fbLive.connection = fakeDbConn
+		cb(null, fakeDb)
+	})
+
+	const adapter = new FbAdapter({ kind: 'fb', host: '127.0.0.1', database: '/tmp/x.fdb', user: 'u', password: 'p' } as TConnFb)
+	const r = await adapter.execTxDynamic(async (exec) => {
+		fakeSocket.emit('close')
+		await exec('SELECT 1 FROM rdb$database', [])
+		return undefined
+	})
+
+	assert.equal(r.ok, false)
+	if (!r.ok) {
+		assert.equal(r.error.kind, 'query')
+		assert.equal(r.error.code, 'FB_CONN_LOST')
+	}
+})

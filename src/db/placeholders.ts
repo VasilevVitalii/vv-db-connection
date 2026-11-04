@@ -53,8 +53,22 @@ export const SQL_ATOM_ORA = new RegExp(`${ORA_Q_QUOTE.source}|${SQL_ATOM.source}
 // AS - the PSQL body after it must not be rewritten). `atom` picks the atoms to skip:
 // pg passes SQL_ATOM_PG so its E'' strings are treated as strings, the other dialects use
 // the default SQL_ATOM, where a backslash is an ordinary character.
+// The scan regex is `atom` plus the placeholder alternative; rebuilding it on every call
+// recompiles on each exec (and in a transaction, on every statement). Cache by atom - the
+// atom set is closed (SQL_ATOM, SQL_ATOM_PG, SQL_ATOM_ORA, SQL_ATOM_MSSQL), so the cache
+// stays tiny. String.replace resets a global regex's lastIndex, so reuse is safe.
+const scanCache = new Map<RegExp, RegExp>()
+function scanFor(atom: RegExp): RegExp {
+	let scan = scanCache.get(atom)
+	if (scan === undefined) {
+		scan = new RegExp(`${atom.source}|(?<!:):(?<ph>[A-Za-z_]\\w*)`, 'g')
+		scanCache.set(atom, scan)
+	}
+	return scan
+}
+
 export function mapPlaceholders(query: string, fn: (name: string) => string, to?: number, atom: RegExp = SQL_ATOM): string {
-	const scan = new RegExp(`${atom.source}|(?<!:):(?<ph>[A-Za-z_]\\w*)`, 'g')
+	const scan = scanFor(atom)
 	return query.replace(scan, (...args: unknown[]): string => {
 		const match = args[0] as string
 		// With a named group the callback args are (match, ...captures, offset, string,
