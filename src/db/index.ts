@@ -23,6 +23,11 @@ export class DbConnection {
 	private _adapterPromise: Promise<IDbAdapter> | undefined
 
 	constructor(connection: TConnectionParam) {
+		// A bad connectTimeout is a programming error, the same class as the per-call
+		// silence deadlines (exec/execStream validate those up front). Validating here
+		// makes it reject at construction instead of surfacing later as a 'connect'
+		// error after a driver has already been loaded.
+		assertTimeoutMs('connectTimeout', (connection as { connectTimeout?: number }).connectTimeout)
 		this._connection = connection
 	}
 

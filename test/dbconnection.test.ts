@@ -54,6 +54,17 @@ test('exec rejects with a TypeError on a negative, NaN or infinite silence timeo
 	}
 })
 
+// review6 2.1: a bad connectTimeout is a programming error too — it must reject at
+// construction, not surface later as a 'connect' error after a driver has been loaded.
+test('constructor rejects with a TypeError on a negative, NaN or infinite connectTimeout', () => {
+	for (const connectTimeout of [-1, NaN, Infinity]) {
+		assert.throws(
+			() => new DbConnection({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p', connectTimeout } as TConnPg),
+			/must be a non-negative finite number of milliseconds/,
+		)
+	}
+})
+
 // review3 §2.4: the Oracle version fallback (v$version -> PRODUCT_COMPONENT_VERSION) must
 // only run when the primary query failed as a query. A timeout or abort would just repeat
 // the same failure against the fallback, so it must return the original error untouched.
