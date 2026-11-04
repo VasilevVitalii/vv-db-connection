@@ -108,11 +108,11 @@ export function buildQuery(query: string, params: TDbParam[]): { sql: string; bi
 	}
 	const binds: Record<string, OraBindValue> = {}
 	for (const p of params) {
-		// Oracle bind names are case-insensitive: match a param to its placeholder by
-		// lowercased name and bind under the placeholder's spelling, so `:V` in the
-		// query resolves a param declared as `v`.
-		const usedName = [...used].find((n) => n.toLowerCase() === p.name.toLowerCase())
-		if (usedName !== undefined) binds[usedName] = oraBind(p)
+		// Oracle bind names are case-insensitive: bind the value under every spelling the
+		// query actually uses, so `:V` and `:v` (the same name) both resolve the param.
+		for (const usedName of used) {
+			if (usedName.toLowerCase() === p.name.toLowerCase()) binds[usedName] = oraBind(p)
+		}
 	}
 	return { sql, binds }
 }
@@ -330,18 +330,24 @@ export class OraAdapter implements IDbAdapter {
 					callback({ kind: 'row', row: row as Record<string, unknown> })
 				})
 				stream.on('error', (err: Error) => finish(toDbError(err, 'query')))
-				stream.on('end', () => finish())
-			})
-		} finally {
-			// Wait for the interrupt before closing, so close() does not race the in-flight
-			// statement and get NJS-032 (which would drop the connection out of the pool).
-			if (interrupt) { try { await interrupt } catch {} }
-			try { await conn.close() } catch {}
-		}
+				// node-oracledb requires waiting for the stream's 'close' (after 'end') before
+				// closing the connection, otherwise close() races the in-flight statement and
+				// throws NJS-032. finish() resolves the interrupt awaited in finally, so doing
+				// it on 'close' guarantees close() runs after the driver released the slot.
+				stream.on('close', () => finish())
+		})
+	} finally {
+		// Wait for the interrupt before closing, so close() does not race the in-flight
+		// statement and get NJS-032 (which would drop the connection out of the pool).
+		if (interrupt) { try { await interrupt } catch {} }
+		// close() can itself throw (connection in use after a stream failure); drop it
+		// rather than leak the pool slot silently.
+		try { await conn.close() } catch { try { await conn.close({ drop: true }) } catch {} }
 	}
+}
 
 	async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, external?: AbortSignal): Promise<TResult<T, TDbError>> {
-		return withTxTimeout(timeoutMs, async (signal) => {
+		return withTxTimeout(timeoutMs, async (signal, clearDeadline) => {
 			let conn: oracledb.Connection
 			try {
 				conn = await (await this.pool()).getConnection()
@@ -432,6 +438,10 @@ export class OraAdapter implements IDbAdapter {
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
 				}
 				try {
+					// The COMMIT outcome must not be raced by the deadline: a 'timeout' here
+					// would be ambiguous (the server may have committed), and a caller retrying
+					// would double-apply the transaction. The external abort still applies.
+					clearDeadline()
 					await conn.commit()
 				} catch (err) {
 					// Same race as the cb path above: on an abort the teardown already owns

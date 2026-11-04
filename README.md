@@ -61,7 +61,7 @@ Oracle pool sizing defaults to a minimum of 0 and a maximum of 4; raise `poolMax
 
 Firebird `charset` is `'UTF8'` (default) or `'WIN1251'`; `numericMode` is `'lossy'` (default) | `'safe'` | `'string'` and controls how `BIGINT`/`INT128` and fixed-point `NUMERIC`/`DECIMAL` results are decoded (see Data types).
 
-`connectTimeout` (mssql/pg/ora/fb, milliseconds) bounds how long establishing a connection may take; without it a driver can hang for minutes against an unreachable host. Firebird's is implemented by the adapter — node-firebird itself has no attach timeout, so the adapter rips the socket of a stuck TCP connect / handshake after the deadline.
+`connectTimeout` (mssql/pg/ora/fb, milliseconds) bounds how long establishing a connection may take; without it a driver can hang for minutes against an unreachable host. Firebird's is implemented by the adapter — node-firebird itself has no attach timeout, so the adapter rips the socket of a stuck TCP connect / handshake after the deadline. A negative, `NaN` or infinite `connectTimeout` is a programming error: `new DbConnection(...)` throws a `TypeError` at construction, before any driver is loaded.
 
 TLS defaults are deliberately permissive for backward compatibility: MSSQL connects without encryption (`encrypt` defaults to `false`), and PostgreSQL `ssl: true` skips certificate verification. To verify it, pass `ssl: { trustServerCertificate: false, ca: '...' }` for PostgreSQL, or `encrypt: true` plus `ca` for MSSQL. `trustServerCertificate: true` means «accept the server certificate without verifying it» — the same flag both adapters use.
 

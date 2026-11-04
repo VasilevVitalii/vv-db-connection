@@ -198,6 +198,7 @@ test('ora: an abort during commit skips rollback (no race with the closing conne
 	let commitReject!: (err: Error) => void
 	let rollbackCalls = 0
 	let closed = 0
+	const controller = new AbortController()
 	const fakeConn = {
 		// break() interrupts the in-flight commit on the server, which rejects it.
 		break: () => {
@@ -207,14 +208,19 @@ test('ora: an abort during commit skips rollback (no race with the closing conne
 		close: () => { closed += 1; return Promise.resolve() },
 		execute: async () => ({ rowsAffected: 0, implicitResults: undefined, outBinds: undefined }),
 		rollback: () => { rollbackCalls += 1; return Promise.resolve() },
-		commit: () => new Promise<void>((_res, rej) => { commitReject = rej }),
+		commit: () => new Promise<void>((_res, rej) => {
+			commitReject = rej
+			// The commit is now pending; abort while it is in flight. (The deadline is
+			// cleared before commit, so an external abort is what interrupts it now.)
+			controller.abort()
+		}),
 	}
 	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
 
 	const adapter = new OraAdapter({ kind: 'ora', host: '127.0.0.1', port: 1521, service: 'x', user: 'u', password: 'p' } as TConnOra)
-	// The callback succeeds immediately, so the transaction reaches commit(); the 50 ms
-	// deadline then fires while commit() is still pending.
-	const r = await adapter.execTxDynamic(async () => {}, 50)
+	// The callback succeeds immediately, so the transaction reaches commit(); the
+	// external abort then fires while commit() is still pending.
+	const r = await adapter.execTxDynamic(async () => {}, undefined, controller.signal)
 	assert.equal(r.ok, false)
 
 	// Let the abort handler finish its teardown (release() awaits break(), then closes).
@@ -328,6 +334,14 @@ test('ora: :NEW/:OLD are correlation names only inside CREATE TRIGGER', async ()
 	assert.deepEqual(u.binds, { old: 5 })
 	const v = buildQuery('SELECT :new AS x FROM dual', [{ name: 'new', value: 1 }])
 	assert.ok('new' in v.binds)
+})
+
+// review7 §2.5: Oracle bind names are case-insensitive, so a query writing one param in
+// two cases (:V ... :v) must bind both spellings, not just the first - the server would
+// answer ORA-01008 for the unbound spelling.
+test('ora: a param written in two cases binds under both spellings', () => {
+	const q = buildQuery('SELECT :V AS a, :v AS b FROM dual', [{ name: 'v', value: 1 }])
+	assert.deepEqual(q.binds, { V: 1, v: 1 })
 })
 
 // review4 §2.4: the isTrigger probe missed CREATE [OR REPLACE] EDITIONABLE/NONEDITIONABLE

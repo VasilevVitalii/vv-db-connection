@@ -42,7 +42,7 @@ export function isDbError(err: unknown): err is TDbError {
 // result that arrives after the deadline is ignored - the race has already been settled.
 export function withTxTimeout<T>(
 	timeoutMs: number | undefined,
-	body: (signal: AbortSignal) => Promise<TResult<T, TDbError>>,
+	body: (signal: AbortSignal, clearDeadline: () => void) => Promise<TResult<T, TDbError>>,
 	external?: AbortSignal,
 ): Promise<TResult<T, TDbError>> {
 	// Validate the deadline first, synchronously: a negative value would fire the timer
@@ -55,7 +55,7 @@ export function withTxTimeout<T>(
 	const hasDeadline = timeoutMs !== undefined && timeoutMs !== 0
 
 	// Neither a deadline nor an external signal: run the body directly, as before.
-	if (!hasDeadline && !external) return body(controller.signal)
+	if (!hasDeadline && !external) return body(controller.signal, () => {})
 
 	// An already-aborted external signal settles the race at once without running the
 	// body - its abort event has already fired and will not fire again.
@@ -66,6 +66,13 @@ export function withTxTimeout<T>(
 	return new Promise<TResult<T, TDbError>>((resolve) => {
 		let settled = false
 		let timer: ReturnType<typeof setTimeout> | undefined
+		// Stops the deadline from firing during the commit/rollback teardown: a deadline
+		// that fires mid-COMMIT reports 'timeout' while the server may already have
+		// committed, so a caller retrying would double-apply the transaction. The external
+		// abort signal is NOT cleared - the caller can still abort the transaction.
+		const clearDeadline = (): void => {
+			if (timer) { clearTimeout(timer); timer = undefined }
+		}
 		const cleanup = (): void => {
 			if (timer) clearTimeout(timer)
 			external?.removeEventListener('abort', onExternalAbort)
@@ -82,12 +89,12 @@ export function withTxTimeout<T>(
 		}
 		if (hasDeadline) {
 			timer = setTimeout(() => {
-				controller.abort(new Error('TIMEOUT'))
+				controller.abort(new TxTimeout())
 				settle({ ok: false, error: { message: 'TIMEOUT', kind: 'timeout' } })
 			}, timeoutMs)
 		}
 		external?.addEventListener('abort', onExternalAbort, { once: true })
-		body(controller.signal).then(
+		body(controller.signal, clearDeadline).then(
 			(r) => settle(r),
 			// The body itself rejected - a real failure of the transaction work, not a
 			// deadline. Labelling it TIMEOUT would hide the actual error from the caller.
@@ -104,14 +111,21 @@ function abortedError(reason: unknown): TDbError {
 	}
 }
 
+// The internal transaction deadline aborts with this private reason. Identifying the
+// deadline by type (not by the string 'TIMEOUT') keeps an external
+// controller.abort(new Error('TIMEOUT')) from being mislabelled 'timeout': that is an
+// external abort and must report kind 'aborted'.
+class TxTimeout extends Error {
+	constructor() { super('TIMEOUT') }
+}
+
 // Maps an AbortSignal's reason to a TDbError. The internal transaction deadline aborts
-// with the sentinel Error('TIMEOUT') (see withTxTimeout), so that case reports kind
-// 'timeout'; every other reason is an external abort and reports kind 'aborted'. The
-// adapters call this from their abort handlers and early-abort branches, so an external
-// abort is never mislabelled 'timeout' and an Error reason is never stringified into
-// "Error: <message>".
+// with a TxTimeout (see withTxTimeout), so that case reports kind 'timeout'; every other
+// reason is an external abort and reports kind 'aborted'. The adapters call this from
+// their abort handlers and early-abort branches, so an external abort is never
+// mislabelled 'timeout' and an Error reason is never stringified into "Error: <message>".
 export function abortError(reason: unknown): TDbError {
-	if (reason instanceof Error && reason.message === 'TIMEOUT') {
+	if (reason instanceof TxTimeout) {
 		return { message: 'TIMEOUT', kind: 'timeout' }
 	}
 	return abortedError(reason)

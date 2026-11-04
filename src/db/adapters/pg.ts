@@ -201,8 +201,9 @@ export class PgAdapter implements IDbAdapter {
 					for (const row of rs.rows) {
 						callback({ kind: 'row', row })
 					}
-					// A DML statement has no result columns: report the rows it changed.
-					if ((rs.fields ?? []).length === 0 && typeof rs.rowCount === 'number') {
+					// Report rows changed by a DML. Keying off command (not the absence of
+					// result columns) keeps INSERT..RETURNING reporting its affected count.
+					if (rs.command !== 'SELECT' && typeof rs.rowCount === 'number') {
 						callback({ kind: 'rowsAffected', count: rs.rowCount })
 					}
 				}
@@ -218,13 +219,13 @@ export class PgAdapter implements IDbAdapter {
 						callback({ kind: 'row', row })
 					})
 					q.on('error', (err: Error) => reject(err))
-					q.on('end', (result: { fields?: FieldDef[]; rowCount?: number | null }) => {
+					q.on('end', (result: { fields?: FieldDef[]; rowCount?: number | null; command?: string }) => {
 						if (!schemaEmitted) {
 							callback({ kind: 'schema', schema: toSchema(result.fields ?? []) })
 						}
-						// A parameterized DML streams no rows and has no result columns:
-						// report the rows it changed before finishing.
-						if ((result.fields ?? []).length === 0 && typeof result.rowCount === 'number') {
+						// Report rows changed by a DML. Keying off command keeps
+						// INSERT..RETURNING reporting its affected count.
+						if (result.command !== 'SELECT' && typeof result.rowCount === 'number') {
 							callback({ kind: 'rowsAffected', count: result.rowCount })
 						}
 						resolve()
@@ -251,7 +252,7 @@ export class PgAdapter implements IDbAdapter {
 	}
 
 	async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, external?: AbortSignal): Promise<TResult<T, TDbError>> {
-		return withTxTimeout(timeoutMs, async (signal) => {
+		return withTxTimeout(timeoutMs, async (signal, clearDeadline) => {
 			let client: PoolClient
 			try {
 				client = await this.pool().connect()
@@ -297,10 +298,11 @@ export class PgAdapter implements IDbAdapter {
 					return client.query({ text: q.text, values: q.values }).then(
 						(res) => ({
 							rows:         res.rows as Record<string, unknown>[],
-							// DML only (TDbRes.rowsAffected contract): pg's rowCount doubles
-							// as the SELECT row count, so report it only when the command
-							// returned no result columns (the same signal execStream uses).
-							rowsAffected: (res.fields ?? []).length === 0 ? res.rowCount ?? undefined : undefined,
+							// DML only (TDbRes.rowsAffected contract): pg's rowCount also
+							// counts SELECT rows, so key off result.command - INSERT/
+							// UPDATE/DELETE/MERGE (RETURNING included) report the affected
+							// count, SELECT reports nothing.
+							rowsAffected: res.command !== 'SELECT' ? res.rowCount ?? undefined : undefined,
 						}),
 						// Tag the failure as a DB query error so it stays 'query' even when
 						// it bubbles through the user's callback (which may re-throw it).
@@ -315,6 +317,10 @@ export class PgAdapter implements IDbAdapter {
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
 				}
 				try {
+					// The COMMIT outcome must not be raced by the deadline: a 'timeout' here
+					// would be ambiguous (the server may have committed), and a caller retrying
+					// would double-apply the transaction. The external abort still applies.
+					clearDeadline()
 					await client.query('COMMIT')
 				} catch (err) {
 					if (!signal.aborted) { try { await client.query('ROLLBACK') } catch {} }

@@ -315,6 +315,9 @@ export class DbConnection {
 		// programming error (a TypeError, per README) and must not be masked by a
 		// connect error when the driver is missing.
 		assertTimeoutMs('execTxDynamic: timeoutMs', timeoutMs)
+		// An already-aborted signal should fail the transaction without loading a driver,
+		// symmetric with execStream's early abort.
+		if (signal?.aborted) return { ok: false, error: abortError(signal.reason) }
 		let adapter: IDbAdapter
 		try {
 			adapter = await this._adapter()

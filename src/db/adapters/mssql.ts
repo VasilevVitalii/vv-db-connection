@@ -232,7 +232,7 @@ export class MssqlAdapter implements IDbAdapter {
 	}
 
 	async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, external?: AbortSignal): Promise<TResult<T, TDbError>> {
-		return withTxTimeout(timeoutMs, async (signal) => {
+		return withTxTimeout(timeoutMs, async (signal, clearDeadline) => {
 			// A transaction owns its connection for its whole lifetime and must be torn
 			// down hard on timeout (a stuck statement never answers rollback), so it gets
 			// its own pool here rather than the shared one used by execStream.
@@ -319,6 +319,10 @@ export class MssqlAdapter implements IDbAdapter {
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
 				}
 				try {
+					// The COMMIT outcome must not be raced by the deadline: a 'timeout' here
+					// would be ambiguous (the server may have committed), and a caller retrying
+					// would double-apply the transaction. The external abort still applies.
+					clearDeadline()
 					await transaction.commit()
 				} catch (err) {
 					if (!signal.aborted) { try { await transaction.rollback() } catch {} }
