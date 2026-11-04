@@ -157,3 +157,15 @@ test('exec() keeps rowsAffected/outParams that arrive before any schema', async 
 	assert.equal(r.result[0]!.rowsAffected, 5)
 	assert.deepEqual(r.result[0]!.outParams, { n: 1 })
 })
+
+// review11 §2.1: invalid Oracle pool sizing must reject at construction (TypeError), the
+// same contract as connectTimeout - before any driver is loaded. It must not surface
+// later as a 'connect' error.
+test('DbConnection rejects invalid Oracle pool sizing at construction', () => {
+	const base = { kind: 'ora', host: '127.0.0.1', service: 'x', user: 'u', password: 'p' } as TConnOra
+	assert.throws(() => new DbConnection({ ...base, poolMin: -1 }), TypeError)
+	assert.throws(() => new DbConnection({ ...base, poolMax: 0 }), TypeError)
+	assert.throws(() => new DbConnection({ ...base, poolIncrement: 0 }), TypeError)
+	assert.throws(() => new DbConnection({ ...base, queueTimeout: -1 }), TypeError)
+	assert.throws(() => new DbConnection({ ...base, poolMin: 5, poolMax: 2 }), TypeError)
+})

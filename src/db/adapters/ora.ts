@@ -3,7 +3,7 @@ import type { IDbAdapter, TDbCol, TDbError, TDbParam, TDbRes, TDbStreamEvent, TD
 import type { TConnOra } from '../connection'
 import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM_ORA } from '../placeholders'
-import { toDbError, isDbError, withTxTimeout, abortError, assertTimeoutMs } from '../helpers'
+import { toDbError, isDbError, withTxTimeout, abortError, assertTimeoutMs, assertOraPool } from '../helpers'
 
 type OraMetadata = { name: string; dbTypeName: string; byteSize?: number; scale?: number; precision?: number }
 type OraBindValue = oracledb.BindParameter | string | number | bigint | Date | Buffer | null | undefined
@@ -172,21 +172,7 @@ export function isRowQuery(sql: string): boolean {
 export class OraAdapter implements IDbAdapter {
 	constructor(private readonly p: TConnOra) {
 		assertTimeoutMs('ora: connectTimeout', p.connectTimeout)
-		// Validate the pool sizing the way connectTimeout is: a negative, fractional or
-		// NaN poolMin/poolMax/poolIncrement/queueTimeout would otherwise go straight into
-		// oracledb.createPool and fail (or misbehave) there instead of at construction.
-		const nonNegInt = (name: string, value: number | undefined, min: number): void => {
-			if (value !== undefined && (!Number.isInteger(value) || value < min)) {
-				throw new TypeError(`ora: ${name} must be an integer >= ${min}`)
-			}
-		}
-		nonNegInt('poolMin', p.poolMin, 0)
-		nonNegInt('poolMax', p.poolMax, 1)
-		nonNegInt('poolIncrement', p.poolIncrement, 1)
-		nonNegInt('queueTimeout', p.queueTimeout, 0)
-		if (p.poolMin !== undefined && p.poolMax !== undefined && p.poolMin > p.poolMax) {
-			throw new TypeError('ora: poolMin must not exceed poolMax')
-		}
+		assertOraPool(p)
 	}
 
 	versionQuery(): string { return 'SELECT banner AS ver FROM v$version WHERE rownum = 1' }

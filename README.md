@@ -57,7 +57,7 @@ MSSQL `auth` is a union: `{ kind: 'mssql', user, password }` or `{ kind: 'ntlm',
 
 Oracle `privilege` is one of `SYSDBA | SYSOPER | SYSASM | SYSBACKUP | SYSDG | SYSKM | SYSRAC`; the connection string is assembled internally as `host:port/service`. Privileged connections are only supported by the pool in **Thin mode** (the default — no Oracle Client installed). In Thick mode (after `oracledb.initOracleClient()`) a pool cannot be privileged, so the adapter fails loudly instead of handing back a connection that is not actually privileged.
 
-Oracle pool sizing defaults to a minimum of 0 and a maximum of 4; raise `poolMax` for more concurrency, and set `queueTimeout` (milliseconds) to bound how long acquiring a connection waits for a free slot instead of the driver default of 60 s.
+Oracle pool sizing defaults to a minimum of 0 and a maximum of 4; raise `poolMax` for more concurrency, and set `queueTimeout` (milliseconds) to bound how long acquiring a connection waits for a free slot instead of the driver default of 60 s. A negative, fractional or `NaN` `poolMin`/`poolMax`/`poolIncrement`/`queueTimeout` (or `poolMin > poolMax`) is a programming error: `new DbConnection(...)` throws a `TypeError` at construction, before the driver is loaded.
 
 Firebird `charset` is `'UTF8'` (default) or `'WIN1251'`; `numericMode` is `'lossy'` (default) | `'safe'` | `'string'` and controls how `BIGINT`/`INT128` and fixed-point `NUMERIC`/`DECIMAL` results are decoded (see Data types).
 
@@ -148,7 +148,7 @@ Statements inside one transaction are not safe to run in parallel: `exec` is bou
 const result = await db.ping() // TResult<null, TDbError>
 ```
 
-A minimal read-only query that requires no privileges; returns `{ ok: true }` on success. Useful for waiting for the database to come up — it accepts the same `options` (`signal`, `firstDataTimeoutMs`, `idleTimeoutMs`) as `exec`, so pass a bounded timeout. Firebird's driver has no attach timeout of its own, so a `ping` against an unreachable Firebird host is cut off by the connection's `connectTimeout` (see Connection fields) rather than by the `firstDataTimeoutMs` deadline.
+A minimal read-only query that requires no privileges; returns `{ ok: true }` on success. Useful for waiting for the database to come up — it accepts the same `options` (`signal`, `firstDataTimeoutMs`, `idleTimeoutMs`) as `exec`, so pass a bounded timeout. Firebird's driver has no attach timeout of its own, so a `ping` against an unreachable Firebird host is cut off by whichever deadline fires first — the connection's `connectTimeout` (see Connection fields) or the call's `firstDataTimeoutMs`; with neither set it hangs until the OS TCP timeout.
 
 ### `version`
 

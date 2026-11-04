@@ -9,13 +9,14 @@ import type { TDbError, TDbErrorKind } from './types'
 // come before the generic `code`, with `sqlState` as the last fallback - this keeps a
 // driver's real error identifier instead of the boilerplate wrapper around it.
 export function toDbError(err: unknown, kind: TDbErrorKind): TDbError {
-	const e = err as { message?: unknown; code?: unknown; number?: unknown; sqlState?: unknown; gdscode?: unknown } | null | undefined
+	const e = err as { message?: unknown; code?: unknown; number?: unknown; sqlState?: unknown; gdscode?: unknown; stack?: unknown } | null | undefined
 	const code = e?.number ?? e?.gdscode ?? e?.code ?? e?.sqlState
+	const stack = err instanceof Error ? err.stack : (typeof e?.stack === 'string' ? e.stack : undefined)
 	return {
 		message: typeof e?.message === 'string' ? e.message : String(err),
 		kind,
 		...(code != null ? { code: String(code) } : {}),
-		...(err instanceof Error ? { stack: err.stack } : {}),
+		...(stack != null ? { stack } : {}),
 	}
 }
 
@@ -32,6 +33,30 @@ export function isDbError(err: unknown): err is TDbError {
 		// sqlState into `code`) or a stack from the underlying Error. A bare {message,
 		// kind} literal is a user throw, not a database error.
 		&& (e.code != null || e.stack != null)
+}
+
+// Validates Oracle pool-sizing parameters the way connectTimeout is: a negative, fractional
+// or NaN poolMin/poolMax/poolIncrement/queueTimeout is a programming error that must reject
+// at construction, before the oracledb driver is loaded (see DbConnection). OraAdapter
+// re-validates through this same function for consumers who build an adapter directly.
+export function assertOraPool(p: {
+	poolMin?: number
+	poolMax?: number
+	poolIncrement?: number
+	queueTimeout?: number
+}): void {
+	const nonNegInt = (name: string, value: number | undefined, min: number): void => {
+		if (value !== undefined && (!Number.isInteger(value) || value < min)) {
+			throw new TypeError(`ora: ${name} must be an integer >= ${min}`)
+		}
+	}
+	nonNegInt('poolMin', p.poolMin, 0)
+	nonNegInt('poolMax', p.poolMax, 1)
+	nonNegInt('poolIncrement', p.poolIncrement, 1)
+	nonNegInt('queueTimeout', p.queueTimeout, 0)
+	if (p.poolMin !== undefined && p.poolMax !== undefined && p.poolMin > p.poolMax) {
+		throw new TypeError('ora: poolMin must not exceed poolMax')
+	}
 }
 
 // Runs a transaction body against a deadline and/or an external AbortSignal. The body

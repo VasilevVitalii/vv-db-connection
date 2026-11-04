@@ -250,7 +250,10 @@ export class FbAdapter implements IDbAdapter {
 			// Capture the Connection this attach just created (node-firebird assigns it to
 			// exports.connection synchronously inside attach()) before the timer is armed.
 			conn = fbLive.connection
-			if (signal) {
+			// Register only if the attach did not already settle synchronously: when it
+			// did, done() has removed the listener and re-adding it here would leak a
+			// listener on a long-lived signal forever.
+			if (signal && !settled) {
 				signal.addEventListener('abort', onAbort)
 				if (signal.aborted) onAbort()
 			}

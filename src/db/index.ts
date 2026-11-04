@@ -2,7 +2,7 @@ import type { TResult } from '../tresult'
 import type { TConnectionParam, TDbKind } from './connection'
 import { dbTitle, dbUser } from './connection'
 import type { IDbAdapter, TDbError, TDbParam, TDbRes, TDbStreamEvent, TDbTxCb, TExecOptions, TTxOptions } from './types'
-import { toDbError, assertTimeoutMs, abortError } from './helpers'
+import { toDbError, assertTimeoutMs, abortError, assertOraPool } from './helpers'
 
 // How long a streaming query may stay silent by default: until the first data after it
 // was sent, and between one portion of data and the next. Both are overridable per call
@@ -28,6 +28,10 @@ export class DbConnection {
 		// makes it reject at construction instead of surfacing later as a 'connect'
 		// error after a driver has already been loaded.
 		assertTimeoutMs('connectTimeout', (connection as { connectTimeout?: number }).connectTimeout)
+		// Oracle pool sizing is the same class of error, and must reject at construction
+		// before the oracledb driver is loaded. OraAdapter re-validates through the same
+		// helper for consumers who build an adapter directly - deliberate double check.
+		if (connection.kind === 'ora') assertOraPool(connection)
 		this._connection = connection
 	}
 
