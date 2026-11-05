@@ -309,6 +309,10 @@ export class DbConnection {
 		// only when the primary failed as a query: a timeout, abort or connect failure
 		// would just repeat the same failure against the fallback and wait it out again.
 		if (res.error.kind === 'query' && adapter.versionFallbackQuery) {
+			// An abort that fired between the primary query and the fallback must not run
+			// the fallback: it would come back 'aborted' and get folded into the primary
+			// 'query' error as a confusing "fallback also failed" message. Report it directly.
+			if (options?.signal?.aborted) return { ok: false, error: abortError(options.signal.reason) }
 			const fb = await this.exec(adapter.versionFallbackQuery(), [], options)
 			if (fb.ok) {
 				const firstRow = fb.result[0]?.rows[0]

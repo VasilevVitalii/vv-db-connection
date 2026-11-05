@@ -114,6 +114,28 @@ test('version still falls back to the second query on a query failure', async (t
 	assert.equal(exec.mock.callCount(), 2)
 })
 
+// review25 2.1: an abort that fires between the primary query failure and the fallback
+// must not run the fallback - it would come back 'aborted' and get folded into the primary
+// 'query' error as a confusing "fallback also failed" message.
+test('version reports aborted when the signal aborts between the primary and the fallback', async (t) => {
+	const db = new DbConnection({ kind: 'ora', host: '127.0.0.1', service: 'x', user: 'u', password: 'p' } as TConnOra)
+	const controller = new AbortController()
+	let calls = 0
+	const exec = t.mock.method(db, 'exec', async () => {
+		calls += 1
+		if (calls === 1) {
+			controller.abort()
+			return { ok: false, error: { message: 'insufficient privileges', kind: 'query' } } as TResult<TDbRes[], TDbError>
+		}
+		return { ok: false, error: { message: 'fallback failed', kind: 'query' } } as TResult<TDbRes[], TDbError>
+	})
+	const v = await db.version({ signal: controller.signal })
+	assert.equal(v.ok, false)
+	assert.equal((v.error as TDbError).kind, 'aborted')
+	assert.equal(calls, 1)
+	assert.equal(exec.mock.callCount(), 1)
+})
+
 // review8 §2.8/2.12 (deferred): version/ping used to load the driver before validating the
 // silence deadlines, so an unknown kind + bad timeout surfaced as 'connect' instead of the
 // TypeError it is. The deadlines must be validated before _adapter().
