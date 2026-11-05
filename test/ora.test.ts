@@ -388,6 +388,18 @@ test('ora: two params differing only by case are rejected', () => {
 	)
 })
 
+// review24 2.2: the duplicate check used to scan every param, so two unused params
+// differing only by case (:v/:V not in the SQL) falsely threw. README:215 says extra
+// params the SQL does not mention are ignored - the check must only see used names.
+test('ora: unused params differing only by case are ignored, not rejected', () => {
+	const q = buildQuery('SELECT :a AS x FROM dual', [
+		{ name: 'a', value: 1 },
+		{ name: 'v', value: 2 },
+		{ name: 'V', value: 3 },
+	])
+	assert.deepEqual(q.binds, { a: 1 })
+})
+
 // review4 §2.4: the isTrigger probe missed CREATE [OR REPLACE] EDITIONABLE/NONEDITIONABLE
 // TRIGGER and the REFERENCING clause, so :new/:old inside those were treated as binds (the
 // server answers ORA-01008) and a REFERENCING NEW AS n / OLD AS o rename was never honoured

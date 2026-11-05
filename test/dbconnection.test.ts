@@ -41,6 +41,20 @@ test('execTxDynamic with an already-aborted signal fails as aborted without a dr
 	assert.equal((r.error as TDbError).kind, 'aborted')
 })
 
+// review24 2.1: version()/ping() must also fail as 'aborted' on an already-aborted signal
+// without loading a driver - a missing driver (unknown kind) would otherwise surface as 'connect'.
+test('version/ping with an already-aborted signal fail as aborted without a driver', async () => {
+	const db = new DbConnection(unknown)
+	const controller = new AbortController()
+	controller.abort()
+	const v = await db.version({ signal: controller.signal })
+	assert.equal(v.ok, false)
+	assert.equal((v.error as TDbError).kind, 'aborted')
+	const p = await db.ping({ signal: controller.signal })
+	assert.equal(p.ok, false)
+	assert.equal((p.error as TDbError).kind, 'aborted')
+})
+
 // review5 2.10: a negative / NaN / infinite silence deadline is a programming error and
 // must fail up front with a TypeError, exactly like execTxDynamic's timeout validation -
 // not be reported as a 'query' finish event.

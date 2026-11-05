@@ -284,6 +284,9 @@ export class DbConnection {
 		// not as a 'connect' error from a driver that never should have been loaded.
 		assertTimeoutMs('version: firstDataTimeoutMs', options?.firstDataTimeoutMs ?? FIRST_DATA_TIMEOUT_MS)
 		assertTimeoutMs('version: idleTimeoutMs', options?.idleTimeoutMs ?? NEXT_ROW_TIMEOUT_MS)
+		// An already-aborted signal must not load the driver: fail as aborted (symmetric
+		// with exec/execStream/execTxDynamic) instead of a missing driver surfacing as 'connect'.
+		if (options?.signal?.aborted) return { ok: false, error: abortError(options.signal.reason) }
 		let adapter: IDbAdapter
 		try {
 			adapter = await this._adapter()
@@ -383,6 +386,9 @@ export class DbConnection {
 		// loaded, not surface as a 'connect' error.
 		assertTimeoutMs('ping: firstDataTimeoutMs', options?.firstDataTimeoutMs ?? FIRST_DATA_TIMEOUT_MS)
 		assertTimeoutMs('ping: idleTimeoutMs', options?.idleTimeoutMs ?? NEXT_ROW_TIMEOUT_MS)
+		// An already-aborted signal must not load the driver: fail as aborted (symmetric
+		// with exec/execStream/execTxDynamic) instead of a missing driver surfacing as 'connect'.
+		if (options?.signal?.aborted) return { ok: false, error: abortError(options.signal.reason) }
 		let adapter: IDbAdapter
 		try {
 			adapter = await this._adapter()
