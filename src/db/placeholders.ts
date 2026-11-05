@@ -99,7 +99,7 @@ export function maskPgBlockComments(sql: string): { masked: string; restore: (s:
 	// The mask token is `<sep><index><sep>`. sep must never occur in the input, or
 	// restore() would split a literal copy of it and rewrite that text into a comment.
 	// NUL is the usual choice (illegal in SQL text), but rather than assume, take the
-	// first control character absent from sql - control characters other than 	 \n \r
+	// first control character absent from sql - control characters other than \t \n \r
 	// are not legal SQL, so the first free one is guaranteed unique. The private-use
 	// fallback only covers a degenerate input made entirely of control characters.
 	const CONTROL = '\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\u0008\u000B\u000C\u000E\u000F\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001A\u001B\u001C\u001D\u001E\u001F'
