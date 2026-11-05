@@ -316,7 +316,9 @@ export class PgAdapter implements IDbAdapter {
 								// README contract: a transaction statement returns a single set —
 								// the first recordset, the rest dropped (same as mssql). A DML
 								// statement contributes no recordset (empty fields), so "first
-								// recordset" = the first set that has columns.
+								// recordset" = the first set that has columns. A set with zero
+								// columns (e.g. `SELECT FROM t` without a column list) has no fields
+								// and is skipped — such a shape is not a recordset callers rely on.
 								const first = res.find((r) => (r.fields?.length ?? 0) > 0)
 								const dml = res.filter((r) => isDmlCommand(r.command))
 								const affected = dml.reduce((n, r) => n + (r.rowCount ?? 0), 0)

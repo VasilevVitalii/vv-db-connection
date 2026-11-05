@@ -404,29 +404,29 @@ export class OraAdapter implements IDbAdapter {
 				// throws NJS-032. finish() resolves the interrupt awaited in finally, so doing
 				// it on 'close' guarantees close() runs after the driver released the slot.
 				stream.on('close', () => finish())
-		})
-	} finally {
-		// Wait for the interrupt before closing, so close() does not race the in-flight
-		// statement and get NJS-032 (which would drop the connection out of the pool).
-		if (interrupt) { try { await interrupt } catch {} }
-		// On abort/error the stream's 'close' fires after destroy/error; wait for it (bounded
-		// so a stuck stream cannot hang release) before close(), or the driver answers
-		// NJS-032 and the connection is dropped instead of pooled.
-		if (streamClosed) await boundedWait(streamClosed)
-		// The DML/PL-SQL path keeps fetching implicit rows (readImplicitResults) after
-		// execute() settles. An abort tears the connection down while that fetch is
-		// still in flight; close() before the fetch settles answers NJS-032 and drops
-		// the connection out of the pool instead of returning it - the same race the
-		// the row path guards against via streamClosed. Wait for the DML handler, bounded
-		// like streamClosed so a truly stuck fetch cannot hang release.
-		if (dmlDone) await boundedWait(dmlDone)
-		// close() can itself throw (connection in use after a stream failure); drop it
-		// rather than leak the pool slot silently. A drop discards the session and any
-		// uncommitted work without surfacing it - an accepted trade-off (a lost session is
-		// cheaper than a permanently leaked pool slot), and there is no logging channel in
-		// this library to report it through.
-		try { await conn.close() } catch { try { await conn.close({ drop: true }) } catch {} }
-	}
+			})
+		} finally {
+			// Wait for the interrupt before closing, so close() does not race the in-flight
+			// statement and get NJS-032 (which would drop the connection out of the pool).
+			if (interrupt) { try { await interrupt } catch {} }
+			// On abort/error the stream's 'close' fires after destroy/error; wait for it (bounded
+			// so a stuck stream cannot hang release) before close(), or the driver answers
+			// NJS-032 and the connection is dropped instead of pooled.
+			if (streamClosed) await boundedWait(streamClosed)
+			// The DML/PL-SQL path keeps fetching implicit rows (readImplicitResults) after
+			// execute() settles. An abort tears the connection down while that fetch is
+			// still in flight; close() before the fetch settles answers NJS-032 and drops
+			// the connection out of the pool instead of returning it - the same race the
+			// the row path guards against via streamClosed. Wait for the DML handler, bounded
+			// like streamClosed so a truly stuck fetch cannot hang release.
+			if (dmlDone) await boundedWait(dmlDone)
+			// close() can itself throw (connection in use after a stream failure); drop it
+			// rather than leak the pool slot silently. A drop discards the session and any
+			// uncommitted work without surfacing it - an accepted trade-off (a lost session is
+			// cheaper than a permanently leaked pool slot), and there is no logging channel in
+			// this library to report it through.
+			try { await conn.close() } catch { try { await conn.close({ drop: true }) } catch {} }
+		}
 }
 
 	async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, external?: AbortSignal): Promise<TResult<T, TDbError>> {

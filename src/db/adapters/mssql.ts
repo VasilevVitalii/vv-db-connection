@@ -334,7 +334,6 @@ export class MssqlAdapter implements IDbAdapter {
 					req.on('recordset', () => {
 						tracker.recordset()
 						recordsetIndex += 1
-						if (recordsetIndex === 0) rows = []
 					})
 					req.on('row', (row: object) => {
 						tracker.row()

@@ -43,7 +43,7 @@ export type TDbRes = {
 // set of synthetic codes (never a driver code): 'TIMEOUT' (deadline/idle expiry),
 // 'ABORTED' (an external abort), 'COMMIT_TIMEOUT' (the commit deadline fired and the
 // outcome is unknown), 'FB_CONN_LOST' (a firebird connection died mid-work) and
-// 'NO_VERSION' (version()/ping() got no row back). In a transaction: 'tx' is the
+// 'NO_VERSION' (version() got no row back). In a transaction: 'tx' is the
 // begin/commit itself failing, 'query' is a statement failing, 'user' is the transaction
 // callback's own code throwing - so a retry loop can tell "my bug" from "the database
 // said no".
