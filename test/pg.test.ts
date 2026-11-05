@@ -270,6 +270,41 @@ test('pg: execStream stops delivering rows after abort (direct adapter)', async 
 	assert.equal(events[events.length - 1]!.kind, 'finish', 'the stream ends with a finish event')
 })
 
+// review23 2.1: the simple protocol buffers the result, so an abort during the await can
+// still see the query resolve. The `done` guard skips the buffered rows, and the guarded
+// finish reports the abort instead of a success finish.
+test('pg: execStream suppresses buffered simple-protocol rows after abort', async (t) => {
+	let resolveQuery!: (value: unknown) => void
+	const gate = new Promise((resolve) => { resolveQuery = resolve })
+	let destroyed = 0
+	const fakeClient = {
+		on(): void {},
+		removeListener(): void {},
+		release(): void {},
+		query: (): unknown => gate,
+		connection: { stream: { destroy(): void { destroyed += 1 } } },
+	}
+	t.mock.method(Pool.prototype, 'connect', async () => fakeClient as unknown as PoolClient)
+
+	const adapter = new PgAdapter({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
+	const events: { kind: string; error?: { kind?: string } }[] = []
+	const abort = new AbortController()
+	const run = adapter.execStream('SELECT 1', [], (e) => events.push(e), abort.signal)
+
+	// Let execStream reach the awaited client.query(text).
+	await new Promise<void>((resolve) => setImmediate(resolve))
+	abort.abort(new Error('timeout'))
+	// The result was buffered before the socket was torn down, so the query still resolves.
+	resolveQuery([{ fields: [{ name: 'n', dataTypeID: 23, dataTypeModifier: -1 }], rows: [{ n: 1 }], rowCount: null, command: 'SELECT' }])
+	await run
+
+	assert.equal(events.filter((e) => e.kind === 'row').length, 0, 'no buffered rows reach the consumer after abort')
+	assert.equal(events.filter((e) => e.kind === 'schema').length, 0, 'no schema reaches the consumer after abort')
+	assert.equal(events[events.length - 1]!.kind, 'finish', 'the stream ends with a finish event')
+	assert.equal(events[events.length - 1]!.error?.kind, 'aborted', 'the finish reports the abort, not a success')
+	assert.equal(destroyed, 1, 'the socket is torn down on abort')
+})
+
 // review20 2.1: a parameterless multi-statement query (simple protocol) used to
 // flatMap-concatenate the rows of every result set, losing the boundary between sets and
 // diverging from README:280 ("first recordset kept, the rest dropped", as mssql does).

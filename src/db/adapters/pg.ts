@@ -213,15 +213,20 @@ export class PgAdapter implements IDbAdapter {
 			// the extended protocol, where Query streams rows instead of buffering them.
 			if (values.length === 0) {
 				const result = await client.query(text)
-				const sets = (Array.isArray(result) ? result : [result]) as QueryResult[]
-				for (const rs of sets) {
-					callback({ kind: 'schema', schema: toSchema(rs.fields ?? []) })
-					for (const row of rs.rows) {
-						callback({ kind: 'row', row })
-					}
-					// Report rows changed by a DML (whitelist, so FETCH/COPY/CTAS stay out).
-					if (isDmlCommand(rs.command) && typeof rs.rowCount === 'number') {
-						callback({ kind: 'rowsAffected', count: rs.rowCount })
+				// Abort may have fired during the await: the result was already buffered
+				// before the socket was torn down, so the promise still resolved. Skip the
+				// emission; the guarded finish below reports the abort instead.
+				if (!done) {
+					const sets = (Array.isArray(result) ? result : [result]) as QueryResult[]
+					for (const rs of sets) {
+						callback({ kind: 'schema', schema: toSchema(rs.fields ?? []) })
+						for (const row of rs.rows) {
+							callback({ kind: 'row', row })
+						}
+						// Report rows changed by a DML (whitelist, so FETCH/COPY/CTAS stay out).
+						if (isDmlCommand(rs.command) && typeof rs.rowCount === 'number') {
+							callback({ kind: 'rowsAffected', count: rs.rowCount })
+						}
 					}
 				}
 			} else {
@@ -255,7 +260,11 @@ export class PgAdapter implements IDbAdapter {
 				})
 			}
 			try {
-				callback({ kind: 'finish' })
+				if (signal?.aborted) {
+					callback({ kind: 'finish', error: abortError(signal.reason) })
+				} else {
+					callback({ kind: 'finish' })
+				}
 			} catch { /* the consumer's finish handler threw - nothing left to report */ }
 		} catch (err) {
 			try { callback({ kind: 'finish', error: signal?.aborted ? abortError(signal.reason) : toDbError(err, 'query') }) } catch { /* the consumer's finish handler threw */ }

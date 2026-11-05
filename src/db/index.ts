@@ -91,8 +91,9 @@ export class DbConnection {
 			return current
 		}
 		// Validate the silence deadlines before running: a bad value is a programming
-		// error and must reject from exec() too. execStream would fold the TypeError into
-		// a 'query' result, so exec re-checks up front and lets the TypeError surface.
+		// error and must reject from exec() too. execStream already validates its own
+		// deadlines, but with an 'execStream:' prefix; exec re-checks up front so the
+		// TypeError carries its own 'exec:' prefix.
 		assertTimeoutMs('exec: firstDataTimeoutMs', options?.firstDataTimeoutMs ?? FIRST_DATA_TIMEOUT_MS)
 		assertTimeoutMs('exec: idleTimeoutMs', options?.idleTimeoutMs ?? NEXT_ROW_TIMEOUT_MS)
 		try {
