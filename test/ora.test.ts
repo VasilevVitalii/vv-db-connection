@@ -160,6 +160,7 @@ test('ora: abort waits for break() before close(), returning the slot', async (t
 test('ora: execTxDynamic closes only after break() lands on a mid-transaction abort', async (t) => {
 	let breakDone = false
 	let breakResolve!: () => void
+	let executeReject!: (err: Error) => void
 	let closed = 0
 	const fakeConn = {
 		break: () => new Promise<void>((resolve) => { breakResolve = () => { breakDone = true; resolve() } }),
@@ -168,7 +169,9 @@ test('ora: execTxDynamic closes only after break() lands on a mid-transaction ab
 			closed += 1
 			return Promise.resolve()
 		},
-		execute: () => new Promise(() => {}), // stuck; break() would end it on a real server
+		// On a real server break() ends the running statement (ORA-01013); model that so
+		// close() waits for both the interrupt and the statement's settle, not just break().
+		execute: () => new Promise((_, reject) => { executeReject = (err) => reject(err) }),
 		rollback: () => Promise.resolve(),
 		commit: () => Promise.resolve(),
 	}
@@ -182,9 +185,11 @@ test('ora: execTxDynamic closes only after break() lands on a mid-transaction ab
 	assert.equal(r.ok, false)
 	if (!r.ok) assert.equal(r.error.kind, 'timeout')
 
-	// Let the abort handler run, then let break() land so close() may proceed.
+	// Let the abort handler run, then let break() land and the interrupted statement
+	// settle (as it does on a real server) so close() may proceed.
 	await new Promise((resolve) => setImmediate(resolve))
 	breakResolve()
+	executeReject(Object.assign(new Error('ORA-01013: user requested cancel of current operation'), { errorNum: 1013 }))
 	await new Promise((resolve) => setImmediate(resolve))
 
 	assert.equal(closed, 1)
@@ -813,4 +818,89 @@ test('ora: an abort while fetching implicit rows waits for the fetch before clos
 	assert.equal(closed, 1, 'close must return the connection to the pool, not drop it')
 	assert.equal(dropped, 0)
 	assert.equal(events[events.length - 1], 'finish')
+})
+
+// review16 2.3: the tx close() path used to wait only for break() to land, not for the
+// interrupted execute() itself to settle, so close() could race the still-running
+// statement into NJS-032 and drop the connection out of the pool. release() must wait for
+// the in-flight execute (bounded) before close(), the same race execStream guards via
+// dmlDone.
+test('ora: execTxDynamic close() waits for the in-flight execute before releasing (no NJS-032 drop)', async (t) => {
+	let breakResolve!: () => void
+	let executeReject!: (err: Error) => void
+	let executeSettled = false
+	let closed = 0
+	let dropped = 0
+	const fakeConn = {
+		break: () => new Promise<void>((resolve) => { breakResolve = resolve }),
+		close: (opts?: { drop?: boolean }) => {
+			if (opts?.drop) { dropped += 1; return Promise.resolve() }
+			// close() while the execute is still in flight answers NJS-032; the fix must
+			// have waited for the execute to settle, so only the OLD code hits this path.
+			if (!executeSettled) return Promise.reject(Object.assign(new Error('NJS-032: connection cannot be released'), { code: 'NJS-032' }))
+			closed += 1
+			return Promise.resolve()
+		},
+		execute: () => new Promise((_, reject) => { executeReject = (err) => { executeSettled = true; reject(err) } }),
+		rollback: () => Promise.resolve(),
+		commit: () => Promise.resolve(),
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: '127.0.0.1', port: 1521, service: 'x', user: 'u', password: 'p' } as TConnOra)
+	const p = adapter.execTxDynamic(async (exec) => {
+		await exec('SELECT 1 FROM dual', [])
+	}, 50)
+	const r = await p
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'timeout')
+
+	await new Promise((resolve) => setImmediate(resolve)) // teardown ran, release() awaiting interrupt
+	breakResolve()                                        // break() lands; the statement is still running
+	await new Promise((resolve) => setImmediate(resolve))
+
+	// On the OLD code release() would already have called close() here (NJS-032 -> drop);
+	// the fix must still be waiting for the execute, so nothing is closed/dropped yet.
+	assert.equal(closed, 0)
+	assert.equal(dropped, 0)
+
+	executeReject(Object.assign(new Error('ORA-01013: user requested cancel of current operation'), { errorNum: 1013 }))
+	await new Promise((resolve) => setImmediate(resolve)) // release() proceeds once the execute settles
+
+	assert.equal(closed, 1, 'close must return the connection to the pool, not drop it')
+	assert.equal(dropped, 0)
+})
+
+// review16 2.4: the in-flight flag used to be a boolean reset by the first statement to
+// settle, so with two overlapping statements an abort after the first settled saw the
+// connection as idle and skipped break(), leaving the second statement running and the
+// session cancelled for its next statement (ORA-01013). A counter keeps break() armed as
+// long as ANY statement is still in flight.
+test('ora: an abort still breaks() while a later statement is in flight (counter, not boolean)', async (t) => {
+	let broken = 0
+	const deferred: Array<{ resolve: (v: unknown) => void; reject: (e: Error) => void }> = []
+	const fakeConn = {
+		break: () => { broken += 1; return Promise.resolve() },
+		close: () => Promise.resolve(),
+		rollback: () => Promise.resolve(),
+		commit: () => Promise.resolve(),
+		execute: () => new Promise((resolve, reject) => { deferred.push({ resolve, reject }) }),
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: '127.0.0.1', port: 1521, service: 'x', user: 'u', password: 'p' } as TConnOra)
+	const controller = new AbortController()
+	const r = await adapter.execTxDynamic(async (exec) => {
+		const p1 = exec('SELECT 1 FROM dual', []) // deferred[0]
+		const p2 = exec('SELECT 2 FROM dual', []) // deferred[1] — both in flight
+		deferred[0]!.resolve({ resultSet: undefined, rowsAffected: 0, implicitResults: undefined, outBinds: undefined })
+		await p1                                 // first settles; the second is still running
+		controller.abort(new Error('cancel'))    // abort while p2 is still in flight
+		deferred[1]!.reject(Object.assign(new Error('ORA-01013: user requested cancel of current operation'), { errorNum: 1013 }))
+		await p2                                 // rejects (the break ended the statement)
+	}, undefined, controller.signal)
+
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'aborted')
+	assert.equal(broken, 1, 'break() must still interrupt the second, still-running statement')
 })

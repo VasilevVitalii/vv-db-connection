@@ -6,6 +6,13 @@ import type { TResult } from '../../tresult'
 import { mapPlaceholders, SQL_ATOM_MSSQL } from '../placeholders'
 import { toDbError, isDbError, withTxTimeout, abortError, assertTimeoutMs } from '../helpers'
 
+// The done-watchdog window for a transaction exec with NO deadline (a bare
+// execTxDynamic). Aligns with the driver's own default requestTimeout (15s — see
+// mssql/lib/tedious/connection-pool.js): a statement that has gone totally silent for
+// that long is treated as dead, so a transaction can never strand forever waiting for
+// 'done'. When a deadline is set it overrides this value — see the exec closure.
+const MSSQL_TX_DONE_WATCHDOG_FALLBACK_MS = 15_000
+
 // Converts :name placeholders to @name for mssql named parameters. A colon inside a
 // string literal, a quoted identifier or a comment is left as it is, and a bracket-quoted
 // identifier ([a:b]) is one identifier - SQL_ATOM_MSSQL keeps the brackets an atom. A
@@ -258,6 +265,10 @@ export class MssqlAdapter implements IDbAdapter {
 			// its own pool here rather than the shared one used by execStream.
 			let pool: sql.ConnectionPool
 			let tx: sql.Transaction | undefined
+			// Set when the exec watchdog tears the socket down ('done' never arrived): the
+			// rollback in the catches below must then be skipped, or it would run on a dead
+			// socket and — with no deadline to bound it — hang.
+			let tornDown = false
 			try {
 				pool = await new sql.ConnectionPool(buildPoolConfig(this.p)).connect()
 			} catch (err) {
@@ -344,37 +355,50 @@ export class MssqlAdapter implements IDbAdapter {
 					return await new Promise<TDbTxResult>((resolve, reject) => {
 						const error: { err: Error | null } = { err: null }
 						let settled = false
-						let fallback: ReturnType<typeof setTimeout> | undefined
+						let watchdog: ReturnType<typeof setTimeout> | undefined
 						const settleDone = (): void => {
 							if (settled) return
 							settled = true
-							if (fallback !== undefined) { clearTimeout(fallback); fallback = undefined }
+							if (watchdog !== undefined) { clearTimeout(watchdog); watchdog = undefined }
 							if (error.err) reject(toDbError(error.err, 'query'))
 							else resolve({ rows, rowsAffected: hasDml ? dmlTotal : undefined })
 						}
 						// 'done' is not guaranteed to follow every failure in every mssql
-						// release: if it never arrives, waiting for it would strand the
-						// transaction forever. Arm a short fallback — if 'done' does not free
-						// the connection in time, rip the socket (the same teardown an abort
-						// performs, so the finally's pool.close() does not wait on a connection
-						// the driver never releases) and reject as 'query'.
-						const armFallback = (): void => {
-							if (settled || fallback !== undefined) return
-							fallback = setTimeout(() => {
-								fallback = undefined
+						// release, but mssql also emits 'error' for every statement-level
+						// failure (constraint, RAISERROR) while the batch keeps running — so a
+						// fixed timer armed on 'error' alone would rip the socket out from under
+						// a still-running batch. This is a liveness watchdog instead: re-armed on
+						// every event that proves the batch is alive (recordset/row/rowsaffected),
+						// it fires only after `windowMs` of total silence — the one reliable
+						// symptom of "done will never arrive" (a silently dead socket). The window
+						// is the transaction's own deadline when one is set; without one the
+						// fallback constant still bounds a bare execTxDynamic. Firing tears the
+						// socket down (the same teardown an abort performs, so the finally's
+						// pool.close() does not wait on a connection the driver never releases)
+						// and rejects as 'query'.
+						const windowMs = timeoutMs !== undefined && timeoutMs > 0 ? timeoutMs : MSSQL_TX_DONE_WATCHDOG_FALLBACK_MS
+						const armWatchdog = (): void => {
+							if (settled) return
+							if (watchdog !== undefined) { clearTimeout(watchdog); watchdog = undefined }
+							watchdog = setTimeout(() => {
+								watchdog = undefined
 								if (settled) return
 								settled = true
+								tornDown = true
 								teardown()
 								reject(toDbError(error.err ?? new Error('mssql: statement failed and the driver never emitted done'), 'query'))
-							}, 1000)
+							}, windowMs)
 						}
-						req.on('error', (err: Error) => { error.err = err; armFallback() })
+						req.on('recordset', armWatchdog)
+						req.on('row', armWatchdog)
+						req.on('rowsaffected', armWatchdog)
+						req.on('error', (err: Error) => { error.err = err; armWatchdog() })
 						req.on('done', () => settleDone())
 						// Some mssql releases reject the query() promise on a stream error
 						// (before 'done' frees the connection); rejecting here would run the
 						// rollback below on a connection the failed request still holds. Record
 						// it and let the 'done' listener reject once the connection is free.
-						req.query(q).catch((err) => { error.err = err; armFallback() })
+						req.query(q).catch((err) => { error.err = err; armWatchdog() })
 					})
 				}
 				// The callback's resolved value is the transaction's result: it is only
@@ -384,7 +408,7 @@ export class MssqlAdapter implements IDbAdapter {
 				try {
 					result = await cb(exec, signal)
 				} catch (err) {
-					if (!signal.aborted) { try { await transaction.rollback() } catch {} }
+					if (!signal.aborted && !tornDown) { try { await transaction.rollback() } catch {} }
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
 				}
 				try {
@@ -400,7 +424,7 @@ export class MssqlAdapter implements IDbAdapter {
 					armCommitDeadline()
 					await transaction.commit()
 				} catch (err) {
-					if (!signal.aborted) { try { await transaction.rollback() } catch {} }
+					if (!signal.aborted && !tornDown) { try { await transaction.rollback() } catch {} }
 					return { ok: false, error: toDbError(err, 'tx') }
 				}
 				return { ok: true, result }

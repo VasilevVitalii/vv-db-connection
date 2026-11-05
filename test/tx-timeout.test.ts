@@ -386,3 +386,140 @@ test('execTxDynamic rejects via fallback when done never follows the stream erro
 
 	setT.mock.restore()
 })
+
+// review16 2.1 (part 1): the done-watchdog window must follow the transaction's own
+// deadline, not a fixed 1s — a fixed 1s ripped the socket out from under a still-running
+// batch whose 'done' only arrived later. With a deadline the watchdog must not fire
+// earlier than the deadline itself.
+test('execTxDynamic watchdog window follows the transaction deadline, not a fixed 1s', async (t) => {
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = { socket: { destroy() {} } }
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+
+	const delays: number[] = []
+	const setT = t.mock.method(globalThis, 'setTimeout', (fn: () => void, delay?: number) => {
+		delays.push(delay as number)
+		return { fn }
+	})
+
+	t.mock.method(sql.Request.prototype, 'query', function (this: sql.Request) {
+		setImmediate(() => { this.emit('error', new Error('boom')) })
+		return new Promise(() => {}) // never settles — the watchdog is the only way out
+	})
+
+	const adapter = new MssqlAdapter(conn)
+	// Intentionally not awaited: the transaction hangs on a statement that never 'done's.
+	void adapter.execTxDynamic(async (exec) => { await exec('SELECT 1', []) }, 5000)
+
+	// The deadline timer (armed by withTxTimeout) and then the watchdog both go through
+	// setTimeout; wait until the error event has armed the watchdog.
+	for (let i = 0; i < 100 && delays.length < 2; i++) {
+		await new Promise((resolve) => setImmediate(resolve))
+	}
+	assert.ok(delays.length >= 2, 'the watchdog must be armed after the error event')
+	assert.ok(!delays.includes(1000), 'the watchdog must not use a fixed 1s window')
+	assert.ok(delays.includes(5000), 'the watchdog window must be the transaction deadline (5000ms)')
+
+	setT.mock.restore()
+})
+
+// review16 2.1 (part 2): a statement-level error does not stop the batch, so the watchdog
+// must be re-armed by the liveness events that follow (recordset/row/rowsaffected) instead
+// of firing after a fixed delay armed on 'error' alone.
+test('execTxDynamic re-arms the watchdog on liveness events', async (t) => {
+	let destroyed = 0
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = {
+			socket: { destroy: () => { destroyed += 1 } },
+		}
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+
+	let setTimeoutCalls = 0
+	const setT = t.mock.method(globalThis, 'setTimeout', (fn: () => void) => {
+		setTimeoutCalls += 1
+		return { fn }
+	})
+
+	t.mock.method(sql.Request.prototype, 'query', function (this: sql.Request) {
+		return new Promise((resolve) => {
+			setImmediate(() => {
+				// A statement-level failure, then the batch keeps streaming and 'done' arrives.
+				this.emit('error', new Error('constraint violated'))
+				this.emit('recordset', {})
+				this.emit('row', { v: 1 })
+				this.emit('done', {})
+				resolve({})
+			})
+		})
+	})
+
+	const adapter = new MssqlAdapter(conn)
+	const r = await adapter.execTxDynamic(async (exec) => {
+		await exec('UPDATE t SET x = 1; SELECT 1', [])
+	})
+
+	// The statement error is still reported, but the connection must not be torn down:
+	// 'done' arrived naturally and rollback ran on a healthy connection.
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'query')
+	assert.equal(destroyed, 0, 'the watchdog must not fire while the batch keeps emitting liveness events')
+	assert.ok(setTimeoutCalls >= 3, `the watchdog must re-arm on each liveness event; got ${setTimeoutCalls} arms`)
+
+	setT.mock.restore()
+})
+
+// review16 2.2: after the watchdog tears the socket down, the rollback in the catch must
+// be skipped — running it on the dead socket would (with no deadline to bound it) hang.
+test('execTxDynamic skips rollback after the watchdog tears the socket down', async (t) => {
+	let destroyed = 0
+	let rollbacks = 0
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = {
+			socket: { destroy: () => { destroyed += 1 } },
+		}
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => { rollbacks += 1; return Promise.resolve() })
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+
+	let watchdogFn!: () => void
+	const setT = t.mock.method(globalThis, 'setTimeout', (fn: () => void) => {
+		watchdogFn = fn
+		return { fn }
+	})
+
+	t.mock.method(sql.Request.prototype, 'query', function (this: sql.Request) {
+		setImmediate(() => { this.emit('error', new Error('boom')) })
+		return new Promise(() => {}) // never emits 'done' — the watchdog fires
+	})
+
+	const adapter = new MssqlAdapter(conn)
+	const p = adapter.execTxDynamic(async (exec) => {
+		await exec('SELECT 1', [])
+	})
+	for (let i = 0; i < 100 && !watchdogFn; i++) {
+		await new Promise((resolve) => setImmediate(resolve))
+	}
+	assert.ok(watchdogFn, 'the watchdog must be armed after the error event')
+	watchdogFn() // fire the watchdog
+
+	const r = await p
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'query')
+	assert.equal(destroyed, 1, 'the watchdog must rip the socket')
+	assert.equal(rollbacks, 0, 'rollback must be skipped on a socket the watchdog already tore down')
+
+	setT.mock.restore()
+})

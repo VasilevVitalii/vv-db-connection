@@ -50,6 +50,24 @@ function toSchema(meta: OraMetadata[]): TDbCol[] {
 	}))
 }
 
+// How long close() waits for an in-flight statement/stream/fetch to settle before it
+// gives up and proceeds. If close() races a still-running statement the driver answers
+// NJS-032 and drops the connection out of the pool instead of returning it, so this is a
+// bound on a genuinely stuck statement, not a normal wait.
+const ORA_CLOSE_WAIT_FALLBACK_MS = 1000
+
+// Await a promise that must settle before close() (an interrupted statement, a stream's
+// 'close', a DML/PL-SQL fetch), bounded by ORA_CLOSE_WAIT_FALLBACK_MS so a truly stuck
+// promise cannot hang connection release. After the race settles, clear the timer so a
+// fast settle does not leave a 1s timer holding the event loop (short-lived scripts and
+// tests would exit ~1s late).
+async function boundedWait(p: Promise<unknown>): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined
+	const fallback = new Promise<void>((res) => { timer = setTimeout(res, ORA_CLOSE_WAIT_FALLBACK_MS) })
+	await Promise.race([p, fallback])
+	if (timer !== undefined) clearTimeout(timer)
+}
+
 // res.implicitResults, with resultSet:true, is an array of ResultSets - one per
 // DBMS_SQL.RETURN_RESULT in a PL/SQL block - each carrying its own metadata. Read and
 // close every one (an unclosed ResultSet keeps its cursor open and the connection busy,
@@ -391,31 +409,17 @@ export class OraAdapter implements IDbAdapter {
 		// Wait for the interrupt before closing, so close() does not race the in-flight
 		// statement and get NJS-032 (which would drop the connection out of the pool).
 		if (interrupt) { try { await interrupt } catch {} }
-		// On abort/error the stream's 'close' fires after destroy/error; wait for it (with
-		// a bounded fallback so a stuck stream cannot hang release) before close(), or the
-		// driver answers NJS-032 and the connection is dropped instead of pooled.
-		if (streamClosed) {
-			let timer: ReturnType<typeof setTimeout> | undefined
-			const fallback = new Promise<void>((res) => { timer = setTimeout(res, 1000) })
-			await Promise.race([streamClosed, fallback])
-			// The fallback only bounds the wait for a stuck stream: once the race has
-			// settled, clear it so a fast 'close' does not leave a 1s timer holding the
-			// event loop (short-lived scripts and tests would exit ~1s late). A no-op if
-			// the fallback itself already fired.
-			if (timer !== undefined) clearTimeout(timer)
-		}
+		// On abort/error the stream's 'close' fires after destroy/error; wait for it (bounded
+		// so a stuck stream cannot hang release) before close(), or the driver answers
+		// NJS-032 and the connection is dropped instead of pooled.
+		if (streamClosed) await boundedWait(streamClosed)
 		// The DML/PL-SQL path keeps fetching implicit rows (readImplicitResults) after
 		// execute() settles. An abort tears the connection down while that fetch is
 		// still in flight; close() before the fetch settles answers NJS-032 and drops
 		// the connection out of the pool instead of returning it - the same race the
-		// row path guards against via streamClosed. Wait for the DML handler, bounded
+		// the row path guards against via streamClosed. Wait for the DML handler, bounded
 		// like streamClosed so a truly stuck fetch cannot hang release.
-		if (dmlDone) {
-			let timer: ReturnType<typeof setTimeout> | undefined
-			const fallback = new Promise<void>((res) => { timer = setTimeout(res, 1000) })
-			await Promise.race([dmlDone, fallback])
-			if (timer !== undefined) clearTimeout(timer)
-		}
+		if (dmlDone) await boundedWait(dmlDone)
 		// close() can itself throw (connection in use after a stream failure); drop it
 		// rather than leak the pool slot silently. A drop discards the session and any
 		// uncommitted work without surfacing it - an accepted trade-off (a lost session is
@@ -439,17 +443,23 @@ export class OraAdapter implements IDbAdapter {
 			// to exhaust). The interrupt promise is remembered for both the abort handler and
 			// the early-abort branch, and a close() that still fails drops the connection.
 			let interrupt: Promise<void> | undefined
-			// An operation (execute() or commit()) is in flight on this connection while
-			// its promise is pending (the statement plus any result-set reads and closes).
+			// Operations (execute() or commit()) are in flight on this connection while
+			// their promise is pending (the statement plus any result-set reads and closes).
 			// break() only interrupts a statement that is actually running: issuing it on
 			// an idle connection leaves the session cancelled and its next statement
 			// answering ORA-01013 (the same rule the early-abort branch below follows).
-			// The abort teardown consults this flag so an abort that lands between
-			// statements (or while the callback does non-DB work) releases the connection
-			// without poisoning it.
-			let operationInFlight = false
+			// A counter (not a boolean) so overlapping statements cannot be hidden by the
+			// first one settling and clearing the flag: the abort teardown must break() as
+			// long as ANY statement is still running.
+			let operationsInFlight = 0
+			// The latest execute() promise (a never-rejecting mirror); close() must wait
+			// for it to settle or the driver answers NJS-032 and drops the connection out
+			// of the pool instead of returning it — the same race execStream guards against
+			// via dmlDone.
+			let inFlightExec: Promise<unknown> | undefined
 			const release = async (): Promise<void> => {
 				if (interrupt) { try { await interrupt } catch {} }
+				if (inFlightExec) await boundedWait(inFlightExec)
 				// close() blocks until the server-side cancel of the interrupted statement
 				// has fully landed, so the connection returns to the pool clean (a broken
 				// cancel would answer ORA-01013 to its next statement). If close() still
@@ -462,7 +472,7 @@ export class OraAdapter implements IDbAdapter {
 				// Only interrupt a statement that is actually running; break() on an idle
 				// connection would leave the session cancelled and its next statement
 				// answering ORA-01013.
-				if (operationInFlight) interrupt = conn.break().catch(() => {})
+				if (operationsInFlight > 0) interrupt = conn.break().catch(() => {})
 				void release()
 			}
 			signal.addEventListener('abort', teardown, { once: true })
@@ -495,8 +505,15 @@ export class OraAdapter implements IDbAdapter {
 					// A statement is in flight from execute() until the whole exec settles
 					// (row reads + implicit-result reads + result-set closes), so the abort
 					// teardown knows there is something to break().
-					operationInFlight = true
-					const clearInFlight = (): void => { operationInFlight = false }
+					operationsInFlight += 1
+					const clearInFlight = (): void => {
+						operationsInFlight -= 1
+						// Nothing left in flight: the close() wait no longer needs the exec
+						// mirror, so a settled exec does not add a pointless boundedWait to the
+						// normal release path (and a parallel-but-forbidden exec still has its
+						// own mirror tracked until the last one settles).
+						if (operationsInFlight === 0) inFlightExec = undefined
+					}
 					const p = conn.execute<Record<string, unknown>>(q.sql, q.binds, { autoCommit: false, outFormat: oracledb.OUT_FORMAT_OBJECT, resultSet: true })
 						.then(async (res) => {
 							// resultSet:true moves a SELECT's rows to res.resultSet (res.rows
@@ -527,6 +544,9 @@ export class OraAdapter implements IDbAdapter {
 							return out
 						})
 						.catch((err) => { throw toDbError(err, 'query') })
+					// Never-rejecting mirror of the in-flight execute(): release()/finally
+					// await it (bounded) so close() does not race the statement into NJS-032.
+					inFlightExec = p.catch(() => {})
 					p.then(clearInFlight, clearInFlight)
 					return p
 				}
@@ -554,11 +574,11 @@ export class OraAdapter implements IDbAdapter {
 					// COMMIT is a statement on the connection too: mark it in flight so an
 					// abort that lands during commit() is interrupted with break() rather than
 					// leaving the session cancelled for its next statement.
-					operationInFlight = true
+					operationsInFlight += 1
 					try {
 						await conn.commit()
 					} finally {
-						operationInFlight = false
+						operationsInFlight -= 1
 					}
 				} catch (err) {
 					// Same race as the cb path above: on an abort the teardown already owns
@@ -571,6 +591,11 @@ export class OraAdapter implements IDbAdapter {
 			} finally {
 				signal.removeEventListener('abort', teardown)
 				if (!signal.aborted) {
+					// A callback that did not await its last exec (fire-and-forget) leaves the
+					// execute() in flight here; wait for it (bounded) before close(), the same
+					// race execStream guards via dmlDone, or close() answers NJS-032 and drops
+					// the connection.
+					if (inFlightExec) await boundedWait(inFlightExec)
 					try { await conn.close() } catch {
 						try { await conn.close({ drop: true }) } catch {}
 					}
