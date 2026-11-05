@@ -373,8 +373,8 @@ export class OraAdapter implements IDbAdapter {
 								emitOwn()
 							}
 							// If isRowQuery misjudged (a SELECT behind an unrecognized prefix)
-							// res.resultSet holds an unread cursor. Close it best-effort so rows
-							// are not silently dropped and the server cursor does not leak
+							// res.resultSet holds an unread cursor. Close it best-effort so the
+							// server cursor does not leak; its rows are dropped either way
 							// (mirrors the tx path, which always closes its result set).
 							try { await res.resultSet?.close() } catch { /* best-effort */ }
 							finish()
