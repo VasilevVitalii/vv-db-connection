@@ -121,6 +121,17 @@ test('version reports both failures when the fallback also fails', async (t) => 
 	assert.match(v.error.message, /fallback also failed/)
 })
 
+// review22 2.2: a NULL in the version column is "no version", not the string "null".
+test('version reports NO_VERSION when the version value is NULL', async (t) => {
+	const db = new DbConnection({ kind: 'ora', host: '127.0.0.1', service: 'x', user: 'u', password: 'p' } as TConnOra)
+	t.mock.method(db, 'exec', async () =>
+		({ ok: true, result: [{ schema: [], rows: [{ VERSION: null }] }] }) as TResult<TDbRes[], TDbError>,
+	)
+	const v = await db.version()
+	assert.equal(v.ok, false)
+	assert.equal((v.error as TDbError).code, 'NO_VERSION')
+})
+
 // review4 §2.6: execTxDynamic validated its timeout after loading the driver, so an invalid
 // timeout on an unknown kind surfaced as a connect error instead of the TypeError the docs
 // promise. The validation must run first and reject before any driver is touched.

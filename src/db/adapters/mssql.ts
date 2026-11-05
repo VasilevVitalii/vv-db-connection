@@ -328,7 +328,7 @@ export class MssqlAdapter implements IDbAdapter {
 					// returned — the res.recordset equivalent.
 					const tracker = new MssqlStatementTracker()
 					let recordsetIndex = -1
-					let rows: Record<string, unknown>[] = []
+					const rows: Record<string, unknown>[] = []
 					let dmlTotal = 0
 					let hasDml = false
 					req.on('recordset', () => {

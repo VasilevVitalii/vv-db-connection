@@ -292,7 +292,12 @@ export class DbConnection {
 		const res = await this.exec(adapter.versionQuery(), [], options)
 		if (res.ok) {
 			const firstRow = res.result[0]?.rows[0]
-			if (firstRow) return { ok: true, result: String(Object.values(firstRow)[0]) }
+			if (firstRow) {
+				const v = Object.values(firstRow)[0]
+				// A NULL (or an empty row) is "no version", not the string "null"/"undefined".
+				if (v == null) return { ok: false, error: { message: 'no version returned', kind: 'query', code: 'NO_VERSION' } }
+				return { ok: true, result: String(v) }
+			}
 			return { ok: false, error: { message: 'no version returned', kind: 'query', code: 'NO_VERSION' } }
 		}
 		// Some servers hide the primary version source from unprivileged users (Oracle's
@@ -303,7 +308,11 @@ export class DbConnection {
 			const fb = await this.exec(adapter.versionFallbackQuery(), [], options)
 			if (fb.ok) {
 				const firstRow = fb.result[0]?.rows[0]
-				if (firstRow) return { ok: true, result: String(Object.values(firstRow)[0]) }
+				if (firstRow) {
+					const v = Object.values(firstRow)[0]
+					if (v == null) return { ok: false, error: { message: 'no version returned (fallback returned NULL)', kind: 'query', code: 'NO_VERSION' } }
+					return { ok: true, result: String(v) }
+				}
 				// The fallback ran (so the primary failure is not the whole story) but also
 				// returned no rows: report that instead of the primary error, which would
 				// hide the fact that the fallback actually succeeded and came back empty.

@@ -427,7 +427,7 @@ export class OraAdapter implements IDbAdapter {
 			// this library to report it through.
 			try { await conn.close() } catch { try { await conn.close({ drop: true }) } catch {} }
 		}
-}
+	}
 
 	async execTxDynamic<T = void>(cb: TDbTxCb<T>, timeoutMs?: number, external?: AbortSignal): Promise<TResult<T, TDbError>> {
 		return withTxTimeout(timeoutMs, async (signal, armCommitDeadline) => {

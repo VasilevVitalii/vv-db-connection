@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { Pool, type PoolClient } from 'pg'
+import { Pool, Query, type PoolClient } from 'pg'
 import { DbConnection } from '../src/index'
 import { PgAdapter, toSchema } from '../src/db/adapters/pg'
 import type { TConnPg } from '../src/db/connection'
@@ -230,6 +230,44 @@ test('pg: execStream tears down and drops the client when abort fires during con
 	assert.equal(queried, 0, 'the query must not run after an abort during connect')
 	assert.equal(released, 1, 'the client must be dropped, not returned to the pool')
 	assert.equal(destroyed, 1, 'the socket must be ripped so nothing runs on the server')
+})
+
+// review22 2.1: a direct adapter consumer used to see buffered stream rows delivered after
+// an abort, because onAbort only tore down the socket and waited for the query to reject.
+// The `done` flag stops those rows: after abort no further events reach the callback.
+test('pg: execStream stops delivering rows after abort (direct adapter)', async (t) => {
+	let stream: Query | undefined
+	let destroyed = 0
+	const fakeClient = {
+		on(): void {},
+		removeListener(): void {},
+		release(): void {},
+		query: (arg: unknown): unknown => {
+			if (arg instanceof Query) { stream = arg; return arg }
+			return Promise.resolve({ rows: [], rowCount: null, command: 'SELECT' })
+		},
+		connection: { stream: { destroy(): void { destroyed += 1 } } },
+	}
+	t.mock.method(Pool.prototype, 'connect', async () => fakeClient as unknown as PoolClient)
+
+	const adapter = new PgAdapter({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
+	const events: { kind: string }[] = []
+	const abort = new AbortController()
+	const run = adapter.execStream('SELECT :p AS n', [{ name: 'p', value: 1 }], (e) => events.push(e), abort.signal)
+
+	// Let the stream path attach its listeners before driving it.
+	await new Promise<void>((resolve) => setImmediate(resolve))
+	assert.ok(stream, 'a parameterized query must take the stream path')
+
+	stream!.emit('row', { n: 1 }, { fields: [{ name: 'n', dataTypeID: 23, dataTypeModifier: -1 }] })
+	abort.abort(new Error('timeout'))
+	stream!.emit('row', { n: 2 }, { fields: [{ name: 'n', dataTypeID: 23, dataTypeModifier: -1 }] })
+	stream!.emit('error', new Error('socket torn down'))
+	await run
+
+	assert.equal(events.filter((e) => e.kind === 'row').length, 1, 'only the row delivered before abort reaches the consumer')
+	assert.equal(destroyed, 1, 'the socket is torn down on abort')
+	assert.equal(events[events.length - 1]!.kind, 'finish', 'the stream ends with a finish event')
 })
 
 // review20 2.1: a parameterless multi-statement query (simple protocol) used to

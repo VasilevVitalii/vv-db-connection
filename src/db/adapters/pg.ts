@@ -182,9 +182,16 @@ export class PgAdapter implements IDbAdapter {
 		// rejects the query but leaves the client healthy), so it also decides whether the
 		// client is returned to the pool or dropped.
 		let broken = false
+		// Once the signal aborts, no further events may reach the consumer (IDbAdapter
+		// contract: events that still come after it are not looked at). DbConnection adds
+		// its own `settled` guard, but a direct adapter consumer relies on this flag to
+		// stop buffered stream rows that a torn-down socket can still deliver before the
+		// query rejects.
+		let done = false
 		const onError = (): void => { broken = true }
 		client.on('error', onError)
 		const onAbort = (): void => {
+			done = true
 			this._teardownClient(client)
 		}
 		signal?.addEventListener('abort', onAbort)
@@ -224,6 +231,7 @@ export class PgAdapter implements IDbAdapter {
 					const stream = new Query({ text, values })
 					let schemaEmitted = false
 					stream.on('row', (row: Record<string, unknown>, result?: { fields?: FieldDef[] }) => {
+						if (done) return
 						if (!schemaEmitted) {
 							schemaEmitted = true
 							callback({ kind: 'schema', schema: toSchema(result?.fields ?? []) })
@@ -232,12 +240,14 @@ export class PgAdapter implements IDbAdapter {
 					})
 					stream.on('error', (err: Error) => reject(err))
 					stream.on('end', (result: { fields?: FieldDef[]; rowCount?: number | null; command?: string }) => {
-						if (!schemaEmitted) {
-							callback({ kind: 'schema', schema: toSchema(result.fields ?? []) })
-						}
-						// Report rows changed by a DML (whitelist, so FETCH/COPY/CTAS stay out).
-						if (result.command !== undefined && isDmlCommand(result.command) && typeof result.rowCount === 'number') {
-							callback({ kind: 'rowsAffected', count: result.rowCount })
+						if (!done) {
+							if (!schemaEmitted) {
+								callback({ kind: 'schema', schema: toSchema(result.fields ?? []) })
+							}
+							// Report rows changed by a DML (whitelist, so FETCH/COPY/CTAS stay out).
+							if (result.command !== undefined && isDmlCommand(result.command) && typeof result.rowCount === 'number') {
+								callback({ kind: 'rowsAffected', count: result.rowCount })
+							}
 						}
 						resolve()
 					})
