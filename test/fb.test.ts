@@ -312,3 +312,43 @@ test('fb: the connection-loss listeners are removed when the transaction ends', 
 	assert.equal(fakeDb.listenerCount('reconnect'), 0, 'reconnect listener must be removed')
 	assert.equal(fakeSocket.listenerCount('close'), 0, 'socket close listener must be removed')
 })
+
+// review19 2.1: a connection lost inside a transaction dropped the socket (connLost →
+// dropConnection) but the cb-throw catch still ran rollback on that dead socket — the
+// driver never answers rollback on a destroyed connection, so the call hung without a
+// deadline (the same class as mssql's tornDown watchdog). The rollback must be skipped
+// once the connection is lost; nothing is left to roll back.
+test('fb: a lost connection before a throwing callback skips rollback on the dead socket', async (t) => {
+	let rollbacks = 0
+	const fakeDb = new EventEmitter() as EventEmitter & Record<string, unknown>
+	const fakeSocket = Object.assign(new EventEmitter(), { destroy: (): void => {} })
+	const fakeDbConn = { _isDetach: false, _retry_connection_id: undefined, _socket: fakeSocket }
+	fakeDb.connection = fakeDbConn
+	const fakeTx = {
+		queryAsync: async (): Promise<unknown> => ({ rows: [], recordCounts: undefined }),
+		commit: (cb: (e: unknown) => void): void => cb(null),
+		rollback: (cb: () => void): void => { rollbacks += 1; cb() },
+	}
+	fakeDb.transaction = (_iso: unknown, cb: (e: unknown, t: unknown) => void): void => cb(null, fakeTx)
+
+	t.mock.method(fbLive, 'attach', (_options: unknown, cb: (err: unknown, db: unknown) => void) => {
+		fbLive.connection = fakeDbConn
+		cb(null, fakeDb)
+	})
+
+	const adapter = new FbAdapter({ kind: 'fb', host: '127.0.0.1', database: '/tmp/x.fdb', user: 'u', password: 'p' } as TConnFb)
+	const r = await adapter.execTxDynamic(async (exec) => {
+		// Lose the connection mid-transaction, then fail: the connection is already
+		// dropped, so rollback must be skipped rather than sent over a dead socket.
+		fakeDb.emit('error', new Error('socket hang up'))
+		await exec('SELECT 1 FROM rdb$database', [])
+		return undefined
+	})
+
+	assert.equal(r.ok, false)
+	if (!r.ok) {
+		assert.equal(r.error.kind, 'query')
+		assert.equal(r.error.code, 'FB_CONN_LOST')
+	}
+	assert.equal(rollbacks, 0, 'rollback must not run on a connection already dropped by connLost')
+})

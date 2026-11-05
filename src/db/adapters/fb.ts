@@ -479,7 +479,9 @@ export class FbAdapter implements IDbAdapter {
 				try {
 					result = await cb(exec, signal)
 				} catch (err) {
-					if (!signal.aborted) { try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {} }
+					// connLost already dropped the socket: rollback would hang on the dead
+					// socket (the driver never answers it), the same class as mssql tornDown.
+					if (!signal.aborted && !connLost) { try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {} }
 					return { ok: false, error: isDbError(err) ? err : toDbError(err, 'user') }
 				}
 				if (connLost) {
@@ -503,7 +505,9 @@ export class FbAdapter implements IDbAdapter {
 						transaction.commit((err: Error | null) => { if (err) reject(err); else resolve() })
 					})
 				} catch (err) {
-					if (!signal.aborted) { try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {} }
+					// connLost already dropped the socket: rollback would hang on the dead
+					// socket (the driver never answers it), the same class as mssql tornDown.
+					if (!signal.aborted && !connLost) { try { await new Promise<void>((resolve) => { transaction.rollback(() => resolve()) }) } catch {} }
 					return { ok: false, error: toDbError(err, 'tx') }
 				}
 				return { ok: true, result }
