@@ -501,6 +501,11 @@ export class FbAdapter implements IDbAdapter {
 					// server may already have committed, so a plain timeout would make a
 					// retry double-apply. The external abort still applies.
 					armCommitDeadline()
+					// connLost may fire while this COMMIT is already in flight: watchConnection
+					// rips the socket, and completing the commit then relies on node-firebird
+					// rejecting the pending op on the dead socket (see dropConnection). With a
+					// deadline armCommitDeadline bounds it anyway; without one there is no hard
+					// bound — accepted debt.
 					await new Promise<void>((resolve, reject) => {
 						transaction.commit((err: Error | null) => { if (err) reject(err); else resolve() })
 					})

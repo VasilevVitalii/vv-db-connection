@@ -313,20 +313,24 @@ export class PgAdapter implements IDbAdapter {
 							// whose results pg delivers as an array of per-statement results
 							// (each with its own rows/command/rowCount).
 							if (Array.isArray(res)) {
-								const rows = res.flatMap((r) => r.rows ?? [])
+								// README contract: a transaction statement returns a single set —
+								// the first recordset, the rest dropped (same as mssql). A DML
+								// statement contributes no recordset (empty fields), so "first
+								// recordset" = the first set that has columns.
+								const first = res.find((r) => (r.fields?.length ?? 0) > 0)
 								const dml = res.filter((r) => isDmlCommand(r.command))
 								const affected = dml.reduce((n, r) => n + (r.rowCount ?? 0), 0)
 								return {
-									rows:         rows as Record<string, unknown>[],
-									rowsAffected: dml.length > 0 ? affected : undefined,
+									rows: (first?.rows ?? []) as Record<string, unknown>[],
+									...(dml.length > 0 ? { rowsAffected: affected } : {}),
 								}
 							}
 							return {
-								rows:         res.rows as Record<string, unknown>[],
+								rows: res.rows as Record<string, unknown>[],
 								// DML only (TDbRes.rowsAffected contract): report the count for
 								// INSERT/UPDATE/DELETE/MERGE (RETURNING included), nothing for
 								// SELECT/FETCH/COPY/CTAS.
-								rowsAffected: isDmlCommand(res.command) ? res.rowCount ?? undefined : undefined,
+								...(isDmlCommand(res.command) && res.rowCount != null ? { rowsAffected: res.rowCount } : {}),
 							}
 						},
 						// Tag the failure as a DB query error so it stays 'query' even when

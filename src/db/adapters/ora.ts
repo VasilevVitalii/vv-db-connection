@@ -531,8 +531,8 @@ export class OraAdapter implements IDbAdapter {
 							const implicit = await readImplicitResults(res)
 							const out: TDbTxResult = {
 								rows,
-								rowsAffected: res.rowsAffected,
-								outParams:    res.outBinds as Record<string, unknown> | undefined,
+								...(res.rowsAffected != null ? { rowsAffected: res.rowsAffected } : {}),
+								...(res.outBinds != null ? { outParams: res.outBinds as Record<string, unknown> } : {}),
 							}
 							if (implicit.length > 0) out.implicitResults = implicit
 							return out

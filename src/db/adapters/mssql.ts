@@ -376,7 +376,7 @@ export class MssqlAdapter implements IDbAdapter {
 							signal.removeEventListener('abort', onAbort)
 							if (watchdog !== undefined) { clearTimeout(watchdog); watchdog = undefined }
 							if (error.err) reject(toDbError(error.err, 'query'))
-							else resolve({ rows, rowsAffected: hasDml ? dmlTotal : undefined })
+							else resolve({ rows, ...(hasDml ? { rowsAffected: dmlTotal } : {}) })
 						}
 						// 'done' is not guaranteed to follow every failure in every mssql
 						// release, but mssql also emits 'error' for every statement-level

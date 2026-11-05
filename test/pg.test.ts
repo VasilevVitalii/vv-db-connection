@@ -231,3 +231,39 @@ test('pg: execStream tears down and drops the client when abort fires during con
 	assert.equal(released, 1, 'the client must be dropped, not returned to the pool')
 	assert.equal(destroyed, 1, 'the socket must be ripped so nothing runs on the server')
 })
+
+// review20 2.1: a parameterless multi-statement query (simple protocol) used to
+// flatMap-concatenate the rows of every result set, losing the boundary between sets and
+// diverging from README:280 ("first recordset kept, the rest dropped", as mssql does).
+// Only the first set with columns must come back; the rest are dropped.
+test('pg: a multi-statement tx exec keeps only the first result set', async (t) => {
+	const fakeClient = {
+		on(): void {},
+		removeListener(): void {},
+		release(): void {},
+		connection: { stream: { destroy(): void {} } },
+		query: async (arg: unknown): Promise<unknown> => {
+			const text = typeof arg === 'string' ? arg : (arg as { text?: string }).text
+			if (text === 'BEGIN' || text === 'COMMIT') {
+				return { rows: [], rowCount: null, command: text }
+			}
+			// A parameterless multi-statement query: pg delivers an array of results.
+			return [
+				{ rows: [{ n: 1 }], fields: [{ name: 'n' }], command: 'SELECT', rowCount: null },
+				{ rows: [{ n: 2 }], fields: [{ name: 'n' }], command: 'SELECT', rowCount: null },
+			]
+		},
+	}
+	t.mock.method(Pool.prototype, 'connect', async () => fakeClient as unknown as PoolClient)
+
+	const adapter = new PgAdapter({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
+	const r = await adapter.execTxDynamic(async (exec) => {
+		const res = await exec('SELECT 1; SELECT 2', [])
+		assert.equal(res.rows.length, 1, 'only the first result set is kept, the rest are dropped')
+		assert.equal((res.rows[0] as { n: number }).n, 1)
+		assert.ok(!('rowsAffected' in res), 'a SELECT leaves rowsAffected unset')
+		return undefined
+	})
+
+	assert.equal(r.ok, true)
+})
