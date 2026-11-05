@@ -401,6 +401,7 @@ export class MssqlAdapter implements IDbAdapter {
 								watchdog = undefined
 								if (settled) return
 								settled = true
+								signal.removeEventListener('abort', onAbort)
 								tornDown = true
 								teardown()
 								reject(toDbError(error.err ?? new Error(`mssql: no activity from the driver within ${windowMs}ms`), 'query'))
@@ -416,6 +417,11 @@ export class MssqlAdapter implements IDbAdapter {
 						// rollback below on a connection the failed request still holds. Record
 						// it and let the 'done' listener reject once the connection is free.
 						req.query(q).catch((err) => { error.err = err; armWatchdog() })
+					// Arm the watchdog for the statement's whole lifetime, not just after the
+					// first event: a statement silent from the very first moment (a dead
+					// socket right after send, a WAITFOR with nothing to stream) must be cut
+					// too, not only one that goes silent after it already started emitting.
+					armWatchdog()
 					})
 				}
 				// The callback's resolved value is the transaction's result: it is only

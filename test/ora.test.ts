@@ -959,3 +959,65 @@ test('ora: execTxDynamic close() waits for an unawaited earlier exec, not just t
 	assert.equal(closed, 1, 'close must return the connection to the pool, not drop it')
 	assert.equal(dropped, 0)
 })
+
+// review18 2.2: COMMIT was counted in operationsInFlight (so an abort interrupted it with
+// break()) but its promise was NOT in inFlightExecs, so release() waited only for break()
+// and then close() raced a commit that had not yet reacted to break() into NJS-032 — the
+// connection was dropped (recreated) instead of returned to the pool. The commit promise
+// must join the Set so close() waits for it to settle.
+test('ora: execTxDynamic close() waits for an aborted commit before releasing (no NJS-032 drop)', async (t) => {
+	let commitPending = false
+	let commitResolve!: () => void
+	let breakResolve!: () => void
+	let closed = 0
+	let dropped = 0
+	const fakeConn = {
+		break: () => new Promise<void>((resolve) => { breakResolve = resolve }),
+		close: (opts?: { drop?: boolean }) => {
+			if (opts?.drop) { dropped += 1; return Promise.resolve() }
+			// close() while the commit is still in flight answers NJS-032; the fix must
+			// have waited for the commit to settle, so only the OLD code (commit outside
+			// the Set) hits this and drops the slot.
+			if (commitPending) return Promise.reject(Object.assign(new Error('NJS-032: connection cannot be released'), { code: 'NJS-032' }))
+			closed += 1
+			return Promise.resolve()
+		},
+		rollback: () => Promise.resolve(),
+		commit: () => {
+			commitPending = true
+			return new Promise<void>((resolve) => { commitResolve = () => { commitPending = false; resolve() } })
+		},
+		execute: () => { throw new Error('unexpected execute()') },
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: '127.0.0.1', port: 1521, service: 'x', user: 'u', password: 'p' } as TConnOra)
+	const controller = new AbortController()
+	const p = adapter.execTxDynamic(async () => { /* straight to COMMIT */ }, undefined, controller.signal)
+
+	// Wait until commit() is in flight, then abort: teardown calls break() (the commit is
+	// in flight) and release() must wait for the commit to settle before close().
+	for (let i = 0; i < 100 && !commitPending; i++) {
+		await new Promise((resolve) => setImmediate(resolve))
+	}
+	assert.ok(commitPending, 'the commit must be in flight')
+
+	controller.abort(new Error('cancel'))
+	breakResolve() // let release() get past the break() await and reach the commit wait
+
+	for (let i = 0; i < 100; i++) {
+		await new Promise((resolve) => setImmediate(resolve))
+	}
+	// close() must not have run yet: the commit is still in flight and must be awaited.
+	assert.equal(closed, 0)
+	assert.equal(dropped, 0)
+
+	commitResolve() // commit settles → release() may now close() clean
+	const r = await p
+	await new Promise((resolve) => setImmediate(resolve))
+
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'aborted')
+	assert.equal(closed, 1, 'close must return the connection to the pool, not drop it')
+	assert.equal(dropped, 0)
+})

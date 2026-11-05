@@ -351,7 +351,7 @@ test('execTxDynamic rejects via fallback when done never follows the stream erro
 	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
 
 	// Arm the watchdog manually so the test does not wait the real window: capture
-	// the callback and fire it once the error has been emitted and the watchdog armed.
+	// the callback and fire it once the watchdog is armed.
 	let fallbackFn!: () => void
 	let handle: unknown
 	const setT = t.mock.method(globalThis, 'setTimeout', (fn: () => void) => {
@@ -376,7 +376,7 @@ test('execTxDynamic rejects via fallback when done never follows the stream erro
 	for (let i = 0; i < 100 && !fallbackFn; i++) {
 		await new Promise((resolve) => setImmediate(resolve))
 	}
-	assert.ok(fallbackFn, 'the fallback timer must be armed after the error event')
+	assert.ok(fallbackFn, 'the fallback timer must be armed at statement send')
 	fallbackFn() // fire the fallback
 	const r = await p
 
@@ -417,11 +417,11 @@ test('execTxDynamic watchdog window follows the transaction deadline, not a fixe
 	void adapter.execTxDynamic(async (exec) => { await exec('SELECT 1', []) }, 5000)
 
 	// The deadline timer (armed by withTxTimeout) and then the watchdog both go through
-	// setTimeout; wait until the error event has armed the watchdog.
+	// setTimeout; wait until the watchdog is armed.
 	for (let i = 0; i < 100 && delays.length < 2; i++) {
 		await new Promise((resolve) => setImmediate(resolve))
 	}
-	assert.ok(delays.length >= 2, 'the watchdog must be armed after the error event')
+	assert.ok(delays.length >= 2, 'the watchdog must be armed at statement send')
 	assert.ok(!delays.includes(1000), 'the watchdog must not use a fixed 1s window')
 	// delays[0] is withTxTimeout's own deadline timer (also 5000); assert the second
 	// timer (the watchdog) specifically — a bare includes() would pass on the deadline
@@ -515,7 +515,7 @@ test('execTxDynamic skips rollback after the watchdog tears the socket down', as
 	for (let i = 0; i < 100 && !watchdogFn; i++) {
 		await new Promise((resolve) => setImmediate(resolve))
 	}
-	assert.ok(watchdogFn, 'the watchdog must be armed after the error event')
+	assert.ok(watchdogFn, 'the watchdog must be armed at statement send')
 	watchdogFn() // fire the watchdog
 
 	const r = await p
@@ -566,15 +566,61 @@ test('execTxDynamic clears the watchdog when the signal aborts mid-exec', async 
 	for (let i = 0; i < 100 && watchdogHandles.length < 1; i++) {
 		await new Promise((resolve) => setImmediate(resolve))
 	}
-	assert.ok(watchdogHandles.length >= 1, 'the watchdog must be armed after the error event')
+	assert.ok(watchdogHandles.length >= 1, 'the watchdog must be armed at statement send')
 	controller.abort(new Error('cancel'))
 
 	const r = await p
 	assert.equal(r.ok, false)
 	if (!r.ok) assert.equal(r.error.kind, 'aborted')
 	assert.equal(destroyed, 1, 'abort must tear the socket down')
-	assert.ok(cleared.includes(watchdogHandles[0]), 'abort must clear the watchdog so it does not outlive the exec')
+	assert.ok(watchdogHandles.every((h) => cleared.includes(h)), 'every watchdog timer must be cleared so none outlives the exec')
 
 	setT.mock.restore()
 	clearT.mock.restore()
+})
+
+// review18 2.1: the watchdog was armed only on liveness events, so a statement silent
+// from the very first moment (a dead socket right after send, a WAITFOR with nothing to
+// stream) was never cut without a deadline — the timer was never armed. The watchdog must
+// be armed at send, covering the statement's whole lifetime.
+test('execTxDynamic cuts a statement silent from the start (watchdog armed at send)', async (t) => {
+	let destroyed = 0
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = {
+			socket: { destroy: () => { destroyed += 1 } },
+		}
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+
+	// No deadline: the watchdog (windowMs = the 15s fallback) is the only timer. The
+	// query emits NOTHING and never 'done', so the watchdog is the only way out.
+	let watchdogFn!: () => void
+	const setT = t.mock.method(globalThis, 'setTimeout', (fn: () => void) => {
+		watchdogFn = fn
+		return { fn }
+	})
+
+	t.mock.method(sql.Request.prototype, 'query', function () {
+		return new Promise(() => {}) // emits no event, never 'done'
+	})
+
+	const adapter = new MssqlAdapter(conn)
+	const p = adapter.execTxDynamic(async (exec) => { await exec('SELECT 1', []) })
+
+	for (let i = 0; i < 100 && !watchdogFn; i++) {
+		await new Promise((resolve) => setImmediate(resolve))
+	}
+	assert.ok(watchdogFn, 'the watchdog must be armed at statement send, not only after the first event')
+	watchdogFn()
+
+	const r = await p
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'query')
+	assert.equal(destroyed, 1, 'the watchdog must tear the socket down on a statement silent from the start')
+
+	setT.mock.restore()
 })

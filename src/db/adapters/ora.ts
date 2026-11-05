@@ -574,12 +574,21 @@ export class OraAdapter implements IDbAdapter {
 					armCommitDeadline()
 					// COMMIT is a statement on the connection too: mark it in flight so an
 					// abort that lands during commit() is interrupted with break() rather than
-					// leaving the session cancelled for its next statement.
+					// leaving the session cancelled for its next statement. Its promise also
+					// joins inFlightExecs (a never-rejecting mirror), so release() waits for the
+					// commit to settle before close() — otherwise close() races a commit that has
+					// not yet reacted to break() into NJS-032 and drops the slot (review18 2.2).
+					// await the ORIGINAL promise, so a commit error still propagates to the
+					// 'tx' catch below.
 					operationsInFlight += 1
+					const commitP = conn.commit()
+					const commitMirror = commitP.catch(() => {})
+					inFlightExecs.add(commitMirror)
 					try {
-						await conn.commit()
+						await commitP
 					} finally {
 						operationsInFlight -= 1
+						inFlightExecs.delete(commitMirror)
 					}
 				} catch (err) {
 					// Same race as the cb path above: on an abort the teardown already owns
