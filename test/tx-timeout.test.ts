@@ -350,8 +350,8 @@ test('execTxDynamic rejects via fallback when done never follows the stream erro
 	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
 	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
 
-	// Arm the fallback manually so the test does not wait the real 1s: capture the
-	// callback and fire it once the error has been emitted and the fallback armed.
+	// Arm the watchdog manually so the test does not wait the real window: capture
+	// the callback and fire it once the error has been emitted and the watchdog armed.
 	let fallbackFn!: () => void
 	let handle: unknown
 	const setT = t.mock.method(globalThis, 'setTimeout', (fn: () => void) => {
@@ -423,7 +423,10 @@ test('execTxDynamic watchdog window follows the transaction deadline, not a fixe
 	}
 	assert.ok(delays.length >= 2, 'the watchdog must be armed after the error event')
 	assert.ok(!delays.includes(1000), 'the watchdog must not use a fixed 1s window')
-	assert.ok(delays.includes(5000), 'the watchdog window must be the transaction deadline (5000ms)')
+	// delays[0] is withTxTimeout's own deadline timer (also 5000); assert the second
+	// timer (the watchdog) specifically — a bare includes() would pass on the deadline
+	// alone even if the watchdog window were wrong.
+	assert.equal(delays[1], 5000, 'the watchdog window must be the transaction deadline (5000ms)')
 
 	setT.mock.restore()
 })
@@ -522,4 +525,56 @@ test('execTxDynamic skips rollback after the watchdog tears the socket down', as
 	assert.equal(rollbacks, 0, 'rollback must be skipped on a socket the watchdog already tore down')
 
 	setT.mock.restore()
+})
+
+// review17 2.2: an abort must clear the watchdog — otherwise the timer outlives the
+// exec (up to windowMs) and holds the event loop after the transaction already
+// settled (the same class review9 2.2 fixed for armCommitDeadline).
+test('execTxDynamic clears the watchdog when the signal aborts mid-exec', async (t) => {
+	let destroyed = 0
+	t.mock.method(sql.ConnectionPool.prototype, 'connect', function (this: sql.ConnectionPool) { return Promise.resolve(this) })
+	t.mock.method(sql.ConnectionPool.prototype, 'close', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'begin', function (this: sql.Transaction) {
+		;(this as unknown as { _acquiredConnection: unknown })._acquiredConnection = {
+			socket: { destroy: () => { destroyed += 1 } },
+		}
+		return Promise.resolve()
+	})
+	t.mock.method(sql.Transaction.prototype, 'rollback', () => Promise.resolve())
+	t.mock.method(sql.Transaction.prototype, 'commit', () => Promise.resolve())
+
+	// No deadline: the watchdog is the only timer armed (windowMs = the 15s fallback),
+	// so the deadline timer does not crowd the captured handles.
+	const watchdogHandles: unknown[] = []
+	const cleared: unknown[] = []
+	const setT = t.mock.method(globalThis, 'setTimeout', (fn: () => void) => {
+		const handle = { fn }
+		watchdogHandles.push(handle)
+		return handle
+	})
+	const clearT = t.mock.method(globalThis, 'clearTimeout', (h: unknown) => { cleared.push(h) })
+
+	t.mock.method(sql.Request.prototype, 'query', function (this: sql.Request) {
+		setImmediate(() => { this.emit('error', new Error('boom')) })
+		return new Promise(() => {}) // never emits 'done' — only abort can settle it
+	})
+
+	const adapter = new MssqlAdapter(conn)
+	const controller = new AbortController()
+	const p = adapter.execTxDynamic(async (exec) => { await exec('SELECT 1', []) }, undefined, controller.signal)
+
+	for (let i = 0; i < 100 && watchdogHandles.length < 1; i++) {
+		await new Promise((resolve) => setImmediate(resolve))
+	}
+	assert.ok(watchdogHandles.length >= 1, 'the watchdog must be armed after the error event')
+	controller.abort(new Error('cancel'))
+
+	const r = await p
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'aborted')
+	assert.equal(destroyed, 1, 'abort must tear the socket down')
+	assert.ok(cleared.includes(watchdogHandles[0]), 'abort must clear the watchdog so it does not outlive the exec')
+
+	setT.mock.restore()
+	clearT.mock.restore()
 })

@@ -904,3 +904,58 @@ test('ora: an abort still breaks() while a later statement is in flight (counter
 	if (!r.ok) assert.equal(r.error.kind, 'aborted')
 	assert.equal(broken, 1, 'break() must still interrupt the second, still-running statement')
 })
+
+// review17 2.3: close() waited only for the LATEST in-flight execute (a single
+// inFlightExec slot), so with two overlapping executes the earlier one — still running
+// when the later one settled — was invisible to close(), which then answered NJS-032 and
+// dropped the connection. A Set of mirrors makes close() wait for ALL of them.
+test('ora: execTxDynamic close() waits for an unawaited earlier exec, not just the latest (Set)', async (t) => {
+	const deferred: Array<{ resolve: (v: unknown) => void; reject: (e: Error) => void }> = []
+	let pending = 0 // execute() calls not yet settled
+	let closed = 0
+	let dropped = 0
+	const fakeConn = {
+		break: () => Promise.resolve(),
+		close: (opts?: { drop?: boolean }) => {
+			if (opts?.drop) { dropped += 1; return Promise.resolve() }
+			// close() while ANY execute is still in flight answers NJS-032; the fix must
+			// have waited for both, so only the OLD code (single latest-slot) hits this.
+			if (pending > 0) return Promise.reject(Object.assign(new Error('NJS-032: connection cannot be released'), { code: 'NJS-032' }))
+			closed += 1
+			return Promise.resolve()
+		},
+		rollback: () => Promise.resolve(),
+		commit: () => Promise.resolve(),
+		execute: () => {
+			pending += 1
+			return new Promise((resolve, reject) => {
+				deferred.push({
+					resolve: (v) => { pending -= 1; resolve(v) },
+					reject: (e) => { pending -= 1; reject(e) },
+				})
+			})
+		},
+	}
+	t.mock.method(oracledb, 'createPool', () => Promise.resolve({ getConnection: async () => fakeConn, close: async () => {} }))
+
+	const adapter = new OraAdapter({ kind: 'ora', host: '127.0.0.1', port: 1521, service: 'x', user: 'u', password: 'p' } as TConnOra)
+	const run = adapter.execTxDynamic(async (exec) => {
+		const p1 = exec('SELECT 1 FROM dual', []) // deferred[0] — fire-and-forget, stays in flight
+		const p2 = exec('SELECT 2 FROM dual', []) // deferred[1] — awaited
+		deferred[1]!.resolve({ resultSet: undefined, rowsAffected: 0, implicitResults: undefined, outBinds: undefined })
+		await p2 // the latest settles; the earlier one is still running
+	})
+
+	await new Promise((resolve) => setImmediate(resolve)) // cb returned; finally is waiting on the Set
+	// close() must not have run yet: the earlier exec is still in flight (pending === 1).
+	assert.equal(closed, 0)
+	assert.equal(dropped, 0)
+
+	deferred[0]!.resolve({ resultSet: undefined, rowsAffected: 0, implicitResults: undefined, outBinds: undefined })
+	const r = await run
+	await new Promise((resolve) => setImmediate(resolve))
+
+	assert.equal(r.ok, true)
+	assert.equal(closed, 1, 'close must return the connection to the pool, not drop it')
+	assert.equal(dropped, 0)
+})

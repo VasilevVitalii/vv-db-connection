@@ -452,14 +452,16 @@ export class OraAdapter implements IDbAdapter {
 			// first one settling and clearing the flag: the abort teardown must break() as
 			// long as ANY statement is still running.
 			let operationsInFlight = 0
-			// The latest execute() promise (a never-rejecting mirror); close() must wait
-			// for it to settle or the driver answers NJS-032 and drops the connection out
-			// of the pool instead of returning it — the same race execStream guards against
-			// via dmlDone.
-			let inFlightExec: Promise<unknown> | undefined
+			// Every in-flight execute() promise (each a never-rejecting mirror); close()
+			// must wait for all of them to settle or the driver answers NJS-032 and drops
+			// the connection out of the pool instead of returning it — the same race
+			// execStream guards against via dmlDone. A Set (not a single "latest" slot)
+			// so a still-running earlier execute() cannot be hidden by a later one
+			// settling first (review17 2.3).
+			const inFlightExecs = new Set<Promise<unknown>>()
 			const release = async (): Promise<void> => {
 				if (interrupt) { try { await interrupt } catch {} }
-				if (inFlightExec) await boundedWait(inFlightExec)
+				if (inFlightExecs.size > 0) await boundedWait(Promise.all([...inFlightExecs]))
 				// close() blocks until the server-side cancel of the interrupted statement
 				// has fully landed, so the connection returns to the pool clean (a broken
 				// cancel would answer ORA-01013 to its next statement). If close() still
@@ -506,14 +508,6 @@ export class OraAdapter implements IDbAdapter {
 					// (row reads + implicit-result reads + result-set closes), so the abort
 					// teardown knows there is something to break().
 					operationsInFlight += 1
-					const clearInFlight = (): void => {
-						operationsInFlight -= 1
-						// Nothing left in flight: the close() wait no longer needs the exec
-						// mirror, so a settled exec does not add a pointless boundedWait to the
-						// normal release path (and a parallel-but-forbidden exec still has its
-						// own mirror tracked until the last one settles).
-						if (operationsInFlight === 0) inFlightExec = undefined
-					}
 					const p = conn.execute<Record<string, unknown>>(q.sql, q.binds, { autoCommit: false, outFormat: oracledb.OUT_FORMAT_OBJECT, resultSet: true })
 						.then(async (res) => {
 							// resultSet:true moves a SELECT's rows to res.resultSet (res.rows
@@ -544,9 +538,16 @@ export class OraAdapter implements IDbAdapter {
 							return out
 						})
 						.catch((err) => { throw toDbError(err, 'query') })
-					// Never-rejecting mirror of the in-flight execute(): release()/finally
-					// await it (bounded) so close() does not race the statement into NJS-032.
-					inFlightExec = p.catch(() => {})
+					// Never-rejecting mirror of this in-flight execute(): release()/finally
+					// await every mirror (bounded) so close() does not race a still-running
+					// statement into NJS-032. Each exec removes its own mirror on settle, so
+					// a settled exec never adds a pointless boundedWait to the release path.
+					const mirror = p.catch(() => {})
+					inFlightExecs.add(mirror)
+					const clearInFlight = (): void => {
+						operationsInFlight -= 1
+						inFlightExecs.delete(mirror)
+					}
 					p.then(clearInFlight, clearInFlight)
 					return p
 				}
@@ -592,10 +593,10 @@ export class OraAdapter implements IDbAdapter {
 				signal.removeEventListener('abort', teardown)
 				if (!signal.aborted) {
 					// A callback that did not await its last exec (fire-and-forget) leaves the
-					// execute() in flight here; wait for it (bounded) before close(), the same
-					// race execStream guards via dmlDone, or close() answers NJS-032 and drops
-					// the connection.
-					if (inFlightExec) await boundedWait(inFlightExec)
+					// execute() in flight here; wait for every one (bounded) before close(),
+					// the same race execStream guards via dmlDone, or close() answers NJS-032
+					// and drops the connection.
+					if (inFlightExecs.size > 0) await boundedWait(Promise.all([...inFlightExecs]))
 					try { await conn.close() } catch {
 						try { await conn.close({ drop: true }) } catch {}
 					}

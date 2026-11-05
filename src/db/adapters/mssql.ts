@@ -356,9 +356,24 @@ export class MssqlAdapter implements IDbAdapter {
 						const error: { err: Error | null } = { err: null }
 						let settled = false
 						let watchdog: ReturnType<typeof setTimeout> | undefined
+						// An abort tears the socket down (the transaction's teardown), but this
+						// exec's watchdog would otherwise outlive it — up to windowMs — if
+						// 'done' never follows the teardown, keeping the event loop alive after
+						// withTxTimeout has already returned (the same leak review9 2.2 fixed
+						// for armCommitDeadline). Settle on abort so the timer is cleared and the
+						// promise does not hang; reject with the abort error, matching the exec
+						// contract (once the signal is aborted, exec rejects rather than run).
+						const onAbort = (): void => {
+							if (settled) return
+							settled = true
+							if (watchdog !== undefined) { clearTimeout(watchdog); watchdog = undefined }
+							reject(abortError(signal.reason))
+						}
+						signal.addEventListener('abort', onAbort, { once: true })
 						const settleDone = (): void => {
 							if (settled) return
 							settled = true
+							signal.removeEventListener('abort', onAbort)
 							if (watchdog !== undefined) { clearTimeout(watchdog); watchdog = undefined }
 							if (error.err) reject(toDbError(error.err, 'query'))
 							else resolve({ rows, rowsAffected: hasDml ? dmlTotal : undefined })
@@ -367,9 +382,11 @@ export class MssqlAdapter implements IDbAdapter {
 						// release, but mssql also emits 'error' for every statement-level
 						// failure (constraint, RAISERROR) while the batch keeps running — so a
 						// fixed timer armed on 'error' alone would rip the socket out from under
-						// a still-running batch. This is a liveness watchdog instead: re-armed on
-						// every event that proves the batch is alive (recordset/row/rowsaffected),
-						// it fires only after `windowMs` of total silence — the one reliable
+						// a still-running batch. This is a liveness watchdog instead: armed and
+						// re-armed on every event that proves the batch is alive
+						// (recordset/row/rowsaffected) — including on a fully successful batch,
+						// where it still guards a driver that silently stops mid-stream — it
+						// fires only after `windowMs` of total silence — the one reliable
 						// symptom of "done will never arrive" (a silently dead socket). The window
 						// is the transaction's own deadline when one is set; without one the
 						// fallback constant still bounds a bare execTxDynamic. Firing tears the
@@ -386,7 +403,7 @@ export class MssqlAdapter implements IDbAdapter {
 								settled = true
 								tornDown = true
 								teardown()
-								reject(toDbError(error.err ?? new Error('mssql: statement failed and the driver never emitted done'), 'query'))
+								reject(toDbError(error.err ?? new Error(`mssql: no activity from the driver within ${windowMs}ms`), 'query'))
 							}, windowMs)
 						}
 						req.on('recordset', armWatchdog)
