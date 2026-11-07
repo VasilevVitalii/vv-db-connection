@@ -1,5 +1,5 @@
 import type { TResult } from '../tresult'
-import type { TDbError, TDbErrorKind } from './types'
+import { DB_ERROR_KINDS, type TDbError, type TDbErrorKind } from './types'
 
 // Builds a TDbError from whatever a driver throws. Each driver reports its own code in a
 // different field, and the most specific one must win: mssql's `number` (1205, 2627) is
@@ -28,7 +28,7 @@ export function isDbError(err: unknown): err is TDbError {
 	if (typeof err !== 'object' || err === null) return false
 	const e = err as { message?: unknown; kind?: unknown; code?: unknown; stack?: unknown }
 	return typeof e.message === 'string'
-		&& (e.kind === 'connect' || e.kind === 'query' || e.kind === 'tx' || e.kind === 'user' || e.kind === 'timeout' || e.kind === 'aborted')
+		&& (DB_ERROR_KINDS as readonly string[]).includes(e.kind as string)
 		// A real TDbError carries an error identifier (toDbError folds number/gdscode/
 		// sqlState into `code`) or a stack from the underlying Error. A bare {message,
 		// kind} literal is a user throw, not a database error.

@@ -10,7 +10,7 @@ const unknown = { kind: 'unknown' } as unknown as TConnectionParam
 // review3 §2.2: a missing/unloadable driver (or an unknown kind) must surface through the
 // normal result contract - a finish event for execStream, { ok: false } for the rest -
 // never a bare rejection that escapes the DbConnection layer.
-test('execStream ends with a finish event when the driver kind is unknown', async (t) => {
+test('execStream ends with a finish event when the driver kind is unknown', async () => {
 	const db = new DbConnection(unknown)
 	const events: TDbStreamEvent[] = []
 	await db.execStream('SELECT 1', [], (e) => events.push(e))
@@ -20,7 +20,7 @@ test('execStream ends with a finish event when the driver kind is unknown', asyn
 	assert.equal(e.error.kind, 'connect')
 })
 
-test('version/ping/execTxDynamic return { ok: false } when the driver kind is unknown', async (t) => {
+test('version/ping/execTxDynamic return { ok: false } when the driver kind is unknown', async () => {
 	const db = new DbConnection(unknown)
 	const v = await db.version()
 	assert.equal(v.ok, false)

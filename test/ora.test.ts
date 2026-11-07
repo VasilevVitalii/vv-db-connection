@@ -24,7 +24,7 @@ runDbSuite('ora', conn, 'SELECT :v AS v FROM dual', {
 
 // review2 2.9: a SELECT hidden behind a leading comment used to be misrouted to
 // execute(), which discards rows - the same query returned an empty result silently.
-test('ora: SELECT behind a leading comment still returns rows', { skip }, async (t) => {
+test('ora: SELECT behind a leading comment still returns rows', { skip }, async () => {
 	const db = new DbConnection(conn!)
 	try {
 		const r = await db.exec('/* leading comment */ SELECT :v AS v FROM dual', [{ name: 'v', value: 'hello' }])
@@ -40,35 +40,35 @@ test('ora: SELECT behind a leading comment still returns rows', { skip }, async 
 
 // review2 §3 (group A): TDbParam.type pins the oracledb bind type instead of letting the
 // driver infer it from the JS value. No live database needed.
-test('ora: a typed param builds a BIND_IN bind parameter', async (t) => {
+test('ora: a typed param builds a BIND_IN bind parameter', async () => {
 	const b = oraBind({ name: 'x', value: 42, type: 'NUMBER' }) as { dir: number; type: unknown; val: unknown }
 	assert.equal(b.dir, oracledb.BIND_IN)
 	assert.ok(b.type)
 	assert.equal(b.val, 42)
 })
 
-test('ora: an untyped param passes the raw value through', async (t) => {
+test('ora: an untyped param passes the raw value through', async () => {
 	assert.equal(oraBind({ name: 'x', value: 'abc' }), 'abc')
 })
 
-test('ora: an unknown type name throws', async (t) => {
+test('ora: an unknown type name throws', async () => {
 	assert.throws(() => oraBind({ name: 'x', value: 1, type: 'NoSuch' }), /unknown param type: NoSuch/)
 })
 
 // review2 §3 (group A): out/inout binds. oracledb needs a type to allocate the out
 // buffer, so a direction out/inout without `type` is rejected client-side.
-test('ora: an out param without a type throws', async (t) => {
+test('ora: an out param without a type throws', async () => {
 	assert.throws(() => oraBind({ name: 'x', value: 42, direction: 'out' }), /out parameter x needs a type/)
 })
 
-test('ora: an out param builds a BIND_OUT bind with no in value', async (t) => {
+test('ora: an out param builds a BIND_OUT bind with no in value', async () => {
 	const b = oraBind({ name: 'x', value: 42, type: 'NUMBER', direction: 'out' }) as { dir: number; type: unknown; val: unknown }
 	assert.equal(b.dir, oracledb.BIND_OUT)
 	assert.ok(b.type)
 	assert.equal(b.val, undefined)
 })
 
-test('ora: an inout param keeps its value and sets BIND_INOUT', async (t) => {
+test('ora: an inout param keeps its value and sets BIND_INOUT', async () => {
 	const b = oraBind({ name: 'x', value: 42, type: 'NUMBER', direction: 'inout' }) as { dir: number; type: unknown; val: unknown }
 	assert.equal(b.dir, oracledb.BIND_INOUT)
 	assert.equal(b.val, 42)
@@ -76,7 +76,7 @@ test('ora: an inout param keeps its value and sets BIND_INOUT', async (t) => {
 
 // review2 §3 (group A): out/inout binds against a live Oracle - the value comes back in
 // TDbRes.outParams via oracledb outBinds.
-test('ora: an OUT parameter returns its value in outParams', { skip }, async (t) => {
+test('ora: an OUT parameter returns its value in outParams', { skip }, async () => {
 	const db = new DbConnection(conn!)
 	try {
 		const r = await db.exec('BEGIN :n := 42; END;', [{ name: 'n', direction: 'out', type: 'NUMBER' }])
@@ -88,7 +88,7 @@ test('ora: an OUT parameter returns its value in outParams', { skip }, async (t)
 	}
 })
 
-test('ora: an INOUT parameter keeps its input and returns the updated value', { skip }, async (t) => {
+test('ora: an INOUT parameter keeps its input and returns the updated value', { skip }, async () => {
 	const db = new DbConnection(conn!)
 	try {
 		const r = await db.exec('BEGIN :n := :n * 2; END;', [{ name: 'n', direction: 'inout', type: 'NUMBER', value: 21 }])
@@ -103,7 +103,7 @@ test('ora: an INOUT parameter keeps its input and returns the updated value', { 
 // review2 §4 (group C): :new/:old are trigger correlation names, not bind placeholders.
 // A CREATE TRIGGER using them must run without a "param not found: new" error, and the
 // trigger must actually fire.
-test('ora: CREATE TRIGGER with :new/:old correlation names runs', { skip }, async (t) => {
+test('ora: CREATE TRIGGER with :new/:old correlation names runs', { skip }, async () => {
 	const db = new DbConnection(conn!)
 	try {
 		const created = await db.exec('CREATE TABLE vv_ra_trg (id NUMBER, name VARCHAR2(20))', [])
@@ -472,7 +472,7 @@ test('ora: execStream abort reason is the error message, not "Error: ..."', asyn
 
 // review3 §2.8: a parenthesised subquery still returns rows; it must route to queryStream,
 // not execute(), which discards the rows.
-test('ora: a parenthesised SELECT or WITH is a row query', async (t) => {
+test('ora: a parenthesised SELECT or WITH is a row query', async () => {
 	assert.equal(isRowQuery('(SELECT 1 FROM dual)'), true)
 	assert.equal(isRowQuery('( WITH x AS (SELECT 1 AS a) SELECT a FROM x )'), true)
 	assert.equal(isRowQuery('( UPDATE t SET x = 1 )'), false)
@@ -574,7 +574,7 @@ test('ora: outParams come before implicit result sets and keep the block rowsAff
 
 // review3 §2.8: live - a PL/SQL block that returns several implicit result sets must
 // surface each as its own result, with its own schema, instead of silently dropping them.
-test('ora: DBMS_SQL.RETURN_RESULT surfaces every implicit result set', { skip }, async (t) => {
+test('ora: DBMS_SQL.RETURN_RESULT surfaces every implicit result set', { skip }, async () => {
 	const db = new DbConnection(conn!)
 	try {
 		const r = await db.exec(
@@ -658,7 +658,7 @@ test('ora: execTxDynamic exec reads a SELECT from res.resultSet', async (t) => {
 
 // review3 2.8 + TDbTxResult: live - a PL/SQL block inside a transaction returns its
 // implicit result sets on TDbTxResult.implicitResults.
-test('ora: execTxDynamic surfaces PL/SQL implicit results', { skip }, async (t) => {
+test('ora: execTxDynamic surfaces PL/SQL implicit results', { skip }, async () => {
 	const db = new DbConnection(conn!)
 	try {
 		const r = await db.execTxDynamic(async (exec) => {

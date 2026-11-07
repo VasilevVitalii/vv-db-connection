@@ -47,7 +47,12 @@ export type TDbRes = {
 // begin/commit itself failing, 'query' is a statement failing, 'user' is the transaction
 // callback's own code throwing - so a retry loop can tell "my bug" from "the database
 // said no".
-export type TDbErrorKind = 'connect' | 'query' | 'tx' | 'user' | 'timeout' | 'aborted'
+// The single source for the kind literals. isDbError (helpers.ts) checks membership
+// against this array, so a kind added here is recognised there automatically instead of
+// the two hand-duplicated lists drifting apart (an unknown kind used to fall through to
+// 'user' silently).
+export const DB_ERROR_KINDS = ['connect', 'query', 'tx', 'user', 'timeout', 'aborted'] as const
+export type TDbErrorKind = (typeof DB_ERROR_KINDS)[number]
 export type TDbError = {
 	message: string
 	code?: string

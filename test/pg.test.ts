@@ -52,7 +52,7 @@ test('pg: kind maps OIDs to readable type names', { skip }, async (t) => {
 // review2 4.9: the schema carried only the type name; the declared length/precision was
 // dropped. dataTypeModifier (the catalog's atttypmod) encodes it: varchar(n)/char(n) →
 // len, numeric(p,s) → precision/scale. Unit test against the FieldDef shape, no live DB.
-test('pg: toSchema decodes length and precision from dataTypeModifier', async (t) => {
+test('pg: toSchema decodes length and precision from dataTypeModifier', async () => {
 	const schema = toSchema([
 		{ name: 'v', tableID: 0, columnID: 0, dataTypeID: 1043, dataTypeSize: -1, dataTypeModifier: 20 + 4, format: 'text' },
 		{ name: 'n', tableID: 0, columnID: 0, dataTypeID: 1700, dataTypeSize: -1, dataTypeModifier: ((10 << 16) | 2) + 4, format: 'text' },

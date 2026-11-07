@@ -201,7 +201,13 @@ export class OraAdapter implements IDbAdapter {
 	versionFallbackQuery(): string { return 'SELECT version AS ver FROM PRODUCT_COMPONENT_VERSION WHERE rownum = 1' }
 	pingQuery(): string { return 'SELECT 1 AS p FROM dual' }
 
-	private _connParams() {
+	private _connParams(): {
+		connectString: string
+		user: string
+		password: string
+		privilege?: number
+		connectTimeout?: number
+	} {
 		const privilegeMap: Record<string, number> = {
 			SYSDBA:    oracledb.SYSDBA,
 			SYSOPER:   oracledb.SYSOPER,

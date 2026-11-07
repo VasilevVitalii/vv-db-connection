@@ -23,7 +23,7 @@ runDbSuite('fb', conn, 'SELECT CAST(:v AS VARCHAR(20)) AS v FROM rdb$database', 
 
 // review2 §3 (group A): out/inout binds are Oracle-only. fb rejects the direction in
 // buildQuery before any attach, so this runs without a live database.
-test('fb: an out param is rejected', async (t) => {
+test('fb: an out param is rejected', async () => {
 	const db = new DbConnection({ kind: 'fb', host: 'localhost', database: '/tmp/x.fdb', user: 'u', password: 'p' } as TConnFb)
 	const r = await db.exec('SELECT 1 FROM rdb$database WHERE 1 = :v', [{ name: 'v', value: 1, direction: 'out' }])
 	assert.equal(r.ok, false)
@@ -34,7 +34,7 @@ test('fb: an out param is rejected', async (t) => {
 // value to a BLOB column automatically, and sends a JS bigint as INT128. Reading a BIGINT
 // beyond 2^53 exactly needs numericMode 'string'/'safe' - 'lossy' (default) decodes via
 // JS Number and silently rounds.
-test('fb: Buffer round-trips through a BLOB column', { skip }, async (t) => {
+test('fb: Buffer round-trips through a BLOB column', { skip }, async () => {
 	const db = new DbConnection(conn as TConnFb)
 	try {
 		const created = await db.exec('CREATE TABLE vv_ra_blob (id INTEGER, data BLOB SUB_TYPE TEXT)', [])
@@ -52,7 +52,7 @@ test('fb: Buffer round-trips through a BLOB column', { skip }, async (t) => {
 	}
 })
 
-test('fb: bigint round-trips exactly with numericMode string', { skip }, async (t) => {
+test('fb: bigint round-trips exactly with numericMode string', { skip }, async () => {
 	const db = new DbConnection({ ...(conn as TConnFb), numericMode: 'string' } as TConnFb)
 	try {
 		const created = await db.exec('CREATE TABLE vv_ra_big (id INTEGER, n BIGINT)', [])
@@ -76,7 +76,7 @@ test('fb: bigint round-trips exactly with numericMode string', { skip }, async (
 // connectTimeout the socket is ripped and the call fails as kind 'connect' promptly.
 // 192.0.2.1 (TEST-NET-1) never answers: either the SYN is dropped and the timeout fires,
 // or the route is unreachable and the connect fails fast - both must end quickly.
-test('fb: a stuck attach to an unreachable host is cut off by connectTimeout', async (t) => {
+test('fb: a stuck attach to an unreachable host is cut off by connectTimeout', async () => {
 	const t0 = Date.now()
 	const db = new DbConnection({ kind: 'fb', host: '192.0.2.1', port: 3050, database: '/tmp/x.fdb', user: 'u', password: 'p', connectTimeout: 500 } as TConnFb)
 	const r = await db.exec('SELECT 1 FROM rdb$database', [])
