@@ -180,17 +180,35 @@ class CommitTimeout extends Error {
 	constructor() { super('COMMIT outcome unknown') }
 }
 
+// The reason DbConnection.abort.finishEarly() aborts its internal stream signal with: it
+// wraps the very TDbError that was already handed to the consumer (a silence deadline, an
+// external abort, a throw from the consumer's handler). A bare `new Error(message)` used to
+// hide the identity of the failure: an adapter - or any other subscriber of that signal -
+// mapping the reason back through abortError() got a generic 'aborted' error and could not
+// tell a timeout from an external abort. The marker class keeps the distinction without
+// guessing from the message text.
+export class StreamAbort extends Error {
+	constructor(public readonly error: TDbError) {
+		super(error.message)
+	}
+}
+
 // Maps an AbortSignal's reason to a TDbError. The internal transaction deadline aborts
-// with a TxTimeout (see withTxTimeout), so that case reports kind 'timeout'; every other
-// reason is an external abort and reports kind 'aborted'. The adapters call this from
-// their abort handlers and early-abort branches, so an external abort is never
-// mislabelled 'timeout' and an Error reason is never stringified into "Error: <message>".
+// with a TxTimeout (see withTxTimeout), so that case reports kind 'timeout'; the stream
+// deadline / early end wraps its TDbError in a StreamAbort, so that error comes back as it
+// was reported (kind and code included); every other reason is an external abort and
+// reports kind 'aborted'. The adapters call this from their abort handlers and early-abort
+// branches, so an external abort is never mislabelled 'timeout' and an Error reason is
+// never stringified into "Error: <message>".
 export function abortError(reason: unknown): TDbError {
 	if (reason instanceof TxTimeout) {
 		return { message: 'TIMEOUT', kind: 'timeout', code: 'TIMEOUT' }
 	}
 	if (reason instanceof CommitTimeout) {
 		return { message: 'COMMIT outcome unknown', kind: 'tx', code: 'COMMIT_TIMEOUT' }
+	}
+	if (reason instanceof StreamAbort) {
+		return reason.error
 	}
 	return abortedError(reason)
 }

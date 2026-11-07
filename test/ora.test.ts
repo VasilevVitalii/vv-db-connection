@@ -411,6 +411,22 @@ test('ora: EDITIONABLE trigger and REFERENCING NEW AS are correlation names', as
 	assert.deepEqual(b.binds, {})
 })
 
+// REFERENCING may also rename PARENT (PARENT AS p), and the clause is bounded by the row /
+// body part (FOR EACH ROW, WHEN, BEGIN, ...): a word later in the trigger body is not a
+// rename, and the default NEW/OLD correlation names keep applying there.
+test('ora: REFERENCING PARENT AS is a correlation name and the body is not scanned', () => {
+	const a = buildQuery(
+		'CREATE OR REPLACE TRIGGER trg BEFORE INSERT ON x REFERENCING OLD AS o NEW AS n PARENT AS p FOR EACH ROW BEGIN :p.id := :n.id + :o.id; END;',
+		[],
+	)
+	assert.deepEqual(a.binds, {})
+	const b = buildQuery(
+		"CREATE TRIGGER trg2 BEFORE INSERT ON x REFERENCING OLD AS o FOR EACH ROW BEGIN :new.id := :o.id; INSERT INTO log VALUES ('NEW row'); END;",
+		[],
+	)
+	assert.deepEqual(b.binds, {})
+})
+
 // review3 §2.7: connection.ts documents queueTimeout 0 as "never", but the pool dropped it
 // and fell back to the driver default. It must be passed through verbatim.
 test('ora: queueTimeout 0 is passed through to createPool', async (t) => {

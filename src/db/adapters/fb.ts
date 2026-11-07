@@ -102,7 +102,9 @@ function fbSchema(output: FbColMeta[]): TDbCol[] {
 // Index of the AS that closes the header of an EXECUTE BLOCK, or -1. Both lists the
 // header may carry - the input parameters and RETURNS - are parenthesized, so the AS
 // we want is the first one outside any parentheses, and outside literals and comments.
-function execBlockBodyAt(query: string): number {
+// Exported for its unit test (the "as declare variable ..." header shape below is the
+// regression it guards).
+export function execBlockBodyAt(query: string): number {
 	if (!/^\s*EXECUTE\s+BLOCK\b/i.test(query)) return -1
 	const scan = new RegExp(`${SQL_ATOM.source}|[()]|\\bAS\\b`, 'gi')
 	let depth  = 0
@@ -122,7 +124,8 @@ function execBlockBodyAt(query: string): number {
 // variables sit between the two, and a header that ends with "as declare variable x"
 // used to be missed, which turned every variable reference in the body into a parameter
 // nobody had passed and failed the query with "param not found".
-function buildQuery(query: string, params: TDbParam[]): { sql: string; values: unknown[] } {
+// Exported for its unit test - it must never be handed a live attach to be checked.
+export function buildQuery(query: string, params: TDbParam[]): { sql: string; values: unknown[] } {
 	const values: unknown[] = []
 	const bodyAt = execBlockBodyAt(query)
 	const sql = mapPlaceholders(query, (name) => {
@@ -259,7 +262,10 @@ export class FbAdapter implements IDbAdapter {
 				if (err) done(reject)(err)
 				// Given up while the attach was on its way: the connection that just came
 				// back has no one waiting for it - drop it instead of leaking the socket.
-				else if (settled) dropConnection(db)
+				// A driver that answers without an error *and* without a connection has
+				// nothing to drop: calling into it would throw a TypeError inside the
+				// driver's own callback.
+				else if (settled) { if (db) dropConnection(db) }
 				else done(resolve)(db)
 			})
 			// Capture the Connection this attach just created (node-firebird assigns it to

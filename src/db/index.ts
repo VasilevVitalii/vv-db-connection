@@ -2,7 +2,7 @@ import type { TResult } from '../tresult'
 import type { TConnectionParam, TDbKind } from './connection'
 import { dbTitle, dbUser } from './connection'
 import type { IDbAdapter, TDbError, TDbParam, TDbRes, TDbStreamEvent, TDbTxCb, TExecOptions, TTxOptions } from './types'
-import { toDbError, assertTimeoutMs, abortError, assertOraPool } from './helpers'
+import { toDbError, assertTimeoutMs, abortError, assertOraPool, StreamAbort } from './helpers'
 
 // How long a streaming query may stay silent by default: until the first data after it
 // was sent, and between one portion of data and the next. Both are overridable per call
@@ -177,7 +177,11 @@ export class DbConnection {
 			if (settled) return
 			settled = true
 			clearTimeout(timer)
-			abort.abort(new Error(error.message))
+			// The signal carries the very error that is reported here (StreamAbort), not a
+			// bare Error around its message: an adapter - or any other subscriber - that maps
+			// the reason back through abortError() gets this error with its own kind and code,
+			// so a timeout stays a timeout instead of turning into a generic abort.
+			abort.abort(new StreamAbort(error))
 			// The finish reaches the consumer's callback too. A throw from that handler
 			// has nowhere left to report and must not reach the driver either, so it is
 			// dropped. This also covers finishEarly being called from the catch below.
@@ -254,7 +258,7 @@ export class DbConnection {
 			}
 		}, abort.signal)
 		// The adapter promise is raced against the timeout; when the timeout wins it is no
-		// longer awaited, so a rejection it produces later must not become an
+		// longer awaited, so a rejection it produces later must not become a
 		// unhandledRejection that takes the process down on Node >= 15.
 		run.catch(() => {})
 
@@ -308,6 +312,8 @@ export class DbConnection {
 		// v$version needs SELECT_CATALOG_ROLE). Fall back to a query anyone can run - but
 		// only when the primary failed as a query: a timeout, abort or connect failure
 		// would just repeat the same failure against the fallback and wait it out again.
+		// The fallback is a call of its own, so its silence deadline starts afresh (the
+		// total can reach about twice the configured one) - documented in the README.
 		if (res.error.kind === 'query' && adapter.versionFallbackQuery) {
 			// An abort that fired between the primary query and the fallback must not run
 			// the fallback: it would come back 'aborted' and get folded into the primary
@@ -405,4 +411,3 @@ export class DbConnection {
 	}
 
 }
-

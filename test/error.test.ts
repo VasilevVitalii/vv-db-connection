@@ -1,8 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { DbConnection } from '../src/index'
-import { toDbError, abortError } from '../src/db/helpers'
+import { toDbError, abortError, StreamAbort } from '../src/db/helpers'
 import type { TConnMssql } from '../src/db/connection'
+import type { TDbError } from '../src/db/types'
 
 // A connection that is never actually opened: the cases below end before the adapter
 // touches the network, so the fields only need to satisfy the type.
@@ -123,4 +124,18 @@ test('abortError does not surface an explicit stack:undefined for an Error witho
 	assert.equal(mapped.kind, 'aborted')
 	assert.equal(mapped.message, 'cancelled')
 	assert.equal('stack' in mapped, false)
+})
+
+// DbConnection.finishEarly() used to abort its internal stream signal with a bare
+// `new Error(message)`: the failure's identity was lost, so an adapter (or any other
+// subscriber) mapping the reason back through abortError() read a timeout as a generic
+// 'aborted' error. The reason now carries the TDbError that was already reported.
+test('abortError returns the TDbError carried by a StreamAbort reason', () => {
+	const timeout: TDbError = { message: 'TIMEOUT', kind: 'timeout', code: 'TIMEOUT' }
+	const mapped = abortError(new StreamAbort(timeout))
+	assert.deepEqual(mapped, timeout)
+	assert.equal(mapped.kind, 'timeout')
+
+	const query: TDbError = { message: 'consumer boom', kind: 'query', code: 'X' }
+	assert.deepEqual(abortError(new StreamAbort(query)), query)
 })

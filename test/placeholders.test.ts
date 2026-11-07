@@ -176,3 +176,29 @@ test('pg: a /* inside a dollar-quoted string is not a comment', () => {
 test('pg: a literal NUL token in the input is not mistaken for a comment mask', () => {
 	assert.equal(pgRewrite('SELECT 1 /* a */ \u00000\u0000 :x'), 'SELECT 1 /* a */ \u00000\u0000 @x')
 })
+
+// The q-quote alternative lists the bracket forms first and falls back to the generic
+// "any delimiter" branch. A bracket of another kind inside the literal is plain text, and
+// the generic branch must close on its own delimiter, not on the first bracket it meets.
+test('Oracle q-quote: a bracket of another kind inside the literal stays text', () => {
+	assert.equal(mapPlaceholders("SELECT q'!a]b :x!' AS s", toAt, undefined, SQL_ATOM_ORA), "SELECT q'!a]b :x!' AS s")
+	assert.equal(mapPlaceholders("SELECT q'[a)b :x]' AS s", toAt, undefined, SQL_ATOM_ORA), "SELECT q'[a)b :x]' AS s")
+	assert.equal(mapPlaceholders("SELECT q'{a}b :x}' AS s", toAt, undefined, SQL_ATOM_ORA), "SELECT q'{a}b :x}' AS s")
+})
+
+// An unterminated q'...' is not a string literal at all: ORA_Q_QUOTE requires its closer,
+// so the atom does not match and the scan falls through - the :name after it is a real
+// placeholder (a SQL error either way, not this parser's to fix).
+test('Oracle q-quote: an unterminated literal falls through to plain code', () => {
+	assert.equal(mapPlaceholders("SELECT q'[abc, :v", toAt, undefined, SQL_ATOM_ORA), "SELECT q'[abc, @v")
+})
+
+// The fall-through branches of maskPgBlockComments (an unterminated /* and an unterminated
+// $tag$) copy the characters literally, so the :name after them is a real placeholder.
+test('pg: an unterminated block comment falls through', () => {
+	assert.equal(pgRewrite('SELECT 1 /* unterminated :v'), 'SELECT 1 /* unterminated @v')
+})
+
+test('pg: an unterminated dollar-quote falls through', () => {
+	assert.equal(pgRewrite('SELECT $tag$ :x'), 'SELECT $tag$ @x')
+})

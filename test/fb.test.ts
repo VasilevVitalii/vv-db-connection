@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events'
 import { createRequire } from 'node:module'
 import { loadConnections, reachable, runDbSuite, connHost, connPort } from './helpers'
 import { DbConnection } from '../src/index'
-import { FbAdapter } from '../src/db/adapters/fb'
+import { FbAdapter, buildQuery, execBlockBodyAt } from '../src/db/adapters/fb'
 import type { TConnFb } from '../src/db/connection'
 
 const conns = await loadConnections()
@@ -152,6 +152,27 @@ test('fb: an attach that completes after the timeout drops the connection', asyn
 	assert.equal(r.ok, false)
 	if (!r.ok) assert.equal(r.error.kind, 'connect')
 	assert.equal(dropped, 1, 'the late connection must be dropped, not leaked')
+})
+
+// A driver callback that answers with neither an error nor a connection (a broken/odd
+// release) must not crash inside the driver's own callback: dropConnection() would read
+// `.connection` of undefined and throw a TypeError there.
+test('fb: an attach that answers without an error and without a db does not throw', async (t) => {
+	let savedCb!: (err: unknown, db: unknown) => void
+
+	t.mock.method(fbLive, 'attach', (_options: unknown, cb: (err: unknown, db: unknown) => void) => {
+		savedCb = cb
+	})
+
+	const adapter = new FbAdapter({ kind: 'fb', host: '127.0.0.1', database: '/tmp/x.fdb', user: 'u', password: 'p', connectTimeout: 30 } as TConnFb)
+	const p = adapter.execTxDynamic(async () => { throw new Error('body must not run') })
+	await new Promise((resolve) => setTimeout(resolve, 60)) // the connect timeout settles the attach
+	// The late answer carries no error and no connection: the `settled` branch must
+	// simply do nothing instead of calling dropConnection(undefined).
+	assert.doesNotThrow(() => savedCb(null, undefined))
+	const r = await p
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'connect')
 })
 
 // review3 4.20 (second half): aborting during an in-flight attach must rip the socket at
@@ -351,4 +372,34 @@ test('fb: a lost connection before a throwing callback skips rollback on the dea
 		assert.equal(r.error.code, 'FB_CONN_LOST')
 	}
 	assert.equal(rollbacks, 0, 'rollback must not run on a connection already dropped by connLost')
+})
+
+// The AS that closes an EXECUTE BLOCK header is not always followed by BEGIN: local
+// declarations sit between the two ("as declare variable x ..."). The header used to be
+// missed, which turned every variable reference in the PSQL body into a parameter nobody
+// had passed and failed the query with "param not found". Only the header is rewritten.
+test('fb: EXECUTE BLOCK rewrites the header only, the PSQL body keeps its :vars', () => {
+	const { sql, values } = buildQuery(
+		'EXECUTE BLOCK (p INTEGER = :p) RETURNS (r INTEGER) AS DECLARE VARIABLE x INTEGER; BEGIN r = :p; x = :x; END',
+		[{ name: 'p', value: 7 }],
+	)
+	assert.equal(sql, 'EXECUTE BLOCK (p INTEGER = ?) RETURNS (r INTEGER) AS DECLARE VARIABLE x INTEGER; BEGIN r = :p; x = :x; END')
+	assert.deepEqual(values, [7])
+})
+
+test('fb: execBlockBodyAt finds the AS outside parentheses, literals and comments', () => {
+	const plain = 'EXECUTE BLOCK (p VARCHAR(10) = :p) RETURNS (r INTEGER) AS BEGIN r = 1; END'
+	assert.equal(execBlockBodyAt(plain), plain.lastIndexOf('AS'))
+	// an AS inside a string literal (or inside the parenthesised header) is not the body opener
+	const literal = "EXECUTE BLOCK (p VARCHAR(10) = ':as') RETURNS (r INTEGER) AS BEGIN END"
+	assert.equal(execBlockBodyAt(literal), literal.lastIndexOf('AS'))
+	// not an EXECUTE BLOCK at all
+	assert.equal(execBlockBodyAt('SELECT :a FROM t'), -1)
+})
+
+test('fb: buildQuery leaves a non-EXECUTE BLOCK statement unbounded', () => {
+	assert.deepEqual(
+		buildQuery('SELECT * FROM t WHERE a = :a AND b = :b', [{ name: 'a', value: 1 }, { name: 'b', value: 2 }]),
+		{ sql: 'SELECT * FROM t WHERE a = ? AND b = ?', values: [1, 2] },
+	)
 })

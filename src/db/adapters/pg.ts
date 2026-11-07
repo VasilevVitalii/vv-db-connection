@@ -81,6 +81,16 @@ function isDmlCommand(command: string): boolean {
 	return DML_COMMANDS.has(command)
 }
 
+// Drops a client whose socket was ripped (abort / timeout). Such a client emits 'error'
+// asynchronously, after this adapter has already removed its own listener, and pg's pool
+// only listens on *idle* clients - so an 'error' on a released, listener-less client is an
+// unhandled event that throws. A dropped client never returns to the pool, so the no-op
+// listener left behind cannot accumulate.
+function dropClient(client: PoolClient): void {
+	client.on('error', () => {})
+	client.release(true)
+}
+
 export class PgAdapter implements IDbAdapter {
 	constructor(private readonly p: TConnPg) {
 		assertTimeoutMs('pg: connectTimeout', p.connectTimeout)
@@ -202,7 +212,7 @@ export class PgAdapter implements IDbAdapter {
 		if (signal?.aborted) {
 			onAbort()
 			client.removeListener('error', onError)
-			client.release(true)
+			dropClient(client)
 			try { callback({ kind: 'finish', error: abortError(signal.reason) }) } catch { /* the consumer's finish handler threw */ }
 			return
 		}
@@ -274,10 +284,13 @@ export class PgAdapter implements IDbAdapter {
 			// same PoolClient, so an un-removed listener accumulates one per query and trips
 			// MaxListeners (and each stale closure would keep a dead `broken` alive).
 			client.removeListener('error', onError)
-			// release(err) drops the client from the pool: pass it on a broken connection so
+			// release(true) drops the client from the pool: pass it on a broken connection so
 			// a dead socket is not handed to the next query. A plain SQL error keeps the
-			// client healthy and is released back normally.
-			client.release(broken || signal?.aborted)
+			// client healthy and is released back normally. A dropped client keeps a no-op
+			// 'error' listener (dropClient): the torn-down socket emits 'error' later, and
+			// an 'error' on a released, listener-less client would throw.
+			if (broken || signal?.aborted) dropClient(client)
+			else client.release(false)
 		}
 	}
 
@@ -310,7 +323,7 @@ export class PgAdapter implements IDbAdapter {
 			if (signal.aborted) {
 				teardown()
 				client.removeListener('error', onError)
-				client.release(true)
+				dropClient(client)
 				return { ok: false, error: abortError(signal.reason) }
 			}
 			try {
@@ -390,7 +403,11 @@ export class PgAdapter implements IDbAdapter {
 			} finally {
 				signal.removeEventListener('abort', teardown)
 				client.removeListener('error', onError)
-				client.release(broken || signal.aborted)
+				// Same as execStream: a client whose socket was ripped emits 'error' later,
+				// and a released client has no pool listener - the stub from dropClient keeps
+				// that late event from throwing.
+				if (broken || signal.aborted) dropClient(client)
+				else client.release(false)
 			}
 		}, external)
 	}

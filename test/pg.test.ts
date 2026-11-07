@@ -305,6 +305,65 @@ test('pg: execStream suppresses buffered simple-protocol rows after abort', asyn
 	assert.equal(destroyed, 1, 'the socket is torn down on abort')
 })
 
+// A torn-down socket emits 'error' asynchronously, after the adapter removed its own
+// listener. pg's pool only listens on idle clients, so the dropped client must keep a
+// no-op listener of its own - otherwise that late event is unhandled and throws.
+test('pg: a dropped client keeps an error listener for the late socket error', async (t) => {
+	let resolveQuery!: (value: unknown) => void
+	const gate = new Promise((resolve) => { resolveQuery = resolve })
+	let released = 0
+	let destroyed = 0
+	const fakeClient = Object.assign(new EventEmitter(), {
+		release: (): void => { released += 1 },
+		query: (): unknown => gate,
+		connection: { stream: { destroy(): void { destroyed += 1 } } },
+	})
+	t.mock.method(Pool.prototype, 'connect', async () => fakeClient as unknown as PoolClient)
+
+	const adapter = new PgAdapter({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
+	const abort = new AbortController()
+	const run = adapter.execStream('SELECT 1', [], () => {}, abort.signal)
+
+	await new Promise<void>((resolve) => setImmediate(resolve))
+	abort.abort(new Error('timeout'))
+	resolveQuery({ fields: [], rows: [], rowCount: null, command: 'SELECT' })
+	await run
+
+	assert.equal(destroyed, 1)
+	assert.equal(released, 1)
+	assert.ok(fakeClient.listenerCount('error') >= 1, 'the dropped client must keep an error listener')
+	assert.doesNotThrow(() => fakeClient.emit('error', new Error('socket torn down')))
+})
+
+// The same hole on the transaction path: the early-abort branch drops the client right
+// after removing the adapter's listener.
+test('pg: a client dropped on a transaction abort keeps an error listener', async (t) => {
+	let release!: () => void
+	const gate = new Promise<void>((resolve) => { release = resolve })
+	let released = 0
+	let destroyed = 0
+	const fakeClient = Object.assign(new EventEmitter(), {
+		release: (): void => { released += 1 },
+		connection: { stream: { destroy(): void { destroyed += 1 } } },
+	})
+	t.mock.method(Pool.prototype, 'connect', () => gate.then(() => fakeClient as unknown as PoolClient))
+
+	const adapter = new PgAdapter({ kind: 'pg', host: '127.0.0.1', database: 'x', user: 'u', password: 'p' } as TConnPg)
+	const r = await adapter.execTxDynamic(async () => { throw new Error('body must not run') }, 30)
+	assert.equal(r.ok, false)
+	if (!r.ok) assert.equal(r.error.kind, 'timeout')
+
+	release()
+	for (let i = 0; i < 20 && released === 0; i++) {
+		await new Promise((resolve) => setImmediate(resolve))
+	}
+
+	assert.equal(released, 1)
+	assert.equal(destroyed, 1)
+	assert.ok(fakeClient.listenerCount('error') >= 1, 'the dropped client must keep an error listener')
+	assert.doesNotThrow(() => fakeClient.emit('error', new Error('socket torn down')))
+})
+
 // review20 2.1: a parameterless multi-statement query (simple protocol) used to
 // flatMap-concatenate the rows of every result set, losing the boundary between sets and
 // diverging from README:280 ("first recordset kept, the rest dropped", as mssql does).
