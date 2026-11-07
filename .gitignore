@@ -10,3 +10,6 @@ distjs/
 # проверки opus
 review*.md
 DECISIONS.md
+
+# ai: не публикуем только локальные настройки .env
+ai/.env
