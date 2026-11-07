@@ -8,8 +8,8 @@ distjs/
 .connect.json
 
 # проверки opus
-review*.md
 DECISIONS.md
 
-# ai: не публикуем только локальные настройки .env
-ai/.env
+# ai: не публикуем локальные настройки .env и учёт расхода
+.ai/.env
+.ai/price.csv
