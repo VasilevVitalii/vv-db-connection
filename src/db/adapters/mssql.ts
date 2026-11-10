@@ -83,6 +83,12 @@ export function buildPoolConfig(p: TConnMssql): sql.config {
 		...(p.database ? { database: p.database } : {}),
 		...(p.connectTimeout ? { connectionTimeout: p.connectTimeout } : {}),
 		...(p.connectTimeout ? { pool: { acquireTimeoutMillis: p.connectTimeout, createTimeoutMillis: p.connectTimeout } } : {}),
+		// The driver's own requestTimeout (tedious default 15s) cuts a long-running
+		// statement off long before this package's silence deadline does. Deadlines here
+		// are owned by execStream/execTxDynamic (firstDataTimeoutMs / idleTimeoutMs), so
+		// the driver-level timer is disabled (0 = no timeout) and the watchdog above is
+		// the only cutoff.
+		requestTimeout: 0,
 		options: {
 			trustServerCertificate: p.trustServerCertificate ?? false,
 			encrypt:                p.encrypt ?? false,
