@@ -213,6 +213,31 @@ export function abortError(reason: unknown): TDbError {
 	return abortedError(reason)
 }
 
+// Awaits a promise but settles at once when the signal aborts, so a cancellation during a
+// long first load (driver import, pool connect) ends the call as aborted instead of waiting
+// out the load and then mislabelling its outcome. The underlying promise keeps running - a
+// shared lazy load must not be cancelled for everyone - only this waiter lets go early.
+export function awaitWithSignal<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+	if (!signal) return p
+	// The waiter below may let go on abort (or never attach, on the pre-aborted path) while
+	// p is still running; if p later rejects with nobody left awaiting it, Node >= 15 treats
+	// it as an unhandledRejection. This no-op rejection handler keeps the promise "handled"
+	// without swallowing its value for the real waiters above.
+	p.catch(() => {})
+	if (signal.aborted) return Promise.reject(abortError(signal.reason))
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = (): void => {
+			signal.removeEventListener('abort', onAbort)
+			reject(abortError(signal.reason))
+		}
+		signal.addEventListener('abort', onAbort, { once: true })
+		p.then(
+			(value) => { signal.removeEventListener('abort', onAbort); resolve(value) },
+			(err) => { signal.removeEventListener('abort', onAbort); reject(err) },
+		)
+	})
+}
+
 // Validates a timeout option: undefined and 0 are the "no deadline" sentinel, anything
 // else must be a finite non-negative number of milliseconds. A negative value would fire
 // the timer at once, NaN too, and Infinity would disable it - none is a meaningful
